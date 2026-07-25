@@ -27,11 +27,18 @@ never resumes a broken thread.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
+import pty
+import re
 import signal
+import struct
 import subprocess
+import termios
+import threading
+import time
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -68,6 +75,10 @@ _sessions: dict[str, dict] = {}
 # the same session (idle eviction, a gateway restart) rejoins its thread
 # instead of silently starting a second one.
 THREADS: dict[str, str] = {}
+
+# Matches a rollout filename's embedded thread UUID, e.g.
+# rollout-2026-07-25T19-04-52-019f9aaa-....jsonl
+_ROLLOUT_THREAD_RE = re.compile(r"rollout-.*-([0-9a-fA-F-]{36})\.jsonl$")
 
 
 def _spawn_isolation() -> dict:
@@ -422,3 +433,213 @@ async def kill(session_id: str) -> None:
     if state is not None:
         await _reap_proc(state.get("proc"))
     log.info("Codex session %s killed", session_id)
+
+
+# Browser terminal (tmux-backed), mirroring the claude harness's approach:
+# the interactive TUI lives in a tmux session keyed by the hive session and
+# outlives every viewer, so a browser attach is just a tmux client living in
+# a pty of the caller's geometry. A dedicated socket keeps this server's tmux
+# options and lifetime isolated from any tmux Daniel runs by hand.
+TMUX_SOCKET = "MIND_NAME-terminal"
+
+# Applied ahead of every session creation so they hold from the pane's first
+# byte; see the claude harness's implementation.py for the rationale behind
+# each option (history-limit/default-terminal are read at pane creation and
+# can't be retrofitted; prefix None + escape-time 0 keep tmux out of a TUI
+# that wants every keystroke; window-size latest sizes to whichever client
+# most recently attached, the only client this server allows).
+_TMUX_OPTIONS = [
+    ["set", "-g", "exit-empty", "off"],
+    ["set", "-g", "status", "off"],
+    ["set", "-g", "prefix", "None"],
+    ["set", "-g", "escape-time", "0"],
+    ["set", "-g", "history-limit", "50000"],
+    ["set", "-g", "window-size", "latest"],
+    ["set", "-g", "destroy-unattached", "off"],
+    ["set", "-g", "default-terminal", "tmux-256color"],
+    ["set", "-gas", "terminal-features", ",xterm-256color:RGB"],
+]
+
+_CLIENT_TERM = "xterm-256color"
+
+
+def tmux_session_name(session_id: str) -> str:
+    """The tmux session that holds this hive session's terminal."""
+    return f"MIND_NAME-{session_id}"
+
+
+def _take_controlling_tty() -> None:
+    """Make the pty the child's controlling terminal, in the child — see
+    the claude harness's implementation.py for why this is required for
+    SIGWINCH (and thus live resize) to reach the attached client at all."""
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def _terminal_argv(thread_id: str | None) -> list[str]:
+    """The interactive `codex` that runs inside the tmux pane.
+
+    A known thread resumes it (`codex resume <id>`); no thread starts a
+    bare `codex`, which mints one on the operator's first message.
+    `check_for_update_on_startup=false` is required, not cosmetic: the
+    update-nag screen's Enter default shells out to
+    `npm install -g @openai/codex`, which fails inside the container (the
+    non-root user has no write access to the global npm dir) and kills
+    codex with exit status 243 before it is ever usable.
+    """
+    cmd = ["codex"]
+    if thread_id:
+        cmd.extend(["resume", thread_id])
+    if CODEX_PROFILE:
+        cmd.extend(["--profile", CODEX_PROFILE])
+    cmd.extend([
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "-c", "check_for_update_on_startup=false",
+    ])
+    return cmd
+
+
+def _tmux(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["tmux", "-L", TMUX_SOCKET, *args],
+        capture_output=True, text=True, env=env,
+    )
+
+
+def pty_session_alive(session_id: str) -> bool:
+    """True while this session's terminal process is still running."""
+    return _tmux("has-session", "-t", tmux_session_name(session_id)).returncode == 0
+
+
+def kill_pty_session(session_id: str) -> bool:
+    """End the terminal for good. True if there was one to end."""
+    name = tmux_session_name(session_id)
+    if _tmux("kill-session", "-t", name).returncode != 0:
+        return False
+    log.info("Killed tmux session %s", name)
+    return True
+
+
+def _capture_new_thread(session_id: str, spawned_at: float, max_wait: float = 3600.0) -> None:
+    """Bind whatever thread id codex mints for a fresh interactive session.
+
+    Unlike `codex exec`, a bare interactive TUI reports no thread id up
+    front — the rollout file (whose name embeds the thread UUID) is only
+    written once the operator sends their first real message, which can be
+    arbitrarily far behind spawn. Poll for as long as the tmux session is
+    alive (capped at max_wait as an outer safety bound) rather than a short
+    fixed timeout, which raced both a slow first message and the update-nag
+    screen.
+    """
+    sessions_dir = CODEX_HOME / "sessions"
+    deadline = time.time() + max_wait
+    while pty_session_alive(session_id) and time.time() < deadline:
+        for path in sorted(sessions_dir.glob("**/rollout-*.jsonl"),
+                            key=lambda p: p.stat().st_mtime, reverse=True):
+            if path.stat().st_mtime < spawned_at:
+                break
+            match = _ROLLOUT_THREAD_RE.search(path.name)
+            if match:
+                THREADS[session_id] = match.group(1)
+                log.info("Captured codex thread %s for new terminal session %s",
+                          match.group(1), session_id)
+                return
+        time.sleep(0.5)
+    if session_id not in THREADS:
+        log.warning("Gave up waiting for a codex thread for session %s after %.0fs",
+                    session_id, max_wait)
+
+
+def spawn_pty(
+    session_id: str,
+    model: str,
+    resume_sid: str | None = None,
+    mcp_config: str = "",
+    registry: Any = None,
+    config_obj: Any = None,
+    mind_id: str = "MIND_NAME",
+    mind_name: str = "MIND_NAME",
+    cols: int = 80,
+    rows: int = 24,
+    **kwargs: Any,
+) -> tuple[subprocess.Popen, int]:
+    """Attach a pty to this session's interactive `codex`, starting it if needed.
+
+    Mirrors the claude harness's tmux-backed terminal: the TUI lives in a
+    tmux session named for the hive session and outlives every viewer; what
+    this returns is a tmux *client* running in a pty of the caller's
+    geometry. Calling it again for a session that already has a terminal
+    attaches a second client to the same `codex` rather than starting a
+    rival one.
+
+    ``resume_sid`` is the session's conversation id, required for call-site
+    symmetry with the claude harness, but codex cannot adopt it directly —
+    see THREADS at module scope. A fresh terminal starts a bare `codex` and
+    a background watcher binds whatever thread it mints; a terminal for a
+    session with an already-known thread resumes it by id.
+    """
+    del mind_id, mind_name, kwargs, mcp_config, config_obj, registry  # unused
+
+    if not resume_sid:
+        raise ValueError(
+            f"spawn_pty for session {session_id} got no conversation id — "
+            "the gateway mints one at session creation and must pass it"
+        )
+
+    name = tmux_session_name(session_id)
+    env = os.environ.copy()
+    overrides = {
+        "CODEX_HOME": str(CODEX_HOME),
+        # A pty spawn is the web terminal by definition — no gateway
+        # derivation needed. surface_inject.sh reads this to tell the model
+        # which surface each turn arrived on.
+        "HIVE_SURFACE": "terminal",
+    }
+    env.update(overrides)
+
+    if not pty_session_alive(session_id):
+        thread_id = THREADS.get(session_id)
+        cmd = _terminal_argv(thread_id)
+        spawned_at = time.time()
+
+        args: list[str] = []
+        for option in _TMUX_OPTIONS:
+            args.extend([*option, ";"])
+        args.extend(["new-session", "-d", "-s", name, "-c", str(PROJECT_DIR),
+                     "-x", str(cols), "-y", str(rows)])
+        for key, value in overrides.items():
+            args.extend(["-e", f"{key}={value}"])
+        args.append("--")
+        args.extend(cmd)
+
+        result = _tmux(*args, env=env)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"tmux refused to start the terminal for session {session_id}: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        log.info("Started tmux session %s (thread=%s)", name, thread_id or "new")
+
+        if not thread_id:
+            threading.Thread(
+                target=_capture_new_thread, args=(session_id, spawned_at), daemon=True,
+            ).start()
+
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    client_env = dict(env, TERM=_CLIENT_TERM)
+    proc = subprocess.Popen(
+        ["tmux", "-L", TMUX_SOCKET, "attach-session", "-d", "-t", name],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=client_env,
+        cwd=str(PROJECT_DIR),
+        preexec_fn=_take_controlling_tty,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    log.info("Attached tmux client to %s for session %s (pid=%d, %dx%d)",
+             name, session_id, proc.pid, cols, rows)
+    return proc, master_fd
