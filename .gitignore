@@ -151,6 +151,10 @@ docker-compose.override.yml
 docker-compose.production.yml
 /deploy/
 
+# Per-mind guidance overlay (identity, host-specific operational rules) —
+# Claude Code loads it alongside the tracked CLAUDE.md
+CLAUDE.local.md
+
 # Local tool state
 .claude/
 .codex/
