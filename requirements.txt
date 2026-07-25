@@ -1,0 +1,45 @@
+# Core
+claude-code-sdk>=0.0.25
+python-dotenv
+cryptography>=46.0.7
+requests>=2.33.0
+pyyaml
+requests
+openai
+anthropic
+setuptools<81
+
+# MCP
+mcp[cli]
+
+# Browser automation
+playwright
+
+# Dev tooling
+pip-audit
+pytest
+pytest-asyncio
+mypy
+ruff
+
+# Gateway server
+fastapi
+uvicorn[standard]
+aiosqlite
+aiohttp
+
+# Vector operations (Lucent)
+numpy
+
+# External integrations
+dateparser
+
+# Discord bot
+discord.py[voice]>=2.0
+
+# Telegram bot
+python-telegram-bot[job-queue]>=21.0
+
+# Remote Admin SSH bridge
+paramiko>=3.0
+

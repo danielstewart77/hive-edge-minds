@@ -1,0 +1,40 @@
+# Example mind — the outpost's one contract file.
+#
+# `setup.sh` copies minds/example/ to minds/<your-mind>/ and fills this in;
+# you can also copy and edit it by hand. Identity and soul prose live in the
+# hive's knowledge graph, not here. Secrets (tokens, chat ids) live in .env.
+
+name: example
+# Stamped by setup.sh (uuidgen). Every write to the hive's memory carries
+# this id; the display name above is never written there.
+mind_id: <generated-uuid>
+description: "Example — starter outpost mind."
+
+# What this mind is allowed to be on this machine.
+#   operator  — full host access by design: the mind operates the machine.
+#   satellite — a connected mind on this machine without the operator posture.
+role: satellite
+
+# How the mind runs on this machine. setup.sh emits the matching installer.
+#   systemd      — bare-metal Linux service (deploy/<name>.service)
+#   container    — Docker container (docker-compose.yml)
+#   windows-task — logon-triggered Windows scheduled task (deploy/<name>-task.xml)
+deployment: systemd
+
+# Harness adapter, by mind_templates/ basename. setup.sh instantiates it at
+# minds/<name>/implementation.py.
+#   claude_cli_claude — Claude Code CLI (stream-json turns + tmux browser terminal)
+#   codex_cli_codex   — Codex CLI (one `codex exec --json` subprocess per turn)
+harness: claude_cli_claude
+
+provider: anthropic
+default_model: sonnet
+mind_server_port: 8421
+
+# Surface bots run in-process by launch_mind_server_and_bots.py. An empty
+# list means the mind is reachable only through hive-comms (e.g. its bot
+# runs in the hive's own stack instead).
+surfaces:
+  - telegram
+
+soul_file: souls/example.md
