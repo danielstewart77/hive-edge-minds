@@ -74,7 +74,10 @@ class TestMirrorTurnToPty:
         mind_server_mod._mirror_turn_to_pty("sess-1", "hi", ["hello"])
         assert mind_server_mod._ptys == {}
 
-    def test_feeds_both_sides_with_crlf_line_endings(self, mind_server_mod):
+    def test_feeds_both_sides_with_crlf_line_endings(self, mind_server_mod, monkeypatch):
+        # Pin the label explicitly — config.py load_dotenv()s the install's
+        # .env at import, so the ambient OWNER_NAME is whatever this host has.
+        monkeypatch.setenv("OWNER_NAME", "testowner")
         handle = _FakeHandle()
         mind_server_mod._ptys["sess-1"] = handle
 
@@ -85,11 +88,12 @@ class TestMirrorTurnToPty:
         assert "\r\n" in rendered  # terminal output needs CRLF, not bare LF
         assert "what's the weather" in rendered
         assert "sunny and 72" in rendered
-        assert "user" in rendered  # OWNER_NAME default label
+        assert "testowner" in rendered  # OWNER_NAME labels the user's side
         assert "ada" in rendered  # MIND_NAME label
 
-    def test_no_user_text_still_feeds_assistant_side(self, mind_server_mod):
+    def test_no_user_text_still_feeds_assistant_side(self, mind_server_mod, monkeypatch):
         """The idle-drain and flush paths have no user turn — just a spontaneous reply."""
+        monkeypatch.setenv("OWNER_NAME", "testowner")
         handle = _FakeHandle()
         mind_server_mod._ptys["sess-1"] = handle
 
@@ -97,7 +101,7 @@ class TestMirrorTurnToPty:
 
         rendered = handle.fed[0].decode()
         assert "background result" in rendered
-        assert "user:" not in rendered
+        assert "testowner:" not in rendered
 
     def test_multiple_text_blocks_joined(self, mind_server_mod):
         handle = _FakeHandle()
