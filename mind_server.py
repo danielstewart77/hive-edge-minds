@@ -483,6 +483,14 @@ async def attach_pty(
         await websocket.close(code=1008, reason="no conversation id for this session")
         return
 
+    # hive-comms has no chat-id-like concept for a browser tile — Telegram/
+    # Discord send a real client_ref, a terminal attach never will. Without
+    # one, rotation_check's missing-client_ref guard bails on every fire and
+    # the transcript just grows until Claude's own native compaction steps
+    # in. session_id (the gateway's conversation id) is already unique and
+    # stable for this conversation's lifetime, so it doubles as the key.
+    client_ref = client_ref or session_id
+
     cols, rows = _clamp_winsize(cols, rows)
     try:
         handle = _open_pty_session(

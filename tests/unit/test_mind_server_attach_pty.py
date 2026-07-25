@@ -91,6 +91,24 @@ class TestAttachPty:
         assert kwargs["owner_ref"] == "u1"
         os.close(slave_fd)
 
+    def test_missing_client_ref_defaults_to_session_id(self, client):
+        """hive-comms has no chat-id-like client_ref for a browser tile, so it
+        never sends one. Without a default, rotation_check's missing-
+        client_ref guard bails on every fire for every terminal session."""
+        test_client, mind_server = client
+        master_fd, slave_fd = pty.openpty()
+        proc = _fake_proc()
+        mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
+
+        with test_client.websocket_connect(
+            "/sessions/sess-42/attach-pty?resume_sid=abc&owner_type=web&owner_ref=u1"
+        ):
+            pass
+
+        kwargs = mind_server.impl.spawn_pty.call_args.kwargs
+        assert kwargs["client_ref"] == "sess-42"
+        os.close(slave_fd)
+
     def test_pumps_browser_input_to_process(self, client):
         test_client, mind_server = client
         master_fd, slave_fd = pty.openpty()
