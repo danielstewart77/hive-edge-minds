@@ -32,15 +32,18 @@ import json
 import logging
 import os
 import pty
-import re
+import select
 import signal
 import struct
 import subprocess
 import termios
 import threading
 import time
+import urllib.error
+import urllib.request
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +68,9 @@ TURN_IDLE_TIMEOUT = float(os.environ.get("CODEX_TURN_IDLE_TIMEOUT", "300"))
 #                "proc": Process | None, "client_ref"/"owner_type"/"owner_ref"}
 _sessions: dict[str, dict] = {}
 
-# session_id -> codex thread id, surviving the session state itself.
+# session_id -> codex thread id, surviving the session state itself and mind
+# restarts. Hive-comms is authoritative; the local file is a safety copy for
+# a gateway outage during the first terminal attach.
 #
 # Codex is the one harness that will not take a conversation id it was handed:
 # `codex exec` mints its own thread and reports it on the first event, and
@@ -74,11 +79,71 @@ _sessions: dict[str, dict] = {}
 # them can only live here. Keeping it outside `_sessions` means a respawn of
 # the same session (idle eviction, a gateway restart) rejoins its thread
 # instead of silently starting a second one.
-THREADS: dict[str, str] = {}
+_THREAD_MAP_PATH = CODEX_HOME / "hive-thread-map.json"
+_THREAD_MAP_LOCK = threading.Lock()
 
-# Matches a rollout filename's embedded thread UUID, e.g.
-# rollout-2026-07-25T19-04-52-019f9aaa-....jsonl
-_ROLLOUT_THREAD_RE = re.compile(r"rollout-.*-([0-9a-fA-F-]{36})\.jsonl$")
+
+def _load_thread_map() -> dict[str, str]:
+    try:
+        data = json.loads(_THREAD_MAP_PATH.read_text())
+        return {str(k): str(v) for k, v in data.items() if k and v}
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return {}
+
+
+THREADS: dict[str, str] = _load_thread_map()
+
+
+def _write_thread_map() -> None:
+    _THREAD_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = _THREAD_MAP_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(THREADS, sort_keys=True))
+    os.replace(temp_path, _THREAD_MAP_PATH)
+
+
+def _remember_thread(session_id: str, thread_id: str) -> None:
+    with _THREAD_MAP_LOCK:
+        THREADS[session_id] = thread_id
+        _write_thread_map()
+
+
+def _forget_thread(session_id: str) -> None:
+    with _THREAD_MAP_LOCK:
+        THREADS.pop(session_id, None)
+        _write_thread_map()
+
+
+def _report_thread(session_id: str, thread_id: str) -> None:
+    """Tell hive-comms which provider-native thread belongs to the session."""
+    base_url = (
+        os.environ.get("COMMS_URL") or os.environ.get("HIVEMIND_BROKER_URL", "")
+    ).rstrip("/")
+    if not base_url:
+        log.warning("Cannot report Codex thread for %s: HIVEMIND_BROKER_URL unset", session_id)
+        return
+    token = os.environ.get("HIVEMIND_BROKER_TOKEN", "")
+    request = urllib.request.Request(
+        f"{base_url}/sessions/{session_id}/harness-state",
+        data=json.dumps({"harness_sid": thread_id}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status != 200:
+                raise RuntimeError(f"gateway returned HTTP {response.status}")
+    except (OSError, urllib.error.URLError, RuntimeError) as exc:
+        log.warning("Failed to report Codex thread %s for session %s: %s",
+                    thread_id, session_id, exc)
+
+
+def _report_thread_in_background(session_id: str, thread_id: str) -> None:
+    threading.Thread(
+        target=_report_thread, args=(session_id, thread_id), daemon=True
+    ).start()
 
 
 def _spawn_isolation() -> dict:
@@ -196,6 +261,7 @@ async def spawn(
     model: str,
     autopilot: bool = False,
     resume_sid: str | None = None,
+    harness_sid: str | None = None,
     surface_prompt: str | None = None,
     allowed_directories: list[str] | None = None,
     soul_file: Path | None = None,
@@ -215,9 +281,8 @@ async def spawn(
     Returns the state dict (stored as the session's ``proc`` slot by
     ``mind_server``). The actual codex subprocess is spawned in ``send``.
 
-    ``resume_sid`` is the gateway's conversation id. Codex cannot adopt it —
-    see THREADS — so it is never passed to the CLI; this session's thread is
-    whatever codex minted for it, if it has spoken at all.
+    ``resume_sid`` is the gateway's conversation id. Codex cannot adopt it;
+    ``harness_sid`` is the provider-native thread persisted by hive-comms.
     """
     _log = logger or log
 
@@ -230,9 +295,11 @@ async def spawn(
     else:
         full_prompt = system_prompt_blocks
 
+    if harness_sid:
+        _remember_thread(session_id, harness_sid)
     state = {
         "system_prompt": full_prompt,
-        "thread_id": THREADS.get(session_id),
+        "thread_id": harness_sid or THREADS.get(session_id),
         "model": model,
         "proc": None,
         "client_ref": client_ref or "",
@@ -300,9 +367,15 @@ async def send(
         **_spawn_isolation(),
     )
     state["proc"] = proc
-    proc.stdin.write(stdin_content.encode())
-    await proc.stdin.drain()
-    proc.stdin.close()
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    proc_stdin = proc.stdin
+    proc_stdout = proc.stdout
+    proc_stderr = proc.stderr
+    proc_stdin.write(stdin_content.encode())
+    await proc_stdin.drain()
+    proc_stdin.close()
 
     # Drain stderr concurrently. send() pipes stderr; if nothing reads it a
     # chatty codex fills the OS pipe buffer and blocks. The tail also feeds
@@ -311,7 +384,7 @@ async def send(
 
     async def _pump_stderr() -> None:
         try:
-            async for errline in proc.stderr:
+            async for errline in proc_stderr:
                 stderr_buf.append(errline.decode(errors="replace"))
                 if len(stderr_buf) > 500:
                     del stderr_buf[0]
@@ -327,7 +400,8 @@ async def send(
         # Don't resume into a thread codex left with an unanswered turn, or
         # the next message gets this turn's response (one turn behind).
         state["thread_id"] = None
-        THREADS.pop(session_id, None)
+        _forget_thread(session_id)
+        _report_thread_in_background(session_id, "")
 
     current_thread_id = thread_id
     # Turn watchdog: codex exec --json streams an event per item as it works,
@@ -339,7 +413,7 @@ async def send(
         while True:
             try:
                 raw_line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=TURN_IDLE_TIMEOUT
+                    proc_stdout.readline(), timeout=TURN_IDLE_TIMEOUT
                 )
             except asyncio.TimeoutError:
                 log.error(
@@ -370,7 +444,7 @@ async def send(
                 current_thread_id = event.get("thread_id")
                 state["thread_id"] = current_thread_id
                 if current_thread_id:
-                    THREADS[session_id] = current_thread_id
+                    _remember_thread(session_id, current_thread_id)
 
             elif etype == "item.completed":
                 for text in extract_assistant_texts(event):
@@ -429,7 +503,7 @@ async def send(
 async def kill(session_id: str) -> None:
     """Reap any in-flight codex subprocess and drop the session state."""
     state = _sessions.pop(session_id, None)
-    THREADS.pop(session_id, None)
+    _forget_thread(session_id)
     if state is not None:
         await _reap_proc(state.get("proc"))
     log.info("Codex session %s killed", session_id)
@@ -479,8 +553,8 @@ def _take_controlling_tty() -> None:
 def _terminal_argv(thread_id: str | None) -> list[str]:
     """The interactive `codex` that runs inside the tmux pane.
 
-    A known thread resumes it (`codex resume <id>`); no thread starts a
-    bare `codex`, which mints one on the operator's first message.
+    Every terminal resumes a known thread (`codex resume <id>`). Fresh
+    threads are created structurally through app-server before this command.
     `check_for_update_on_startup=false` is required, not cosmetic: the
     update-nag screen's Enter default shells out to
     `npm install -g @openai/codex`, which fails inside the container (the
@@ -521,40 +595,85 @@ def kill_pty_session(session_id: str) -> bool:
     return True
 
 
-def _capture_new_thread(session_id: str, spawned_at: float, max_wait: float = 3600.0) -> None:
-    """Bind whatever thread id codex mints for a fresh interactive session.
-
-    Unlike `codex exec`, a bare interactive TUI reports no thread id up
-    front — the rollout file (whose name embeds the thread UUID) is only
-    written once the operator sends their first real message, which can be
-    arbitrarily far behind spawn. Poll for as long as the tmux session is
-    alive (capped at max_wait as an outer safety bound) rather than a short
-    fixed timeout, which raced both a slow first message and the update-nag
-    screen.
-    """
-    sessions_dir = CODEX_HOME / "sessions"
-    deadline = time.time() + max_wait
-    while pty_session_alive(session_id) and time.time() < deadline:
-        for path in sorted(sessions_dir.glob("**/rollout-*.jsonl"),
-                            key=lambda p: p.stat().st_mtime, reverse=True):
-            if path.stat().st_mtime < spawned_at:
+def _read_rpc_response(proc: subprocess.Popen, request_id: int, timeout: float = 15.0) -> dict:
+    """Read app-server JSON lines until the matching response arrives."""
+    assert proc.stdout is not None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+        if not ready:
+            if proc.poll() is not None:
                 break
-            match = _ROLLOUT_THREAD_RE.search(path.name)
-            if match:
-                THREADS[session_id] = match.group(1)
-                log.info("Captured codex thread %s for new terminal session %s",
-                          match.group(1), session_id)
-                return
-        time.sleep(0.5)
-    if session_id not in THREADS:
-        log.warning("Gave up waiting for a codex thread for session %s after %.0fs",
-                    session_id, max_wait)
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            break
+        message = json.loads(line)
+        if message.get("id") == request_id:
+            return message
+    raise RuntimeError(f"Codex app-server did not answer request {request_id}")
+
+
+def _create_terminal_thread(model: str) -> str:
+    """Create an empty persistent Codex thread before launching its TUI.
+
+    Starting bare Codex and guessing which new rollout belonged to which
+    terminal raced whenever several tiles were opened together. app-server's
+    thread/start method returns the exact UUID without adding a fake turn.
+    """
+    cmd = ["codex"]
+    if CODEX_PROFILE:
+        cmd.extend(["--profile", CODEX_PROFILE])
+    cmd.extend(["app-server", "--listen", "stdio://"])
+    env = dict(os.environ, CODEX_HOME=str(CODEX_HOME))
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, cwd=str(PROJECT_DIR),
+    )
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        proc_stdin = proc.stdin
+
+        def send(message: dict) -> None:
+            proc_stdin.write(json.dumps(message) + "\n")
+            proc_stdin.flush()
+
+        send({"method": "initialize", "id": 1, "params": {
+            "clientInfo": {"name": "hive-outpost", "title": "Hive Outpost", "version": "1"}
+        }})
+        initialized = _read_rpc_response(proc, 1)
+        if initialized.get("error"):
+            raise RuntimeError(f"Codex app-server initialize failed: {initialized['error']}")
+        send({"method": "initialized", "params": {}})
+        send({"method": "thread/start", "id": 2, "params": {
+            "cwd": str(PROJECT_DIR),
+            "model": model,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }})
+        started = _read_rpc_response(proc, 2)
+        if started.get("error"):
+            raise RuntimeError(f"Codex thread creation failed: {started['error']}")
+        thread_id = (((started.get("result") or {}).get("thread") or {}).get("id") or "").strip()
+        if not thread_id:
+            raise RuntimeError("Codex thread creation returned no thread id")
+        return thread_id
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 def spawn_pty(
     session_id: str,
     model: str,
     resume_sid: str | None = None,
+    harness_sid: str | None = None,
     mcp_config: str = "",
     registry: Any = None,
     config_obj: Any = None,
@@ -573,11 +692,10 @@ def spawn_pty(
     attaches a second client to the same `codex` rather than starting a
     rival one.
 
-    ``resume_sid`` is the session's conversation id, required for call-site
-    symmetry with the claude harness, but codex cannot adopt it directly —
-    see THREADS at module scope. A fresh terminal starts a bare `codex` and
-    a background watcher binds whatever thread it mints; a terminal for a
-    session with an already-known thread resumes it by id.
+    ``resume_sid`` is the gateway conversation id. ``harness_sid`` is the
+    separately persisted Codex thread id. A fresh terminal creates its Codex
+    thread through app-server before the TUI starts, reports it to the
+    gateway, and always launches with ``codex resume``.
     """
     del mind_id, mind_name, kwargs, mcp_config, config_obj, registry  # unused
 
@@ -586,6 +704,9 @@ def spawn_pty(
             f"spawn_pty for session {session_id} got no conversation id — "
             "the gateway mints one at session creation and must pass it"
         )
+
+    if harness_sid:
+        _remember_thread(session_id, harness_sid)
 
     name = tmux_session_name(session_id)
     env = os.environ.copy()
@@ -599,9 +720,16 @@ def spawn_pty(
     env.update(overrides)
 
     if not pty_session_alive(session_id):
-        thread_id = THREADS.get(session_id)
+        thread_id = harness_sid or THREADS.get(session_id)
+        if not thread_id:
+            thread_id = _create_terminal_thread(model)
+            _remember_thread(session_id, thread_id)
+            _report_thread(session_id, thread_id)
+        elif not harness_sid:
+            # Backfill hive-comms from the disk safety copy after an upgrade
+            # or a gateway outage during the original thread report.
+            _report_thread(session_id, thread_id)
         cmd = _terminal_argv(thread_id)
-        spawned_at = time.time()
 
         args: list[str] = []
         for option in _TMUX_OPTIONS:
@@ -620,11 +748,6 @@ def spawn_pty(
                 f"{(result.stderr or result.stdout).strip()}"
             )
         log.info("Started tmux session %s (thread=%s)", name, thread_id or "new")
-
-        if not thread_id:
-            threading.Thread(
-                target=_capture_new_thread, args=(session_id, spawned_at), daemon=True,
-            ).start()
 
     master_fd, slave_fd = pty.openpty()
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))

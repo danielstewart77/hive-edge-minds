@@ -11,12 +11,26 @@ import asyncio
 import os
 import queue
 import threading
-import tkinter as tk
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from tkinter import scrolledtext
-from typing import Callable
+from typing import Any
 
-from voice.wake_word_app import WakeWordAppEvent, run_microphone_wake_word_app_with_events
+from voice.wake_word_app import (
+    WakeWordAppEvent,
+    run_microphone_wake_word_app_with_events,
+)
+
+tk: Any
+scrolledtext: Any
+try:
+    import tkinter
+    from tkinter import scrolledtext as tkinter_scrolledtext
+except ModuleNotFoundError:  # Headless server installs do not ship Tk.
+    tk = None
+    scrolledtext = None
+else:
+    tk = tkinter
+    scrolledtext = tkinter_scrolledtext
 
 
 def _display_name() -> str:
@@ -350,11 +364,14 @@ class WakeWordWindow:
 
 
 def launch_wake_word_window(
-    root_factory: Callable[[], tk.Misc] = tk.Tk,
+    root_factory: Callable[[], Any] | None = None,
     controller: WakeWordWindowController | None = None,
 ) -> None:
     """Launch the desktop smart-speaker window."""
 
+    if tk is None:
+        raise RuntimeError("Tkinter is required for wake-word UI mode")
+    root_factory = root_factory or tk.Tk
     root = root_factory()
     WakeWordWindow(root=root, controller=controller)
     root.mainloop()
