@@ -246,6 +246,26 @@ YAML
 YAML
 )"
     fi
+
+    # Codex installs to a hivemind-owned NPM_CONFIG_PREFIX (see Dockerfile).
+    # Mounting a named volume there lets every codex-harness container on
+    # this host share one codex install: `npm install -g @openai/codex@latest`
+    # run in any one of them updates it for all of them, no rebuild needed.
+    # The volume is local to this host's Docker daemon on purpose — outposts
+    # on other hosts each get their own, updated separately (see
+    # tools/stateless/update_codex/).
+    local codex_volume_line="" codex_volumes_block=""
+    if [ "$HARNESS" = "codex_cli_codex" ]; then
+        codex_volume_line="      - codex-global:/home/hivemind/.npm-global
+"
+        codex_volumes_block="
+volumes:
+  codex-global:
+    external: true
+    name: codex-global
+"
+    fi
+
     cat > docker-compose.yml <<EOF
 # $NAME — hive-outpost mind ($ROLE) as a container.
 # Joins the external \`hivemind\` network so hive-comms can reach it and its
@@ -265,7 +285,7 @@ services:
       COMMS_URL: http://hive-comms:8424
       LUCENT_URL_SELF: http://hive-lucent:8424
 $operator_block
-    networks:
+$codex_volume_line    networks:
       - hivemind
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -274,8 +294,17 @@ networks:
   hivemind:
     external: true
     name: hivemind
+$codex_volumes_block
 EOF
     echo "Wrote docker-compose.yml"
+    if [ "$HARNESS" = "codex_cli_codex" ]; then
+        cat <<EOF
+Note: this mind shares codex updates with sibling codex-harness containers
+on this host via the codex-global volume. Create it once per host before
+first start:
+  docker volume create codex-global
+EOF
+    fi
     cat <<EOF
 
 Next steps:
