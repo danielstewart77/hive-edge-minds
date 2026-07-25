@@ -244,6 +244,7 @@ def spawn_pty(
     mind_name: str = "MIND_NAME",
     cols: int = 80,
     rows: int = 24,
+    client_ref: str | None = None,
     **kwargs: Any,
 ) -> tuple[subprocess.Popen, int]:
     """Attach a pty to this session's interactive `claude`, starting it if needed.
@@ -269,7 +270,10 @@ def spawn_pty(
     and the pty master fd; the caller owns both lifecycles, and ending them
     detaches the view without touching the conversation.
     """
-    del mind_id, mind_name, kwargs  # unused, kept for call-site symmetry with spawn()
+    del mind_id, mind_name  # unused, kept for call-site symmetry with spawn()
+    owner_type = kwargs.pop("owner_type", None) or ""
+    owner_ref = kwargs.pop("owner_ref", None) or ""
+    del kwargs  # remainder unused, kept for call-site symmetry with spawn()
 
     from config import PROJECT_DIR
 
@@ -299,6 +303,17 @@ def spawn_pty(
     # needed. The surface_inject.sh hook reads this to tell the model which
     # surface each turn arrived on.
     overrides["HIVE_SURFACE"] = "terminal"
+    # Per-session env for hooks (rotation_check, etc.) inside the tmux pane.
+    # Without these the Stop hook's threshold check finds no CLIENT_REF and
+    # bails on every fire, so a terminal conversation never rotates and just
+    # grows until Claude's own native compaction is the only thing left to
+    # intervene.
+    if client_ref:
+        overrides["CLIENT_REF"] = client_ref
+    if owner_type:
+        overrides["OWNER_TYPE"] = owner_type
+    if owner_ref:
+        overrides["OWNER_REF"] = owner_ref
     env.update(overrides)
 
     if not pty_session_alive(session_id):

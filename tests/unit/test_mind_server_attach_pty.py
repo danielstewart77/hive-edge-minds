@@ -70,6 +70,27 @@ class TestAttachPty:
         assert kwargs["model"] == "sonnet"
         os.close(slave_fd)
 
+    def test_rotation_routing_params_reach_spawn_pty(self, client):
+        """CLIENT_REF/OWNER_TYPE/OWNER_REF have to reach spawn_pty or the
+        rotation Stop hook never sees them in the pane env, and a terminal
+        session never rotates."""
+        test_client, mind_server = client
+        master_fd, slave_fd = pty.openpty()
+        proc = _fake_proc()
+        mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
+
+        with test_client.websocket_connect(
+            "/sessions/sess-9/attach-pty"
+            "?resume_sid=abc&client_ref=terminal-abc&owner_type=web&owner_ref=u1"
+        ):
+            pass
+
+        kwargs = mind_server.impl.spawn_pty.call_args.kwargs
+        assert kwargs["client_ref"] == "terminal-abc"
+        assert kwargs["owner_type"] == "web"
+        assert kwargs["owner_ref"] == "u1"
+        os.close(slave_fd)
+
     def test_pumps_browser_input_to_process(self, client):
         test_client, mind_server = client
         master_fd, slave_fd = pty.openpty()

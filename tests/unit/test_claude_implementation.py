@@ -156,6 +156,26 @@ class TestSpawnPty:
         assert "HIVE_SURFACE=terminal" in tmux.new_session
         assert popen.call_args.kwargs["env"]["HIVE_SURFACE"] == "terminal"
 
+    def test_rotation_env_reaches_the_pane(self):
+        """The rotation Stop hook reads CLIENT_REF/OWNER_TYPE/OWNER_REF from
+        the process env. Without them on a terminal spawn the hook bails on
+        every fire and a terminal conversation never rotates."""
+        tmux, popen, _ = _spawned(client_ref="terminal-abc", owner_type="web", owner_ref="u1")
+
+        assert "CLIENT_REF=terminal-abc" in tmux.new_session
+        assert "OWNER_TYPE=web" in tmux.new_session
+        assert "OWNER_REF=u1" in tmux.new_session
+        assert popen.call_args.kwargs["env"]["CLIENT_REF"] == "terminal-abc"
+        assert popen.call_args.kwargs["env"]["OWNER_TYPE"] == "web"
+        assert popen.call_args.kwargs["env"]["OWNER_REF"] == "u1"
+
+    def test_missing_rotation_env_sets_nothing(self):
+        tmux, _, _ = _spawned()
+
+        assert not any(c.startswith("CLIENT_REF=") for c in tmux.new_session)
+        assert not any(c.startswith("OWNER_TYPE=") for c in tmux.new_session)
+        assert not any(c.startswith("OWNER_REF=") for c in tmux.new_session)
+
     def test_agent_view_disabled_so_a_tile_stays_on_its_own_conversation(self):
         """The agent view backgrounds the conversation into a daemon-hosted pty
         of its own geometry and lets a tile fork into someone else's transcript.

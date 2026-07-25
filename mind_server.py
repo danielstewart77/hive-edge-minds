@@ -391,7 +391,8 @@ async def _reap_idle_ptys() -> None:
 
 
 def _open_pty_session(
-    session_id: str, model: str, resume_sid: str | None, cols: int, rows: int
+    session_id: str, model: str, resume_sid: str | None, cols: int, rows: int,
+    client_ref: str | None = None, owner_type: str | None = None, owner_ref: str | None = None,
 ) -> _PtyHandle:
     """Attach this tile to the session's terminal, starting one if needed.
 
@@ -422,6 +423,9 @@ def _open_pty_session(
         mind_name=MIND_NAME,
         cols=cols,
         rows=rows,
+        client_ref=client_ref,
+        owner_type=owner_type,
+        owner_ref=owner_ref,
     )
     handle.proc = proc
     handle.master_fd = master_fd
@@ -440,6 +444,9 @@ async def attach_pty(
     model: str = "sonnet",
     cols: int = 80,
     rows: int = 24,
+    client_ref: str | None = None,
+    owner_type: str | None = None,
+    owner_ref: str | None = None,
 ):
     """Bidirectional raw-byte bridge between a browser terminal and this
     session's interactive `claude`.
@@ -478,7 +485,10 @@ async def attach_pty(
 
     cols, rows = _clamp_winsize(cols, rows)
     try:
-        handle = _open_pty_session(session_id, model, resume_sid, cols, rows)
+        handle = _open_pty_session(
+            session_id, model, resume_sid, cols, rows,
+            client_ref=client_ref, owner_type=owner_type, owner_ref=owner_ref,
+        )
     except Exception:
         log.exception("Failed to open terminal for session %s", session_id)
         await websocket.close(code=1011, reason="failed to start terminal")
