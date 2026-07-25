@@ -132,3 +132,16 @@ def test_rejects_bad_inputs(repo):
     assert _run(repo, "--name", "ok", "--role", "satellite",
                 "--deployment", "systemd", "--harness", "no_such_harness",
                 "--surfaces", "none", "--port", "8421").returncode != 0
+
+
+def test_existing_env_mind_id_is_reused(repo):
+    (repo / ".env").write_text("MIND_NAME=old\nMIND_ID=11111111-2222-3333-4444-555555555555\n")
+    result = _run(repo, "--name", "atlas", "--role", "satellite",
+                  "--deployment", "windows-task", "--harness", "codex_cli_codex",
+                  "--surfaces", "none", "--port", "8421")
+    assert result.returncode == 0, result.stderr
+    runtime = (repo / "minds/atlas/runtime.yaml").read_text()
+    assert "mind_id: 11111111-2222-3333-4444-555555555555" in runtime
+    env = (repo / ".env").read_text()
+    assert env.count("MIND_ID=") == 1
+    assert "MIND_ID=11111111-2222-3333-4444-555555555555" in env

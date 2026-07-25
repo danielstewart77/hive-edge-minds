@@ -144,8 +144,12 @@ node_modules/
 config.yaml
 .mcp.json
 .mcp.container.json
+
+# Generated installers (setup.sh output — per-host)
+docker-compose.yml
 docker-compose.override.yml
 docker-compose.production.yml
+/deploy/
 
 # Local tool state
 .claude/

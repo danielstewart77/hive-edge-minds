@@ -86,8 +86,16 @@ if [ "$DEPLOYMENT" = "systemd" ] && [ "$HARNESS" = "claude_cli_claude" ] \
     exit 1
 fi
 
-MIND_ID="$(command -v uuidgen >/dev/null 2>&1 && uuidgen \
-           || python3 -c 'import uuid; print(uuid.uuid4())')"
+# An existing .env MIND_ID is this mind's identity — every memory write in
+# the hive carries it. Reuse it; minting a second one would split the mind.
+MIND_ID=""
+if [ -f .env ]; then
+    MIND_ID="$(sed -n 's/^MIND_ID=//p' .env | head -1)"
+fi
+if [ -z "$MIND_ID" ]; then
+    MIND_ID="$(command -v uuidgen >/dev/null 2>&1 && uuidgen \
+               || python3 -c 'import uuid; print(uuid.uuid4())')"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Mind scaffold
