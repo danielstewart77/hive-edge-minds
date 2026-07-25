@@ -185,6 +185,7 @@ emit_systemd() {
     local path_line="$bin_dir"
     [ -n "$node_dir" ] && [ "$node_dir" != "$bin_dir" ] && path_line+=":$node_dir"
     path_line+=":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    local service_user="${USER:-$(id -un)}"
 
     cat > "deploy/$NAME.service" <<EOF
 [Unit]
@@ -193,7 +194,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=$USER
+User=$service_user
 WorkingDirectory=$ROOT
 EnvironmentFile=$ROOT/.env
 Environment=PATH=$path_line

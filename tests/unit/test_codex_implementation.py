@@ -8,7 +8,6 @@ real `codex exec`.
 import json
 import os
 import subprocess
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -68,8 +67,10 @@ def _ev(obj):
 
 
 @pytest.fixture(autouse=True)
-def _isolate(monkeypatch):
+def _isolate(monkeypatch, tmp_path):
     """Clear session state between tests."""
+    monkeypatch.setattr(impl, "_THREAD_MAP_PATH", tmp_path / "thread-map.json")
+    monkeypatch.setattr(impl, "CODEX_PROFILE", "")
     impl._sessions.clear()
     impl.THREADS.clear()
     yield
@@ -286,20 +287,24 @@ def _spawned(alive: bool = False, tmux: "_TmuxRecorder | None" = None, **kwargs)
     tmux = tmux or _TmuxRecorder()
     call_kwargs = {"session_id": "s1", "model": "gpt-5.4", "resume_sid": "conv-1"}
     call_kwargs.update(kwargs)
+    report_thread = MagicMock()
     with patch("mind_templates.codex_cli_codex._tmux", tmux), \
          patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=alive), \
          patch("mind_templates.codex_cli_codex.pty.openpty", return_value=(11, 22)), \
          patch("mind_templates.codex_cli_codex.fcntl.ioctl"), \
          patch("mind_templates.codex_cli_codex.os.close"), \
-         patch("mind_templates.codex_cli_codex.threading.Thread") as thread_cls, \
+         patch("mind_templates.codex_cli_codex._create_terminal_thread",
+               return_value="thread-created") as create_thread, \
+         patch("mind_templates.codex_cli_codex._report_thread", report_thread), \
          patch("mind_templates.codex_cli_codex.subprocess.Popen") as popen:
         popen.return_value = MagicMock(pid=999)
         result = impl.spawn_pty(**call_kwargs)
-    return tmux, popen, thread_cls, result
+    create_thread.report_thread = report_thread
+    return tmux, popen, create_thread, result
 
 
 class TestSpawnPty:
-    def test_pane_argv_starts_bare_codex_with_update_check_disabled(self):
+    def test_pane_argv_resumes_precreated_thread_with_update_check_disabled(self):
         """The update-nag screen's Enter default runs `npm install -g` and
         kills codex when that fails inside the container (no write access
         to the global npm dir) — check_for_update_on_startup=false is the
@@ -308,7 +313,7 @@ class TestSpawnPty:
 
         cmd = tmux.pane_argv
         assert cmd[0] == "codex"
-        assert "resume" not in cmd
+        assert cmd[:3] == ["codex", "resume", "thread-created"]
         assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "check_for_update_on_startup=false"
         assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "--dangerously-bypass-hook-trust" in cmd
@@ -420,23 +425,28 @@ class TestSpawnPty:
 
         assert mock_ioctl.call_args.args[0] == 22
 
-    def test_fresh_terminal_starts_a_thread_capture_watcher(self):
-        """No thread yet: a background watcher has to bind whatever codex
-        mints once the operator's first message lands, or every later turn
-        forks a new thread instead of resuming this terminal's."""
-        tmux, _, thread_cls, _ = _spawned(session_id="s2")
+    def test_fresh_terminal_precreates_and_reports_exact_thread(self):
+        tmux, _, create_thread, _ = _spawned(session_id="s2")
 
-        thread_cls.assert_called_once()
-        assert thread_cls.call_args.kwargs["target"] is impl._capture_new_thread
-        assert thread_cls.call_args.kwargs["args"][0] == "s2"
-        assert thread_cls.call_args.kwargs["daemon"] is True
+        create_thread.assert_called_once_with("gpt-5.4")
+        create_thread.report_thread.assert_called_once_with("s2", "thread-created")
+        assert tmux.pane_argv[:3] == ["codex", "resume", "thread-created"]
 
-    def test_known_thread_spawn_skips_the_capture_watcher(self):
-        """Nothing new to capture — resuming a thread we already know."""
+    def test_gateway_thread_is_resumed_without_creating_another(self):
         impl.THREADS["s3"] = "thread-known"
-        _, _, thread_cls, _ = _spawned(session_id="s3")
+        tmux, _, create_thread, _ = _spawned(
+            session_id="s3", harness_sid="thread-gateway"
+        )
 
-        thread_cls.assert_not_called()
+        create_thread.assert_not_called()
+        assert tmux.pane_argv[:3] == ["codex", "resume", "thread-gateway"]
+
+    def test_local_safety_copy_backfills_the_gateway(self):
+        impl.THREADS["s4"] = "thread-local"
+        _, _, create_thread, _ = _spawned(session_id="s4")
+
+        create_thread.assert_not_called()
+        create_thread.report_thread.assert_called_once_with("s4", "thread-local")
 
 
 class TestTmuxSessionLifecycle:
@@ -463,59 +473,55 @@ class TestTmuxSessionLifecycle:
             assert impl.kill_pty_session("s1") is False
 
 
-class TestCaptureNewThread:
-    """The watcher that binds a fresh interactive session's minted thread.
+class TestThreadMap:
+    def test_remembered_thread_survives_memory_reset(self):
+        impl._remember_thread("s1", "thread-one")
+        impl.THREADS.clear()
+        assert impl._load_thread_map() == {"s1": "thread-one"}
 
-    A bare `codex` TUI reports no thread id up front — unlike `codex exec`,
-    the rollout file only appears once the operator sends a real message —
-    so the watcher polls for as long as the terminal is alive rather than a
-    short fixed timeout.
-    """
+    def test_forget_removes_persisted_mapping(self):
+        impl._remember_thread("s1", "thread-one")
+        impl._forget_thread("s1")
+        assert impl._load_thread_map() == {}
 
-    def _rollout(self, tmp_path, thread_id, mtime):
-        sessions_dir = tmp_path / "sessions"
-        sessions_dir.mkdir(exist_ok=True)
-        path = sessions_dir / f"rollout-2026-07-25T19-00-00-{thread_id}.jsonl"
-        path.write_text("{}")
-        os.utime(path, (mtime, mtime))
-        return path
 
-    def test_binds_the_thread_once_its_rollout_appears(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(impl, "CODEX_HOME", tmp_path)
-        spawned_at = time.time()
-        self._rollout(tmp_path, "019f9aaa-7f0f-71a0-af10-c45007904da0", spawned_at + 1)
+class TestCreateTerminalThread:
+    def test_app_server_returns_exact_empty_thread_id(self, monkeypatch):
+        class Input:
+            def __init__(self):
+                self.messages = []
 
-        with patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=True):
-            impl._capture_new_thread("s1", spawned_at, max_wait=2.0)
+            def write(self, value):
+                self.messages.append(json.loads(value))
 
-        assert impl.THREADS["s1"] == "019f9aaa-7f0f-71a0-af10-c45007904da0"
+            def flush(self):
+                pass
 
-    def test_ignores_rollouts_older_than_the_spawn(self, tmp_path, monkeypatch):
-        """A stale rollout from a previous terminal on this session must not
-        be mistaken for the one this spawn is waiting on."""
-        monkeypatch.setattr(impl, "CODEX_HOME", tmp_path)
-        spawned_at = time.time()
-        self._rollout(tmp_path, "00000000-0000-0000-0000-000000000000", spawned_at - 100)
+        class Output:
+            def __init__(self):
+                self.lines = iter([
+                    json.dumps({"id": 1, "result": {}}) + "\n",
+                    json.dumps({"method": "thread/started", "params": {}}) + "\n",
+                    json.dumps({"id": 2, "result": {
+                        "thread": {"id": "thread-exact"}
+                    }}) + "\n",
+                ])
 
-        alive = iter([True, False])
-        with patch("mind_templates.codex_cli_codex.pty_session_alive",
-                   side_effect=lambda sid: next(alive, False)), \
-             patch("mind_templates.codex_cli_codex.time.sleep"):
-            impl._capture_new_thread("s1", spawned_at, max_wait=30.0)
+            def readline(self):
+                return next(self.lines, "")
 
-        assert "s1" not in impl.THREADS
+        proc = MagicMock()
+        proc.stdin = Input()
+        proc.stdout = Output()
+        proc.poll.return_value = None
+        monkeypatch.setattr(impl.subprocess, "Popen", MagicMock(return_value=proc))
+        monkeypatch.setattr(impl.select, "select", lambda *args: ([proc.stdout], [], []))
 
-    def test_gives_up_once_the_terminal_dies(self, tmp_path, monkeypatch):
-        """No rollout ever appears if the operator never sent a message —
-        the watcher must stop with the terminal, not spin for max_wait."""
-        monkeypatch.setattr(impl, "CODEX_HOME", tmp_path)
-        started = time.time()
-
-        with patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=False):
-            impl._capture_new_thread("s1", started, max_wait=30.0)
-
-        assert time.time() - started < 5.0
-        assert "s1" not in impl.THREADS
+        assert impl._create_terminal_thread("gpt-5.4") == "thread-exact"
+        assert proc.stdin.messages[2]["method"] == "thread/start"
+        assert proc.stdin.messages[2]["params"]["model"] == "gpt-5.4"
+        assert "input" not in proc.stdin.messages[2]["params"]
+        proc.terminate.assert_called_once()
 
 
 class TestExtractAssistantTexts:

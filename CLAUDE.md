@@ -59,9 +59,10 @@ stream-json path (claude).
   `spawn_pty` for the browser terminal.
 - `codex_cli_codex` — one `codex exec --json` subprocess per turn. Codex
   mints its own thread ids and cannot adopt the gateway's conversation id;
-  the session→thread mapping lives in the module-level `THREADS` registry,
-  and a failed or incomplete turn resets the thread so the next turn never
-  resumes a broken one. POSIX spawns use `start_new_session` + `killpg`
+  hive-comms persists that provider-native id as `harness_sid`, while the
+  outpost keeps a local disk-backed safety copy. A failed or incomplete turn
+  clears both so the next turn never resumes a broken one. POSIX spawns use
+  `start_new_session` + `killpg`
   (the node wrapper's rust child must not orphan to PID 1); Windows uses
   CREATE_NO_WINDOW (hidden console inherited by children — never
   DETACHED_PROCESS, which makes every console child pop a visible conhost
@@ -72,10 +73,10 @@ stream-json path (claude).
 hive-comms mints the conversation id when the session row is written. Every
 spawn is handed that id: `--resume` when a transcript exists, `--session-id`
 when it's the conversation's first process. A mind handed no id raises
-rather than inventing one; an id reported by the harness is logged and
-ignored, never written back. Surfaces therefore share one conversation by
-construction. (Codex is the exception on the harness side — see THREADS
-above — but the session's identity is still the gateway's id.)
+rather than inventing one. Surfaces therefore share one conversation by
+construction. Codex additionally reports its own thread id, which hive-comms
+stores separately as `harness_sid` and returns on every spawn and terminal
+attach; the session's identity remains the gateway's id.
 
 ### Browser terminal (claude harness, tmux-backed)
 

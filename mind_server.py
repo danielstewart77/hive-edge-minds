@@ -393,6 +393,7 @@ async def _reap_idle_ptys() -> None:
 def _open_pty_session(
     session_id: str, model: str, resume_sid: str | None, cols: int, rows: int,
     client_ref: str | None = None, owner_type: str | None = None, owner_ref: str | None = None,
+    harness_sid: str | None = None,
 ) -> _PtyHandle:
     """Attach this tile to the session's terminal, starting one if needed.
 
@@ -426,6 +427,7 @@ def _open_pty_session(
         client_ref=client_ref,
         owner_type=owner_type,
         owner_ref=owner_ref,
+        harness_sid=harness_sid,
     )
     handle.proc = proc
     handle.master_fd = master_fd
@@ -447,6 +449,7 @@ async def attach_pty(
     client_ref: str | None = None,
     owner_type: str | None = None,
     owner_ref: str | None = None,
+    harness_sid: str | None = None,
 ):
     """Bidirectional raw-byte bridge between a browser terminal and this
     session's interactive `claude`.
@@ -496,6 +499,7 @@ async def attach_pty(
         handle = _open_pty_session(
             session_id, model, resume_sid, cols, rows,
             client_ref=client_ref, owner_type=owner_type, owner_ref=owner_ref,
+            harness_sid=harness_sid,
         )
     except Exception:
         log.exception("Failed to open terminal for session %s", session_id)
@@ -822,6 +826,7 @@ async def create_session(request: Request):
         return JSONResponse({"error": "session_id required"}, status_code=400)
     model = body.get("model", "sonnet")
     resume_sid = (body.get("resume_sid") or "").strip()
+    harness_sid = (body.get("harness_sid") or "").strip() or None
     if not resume_sid:
         return JSONResponse(
             {"error": "resume_sid (conversation id) required — the gateway mints it"},
@@ -847,6 +852,7 @@ async def create_session(request: Request):
             model=model,
             autopilot=autopilot,
             resume_sid=resume_sid,
+            harness_sid=harness_sid,
             surface_prompt=surface_prompt,
             allowed_directories=allowed_directories,
             mind_id=MIND_ID,
