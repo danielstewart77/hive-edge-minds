@@ -32,7 +32,7 @@ import json
 import logging
 import os
 import pty
-import select
+import re
 import signal
 import struct
 import subprocess
@@ -595,78 +595,44 @@ def kill_pty_session(session_id: str) -> bool:
     return True
 
 
-def _read_rpc_response(proc: subprocess.Popen, request_id: int, timeout: float = 15.0) -> dict:
-    """Read app-server JSON lines until the matching response arrives."""
-    assert proc.stdout is not None
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], 0.25)
-        if not ready:
-            if proc.poll() is not None:
-                break
-            continue
-        line = proc.stdout.readline()
-        if not line:
-            break
-        message = json.loads(line)
-        if message.get("id") == request_id:
-            return message
-    raise RuntimeError(f"Codex app-server did not answer request {request_id}")
+_ROLLOUT_UUID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+    re.IGNORECASE,
+)
 
 
-def _create_terminal_thread(model: str) -> str:
-    """Create an empty persistent Codex thread before launching its TUI.
+def _existing_rollout_paths() -> set[Path]:
+    sessions_dir = CODEX_HOME / "sessions"
+    if not sessions_dir.exists():
+        return set()
+    return set(sessions_dir.rglob("*.jsonl"))
 
-    Starting bare Codex and guessing which new rollout belonged to which
-    terminal raced whenever several tiles were opened together. app-server's
-    thread/start method returns the exact UUID without adding a fake turn.
+
+def _watch_for_new_thread(session_id: str, before: set[Path]) -> None:
+    """A fresh terminal starts bare `codex` with no thread id yet: app-server's
+    thread/start mints one without persisting a rollout, and codex only
+    writes that file once a real turn begins — there is nothing on disk to
+    resume before the user's first message. Poll for the rollout codex
+    itself creates and report it, so a later reattach (after the tmux
+    session has died) resumes the real conversation instead of starting a
+    new one. Gives up once the tmux session ends with nothing ever typed.
     """
-    cmd = ["codex"]
-    if CODEX_PROFILE:
-        cmd.extend(["--profile", CODEX_PROFILE])
-    cmd.extend(["app-server", "--listen", "stdio://"])
-    env = dict(os.environ, CODEX_HOME=str(CODEX_HOME))
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, cwd=str(PROJECT_DIR),
-    )
-    try:
-        assert proc.stdin is not None
-        assert proc.stdout is not None
-        assert proc.stderr is not None
-        proc_stdin = proc.stdin
+    name = tmux_session_name(session_id)
+    while _tmux("has-session", "-t", name).returncode == 0:
+        new = _existing_rollout_paths() - before
+        for path in new:
+            match = _ROLLOUT_UUID_RE.search(path.name)
+            if match:
+                _remember_thread(session_id, match.group(1))
+                _report_thread(session_id, match.group(1))
+                return
+        time.sleep(1.0)
 
-        def send(message: dict) -> None:
-            proc_stdin.write(json.dumps(message) + "\n")
-            proc_stdin.flush()
 
-        send({"method": "initialize", "id": 1, "params": {
-            "clientInfo": {"name": "hive-outpost", "title": "Hive Outpost", "version": "1"}
-        }})
-        initialized = _read_rpc_response(proc, 1)
-        if initialized.get("error"):
-            raise RuntimeError(f"Codex app-server initialize failed: {initialized['error']}")
-        send({"method": "initialized", "params": {}})
-        send({"method": "thread/start", "id": 2, "params": {
-            "cwd": str(PROJECT_DIR),
-            "model": model,
-            "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
-        }})
-        started = _read_rpc_response(proc, 2)
-        if started.get("error"):
-            raise RuntimeError(f"Codex thread creation failed: {started['error']}")
-        thread_id = (((started.get("result") or {}).get("thread") or {}).get("id") or "").strip()
-        if not thread_id:
-            raise RuntimeError("Codex thread creation returned no thread id")
-        return thread_id
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+def _watch_for_new_thread_in_background(session_id: str, before: set[Path]) -> None:
+    threading.Thread(
+        target=_watch_for_new_thread, args=(session_id, before), daemon=True
+    ).start()
 
 
 def spawn_pty(
@@ -693,11 +659,12 @@ def spawn_pty(
     rival one.
 
     ``resume_sid`` is the gateway conversation id. ``harness_sid`` is the
-    separately persisted Codex thread id. A fresh terminal creates its Codex
-    thread through app-server before the TUI starts, reports it to the
-    gateway, and always launches with ``codex resume``.
+    separately persisted Codex thread id. A fresh terminal has neither: it
+    launches bare `codex`, and a background watcher reports the thread id
+    once codex creates one on the first real turn. Every later reattach
+    launches with ``codex resume <thread_id>``.
     """
-    del mind_id, mind_name, kwargs, mcp_config, config_obj, registry  # unused
+    del mind_id, mind_name, kwargs, mcp_config, config_obj, registry, model  # unused
 
     if not resume_sid:
         raise ValueError(
@@ -721,14 +688,14 @@ def spawn_pty(
 
     if not pty_session_alive(session_id):
         thread_id = harness_sid or THREADS.get(session_id)
-        if not thread_id:
-            thread_id = _create_terminal_thread(model)
-            _remember_thread(session_id, thread_id)
-            _report_thread(session_id, thread_id)
-        elif not harness_sid:
+        if thread_id and not harness_sid:
             # Backfill hive-comms from the disk safety copy after an upgrade
             # or a gateway outage during the original thread report.
             _report_thread(session_id, thread_id)
+        # A brand-new terminal has no thread yet: launch bare `codex` and
+        # let it mint its own on the user's first turn (see
+        # _watch_for_new_thread for why this can't be pre-created).
+        before = _existing_rollout_paths() if not thread_id else set()
         cmd = _terminal_argv(thread_id)
 
         args: list[str] = []
@@ -748,6 +715,8 @@ def spawn_pty(
                 f"{(result.stderr or result.stdout).strip()}"
             )
         log.info("Started tmux session %s (thread=%s)", name, thread_id or "new")
+        if not thread_id:
+            _watch_for_new_thread_in_background(session_id, before)
 
     master_fd, slave_fd = pty.openpty()
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))

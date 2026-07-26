@@ -57,12 +57,13 @@ stream-json path (claude).
 
 - `claude_cli_claude` — long-lived `claude --stream-json` per session, plus
   `spawn_pty` for the browser terminal.
-- `codex_cli_codex` — one `codex exec --json` subprocess per turn. Codex
-  mints its own thread ids and cannot adopt the gateway's conversation id;
-  hive-comms persists that provider-native id as `harness_sid`, while the
-  outpost keeps a local disk-backed safety copy. A failed or incomplete turn
-  clears both so the next turn never resumes a broken one. POSIX spawns use
-  `start_new_session` + `killpg`
+- `codex_cli_codex` — one `codex exec --json` subprocess per turn, plus
+  `spawn_pty` for the browser terminal. Codex mints its own thread ids and
+  cannot adopt the gateway's conversation id; hive-comms persists that
+  provider-native id as `harness_sid`, while the outpost keeps a local
+  disk-backed safety copy. A failed or incomplete turn clears both so the
+  next turn never resumes a broken one. POSIX spawns use `start_new_session`
+  + `killpg`
   (the node wrapper's rust child must not orphan to PID 1); Windows uses
   CREATE_NO_WINDOW (hidden console inherited by children — never
   DETACHED_PROCESS, which makes every console child pop a visible conhost
@@ -78,24 +79,39 @@ construction. Codex additionally reports its own thread id, which hive-comms
 stores separately as `harness_sid` and returns on every spawn and terminal
 attach; the session's identity remains the gateway's id.
 
-### Browser terminal (claude harness, tmux-backed)
+### Browser terminal (tmux-backed)
 
 `mind_server.py` exposes `WS /sessions/{id}/attach-pty`, bridging raw bytes
-between an xterm.js tile and an interactive `claude`. **The conversation
-lives in tmux; a tile is a client.** `spawn_pty` starts `claude` inside a
-tmux session on a dedicated socket, then attaches a `tmux attach-session -d`
-client in a pty of the tile's geometry — ending the client detaches the view
-without touching the conversation, and re-attaching joins the same session
-rather than starting a rival `claude`. tmux owns the screen model and
-history: it repaints on attach and on live resize, which is why no
-scrollback ring, VT emulator, or snapshot painter exists here.
-`_take_controlling_tty` (setsid + TIOCSCTTY) makes SIGWINCH actually reach
-the app — without a controlling terminal a resize sets winsize and signals
-nobody. The socket carries a NUL-byte heartbeat every 5s so half-open mobile
-connections are detectable. `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` is set in the
-pane: the harness's agent view is a second session picker inside a surface
-that already has one, and it re-hosts the conversation in a nested pty at
-the wrong geometry.
+between an xterm.js tile and an interactive harness CLI (`claude` or
+`codex`, per the mind's template — both templates implement `spawn_pty`).
+**The conversation lives in tmux; a tile is a client.** `spawn_pty` starts
+the CLI inside a tmux session on a dedicated socket, then attaches a `tmux
+attach-session -d` client in a pty of the tile's geometry — ending the
+client detaches the view without touching the conversation, and
+re-attaching joins the same session rather than starting a rival CLI
+process. tmux owns the screen model and history: it repaints on attach and
+on live resize, which is why no scrollback ring, VT emulator, or snapshot
+painter exists here. `_take_controlling_tty` (setsid + TIOCSCTTY) makes
+SIGWINCH actually reach the app — without a controlling terminal a resize
+sets winsize and signals nobody. The socket carries a NUL-byte heartbeat
+every 5s so half-open mobile connections are detectable. For the claude
+harness, `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` is set in the pane: the
+harness's agent view is a second session picker inside a surface that
+already has one, and it re-hosts the conversation in a nested pty at the
+wrong geometry. For the codex harness, a fresh terminal launches bare
+`codex` (no thread id yet) rather than pre-minting one through `app-server`:
+`app-server`'s `thread/start` RPC returns a thread id and an intended
+rollout path without actually writing that rollout file to disk, so
+`codex resume <id>` against a pre-minted id fails with "No saved session
+found." A background daemon thread polls `CODEX_HOME/sessions/` for the one
+new rollout file codex itself writes once the user's first real turn
+begins, extracts the thread id from its filename, and reports it via the
+same `harness_sid` path the per-turn chat flow uses — mirroring how that
+flow already captures `thread.started` in real time. Every later reattach
+launches `codex resume <id>` against that discovered id. `app-server` has
+its own arg parser and rejects `--profile` outright — unlike plain
+`codex`/`codex exec` invocations — so both paths read the config profile
+from `CODEX_HOME`'s `config.toml` directly instead.
 
 The process ends only on `DELETE /sessions/{id}` or via the idle reaper
 (`PTY_IDLE_TIMEOUT_SECONDS`, default one hour unattached). A turn in flight
