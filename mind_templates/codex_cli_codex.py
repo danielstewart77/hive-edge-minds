@@ -553,9 +553,10 @@ def _take_controlling_tty() -> None:
 def _terminal_argv(thread_id: str | None) -> list[str]:
     """The interactive `codex` that runs inside the tmux pane.
 
-    Every terminal resumes a known thread (`codex resume <id>`). Fresh
-    threads are created structurally through app-server before this command.
-    `check_for_update_on_startup=false` is required, not cosmetic: the
+    Resumes a known thread (`codex resume <id>`) when one exists and has a
+    rollout on disk; a fresh terminal launches bare `codex` instead (see
+    `_watch_for_new_thread`). `check_for_update_on_startup=false` is
+    required, not cosmetic: the
     update-nag screen's Enter default shells out to
     `npm install -g @openai/codex`, which fails inside the container (the
     non-root user has no write access to the global npm dir) and kills
@@ -606,6 +607,22 @@ def _existing_rollout_paths() -> set[Path]:
     if not sessions_dir.exists():
         return set()
     return set(sessions_dir.rglob("*.jsonl"))
+
+
+def _rollout_exists(thread_id: str) -> bool:
+    """A harness_sid is only resumable if its rollout is on *this* CODEX_HOME.
+
+    A thread id can outlive the container that minted it — a redeploy onto a
+    fresh volume, a migration to a new host — while hive-comms and the disk
+    safety copy still point at it. `codex resume` on a missing rollout dies
+    within a second of tmux starting it, which reads identically to a hung
+    terminal. Check before trusting either source.
+    """
+    return any(
+        _ROLLOUT_UUID_RE.search(path.name)
+        and _ROLLOUT_UUID_RE.search(path.name).group(1).lower() == thread_id.lower()
+        for path in _existing_rollout_paths()
+    )
 
 
 def _watch_for_new_thread(session_id: str, before: set[Path]) -> None:
@@ -662,7 +679,10 @@ def spawn_pty(
     separately persisted Codex thread id. A fresh terminal has neither: it
     launches bare `codex`, and a background watcher reports the thread id
     once codex creates one on the first real turn. Every later reattach
-    launches with ``codex resume <thread_id>``.
+    launches with ``codex resume <thread_id>`` — unless that thread's
+    rollout no longer exists under this ``CODEX_HOME`` (a migration or a
+    redeploy onto a fresh volume), in which case it is discarded and
+    treated as fresh.
     """
     del mind_id, mind_name, kwargs, mcp_config, config_obj, registry, model  # unused
 
@@ -688,7 +708,19 @@ def spawn_pty(
 
     if not pty_session_alive(session_id):
         thread_id = harness_sid or THREADS.get(session_id)
-        if thread_id and not harness_sid:
+        if thread_id and not _rollout_exists(thread_id):
+            # A thread id outlived its rollout — a redeploy onto a fresh
+            # volume, a migration to a new host. hive-comms and the disk
+            # safety copy still point at it, but `codex resume` on it dies
+            # within a second of tmux starting it. Treat it as if this
+            # terminal had never had a thread.
+            log.warning(
+                "Discarding stale thread %s for session %s — no matching "
+                "rollout under %s", thread_id, session_id, CODEX_HOME,
+            )
+            _forget_thread(session_id)
+            thread_id = None
+        elif thread_id and not harness_sid:
             # Backfill hive-comms from the disk safety copy after an upgrade
             # or a gateway outage during the original thread report.
             _report_thread(session_id, thread_id)
