@@ -122,6 +122,25 @@ The process ends only on `DELETE /sessions/{id}` or via the idle reaper
 (`PTY_IDLE_TIMEOUT_SECONDS`, default one hour unattached). A turn in flight
 survives a closed tab.
 
+A terminal tile follows its own rotation. Rotation normally arms a flag that
+hive-comms consumes on the conversation's next user turn, but keystrokes are
+raw bytes — the terminal never calls `send_message`, so there is no turn to
+consume it. For sessions whose `owner_ref` is `terminal`, `arm_rotation`
+therefore finalizes on the spot: the successor is created first, then the old
+session is killed with the new id attached to the published `session_closed`
+event. `ws_attach` turns that into close code **4412** with the successor id
+as the reason, and the tile reattaches straight to it — no polling, no dead
+tile. Bare 4410 keeps its old meaning: ended, no successor. The tile must be
+holding current JS to honor 4412; a tab left open across the deploy runs the
+old handler and falls back to sitting disconnected.
+
+Terminal turns also have to reach the `session_turns` ledger, which is what
+`GET /sessions/late-turns` reads to fold turns typed during the rotation's
+multi-minute background window into the successor's `<pending-continuation>`.
+`send_message` writes that ledger for chat surfaces; the pty bridge can't, so
+the Stop hook POSTs each completed turn to `POST /sessions/record-turn` on
+every fire when `HIVE_SURFACE=terminal`.
+
 ### Cross-surface session pickup
 
 Telegram's `/sessions` lists conversations another surface is holding

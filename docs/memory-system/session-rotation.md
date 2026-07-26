@@ -1,7 +1,9 @@
 # Session rotation cycle
 
-One file. One flag. Async summary. Same pattern for any mind that hits a
-context-window threshold mid-session.
+A session that is about to run out of context is retired and replaced by a
+fresh one carrying a distilled summary forward. The Stop hook decides and
+does the slow work; hive-comms owns the swap and composes the successor's
+opening context.
 
 ## The whole loop
 
@@ -9,90 +11,114 @@ context-window threshold mid-session.
 sequenceDiagram
     participant M as dying session
     participant H as Stop hook
-    participant BG as async subshell
+    participant BG as detached child
     participant O as Ollama
-    participant F as session-state.json
-    participant N as fresh session
-    participant SB as SessionStart hook
+    participant NS as hive-comms
+    participant N as successor session
 
     M->>H: Stop event
-    H->>H: over threshold?
+    H->>H: transcript chars ÷ 4 over threshold?
     Note over H: no → exit. yes ↓
-    H->>BG: fork & disown
-    H-->>M: exit 0
+    H->>BG: fork, setsid, detach
+    H-->>M: exit 0 (turn never blocks)
 
-    BG->>O: full transcript → map-reduce summary
-    O-->>BG: prose carry-forward + project block
-    BG->>F: write {injected:false, ...}
-    BG->>N: spawn fresh session (kills old)
+    Note over BG: watermark = now
+    BG->>O: full transcript → map-reduce digest → structured passes
+    O-->>BG: summary + per-project state
+    BG->>NS: GET /sessions/late-turns?since=watermark
+    NS-->>BG: turns committed during the Ollama window
+    BG->>O: cheap delta pass over just those turns
+    BG->>NS: POST /sessions/{sid}/rotation-memory (carry-forward)
+    BG->>NS: POST /sessions/arm-rotation
 
-    N->>SB: SessionStart
-    SB->>F: read
-    alt injected == false
-        SB->>F: flip to injected:true
-        SB-->>N: inject as systemMessage
-    else injected == true
-        SB-->>N: skip (transcript already has it)
+    alt owner_ref == "terminal"
+        NS->>N: create successor, then kill old (rotated_to = new id)
+        NS-->>M: session_closed{rotated_to} → ws close 4412
+    else chat surface
+        Note over NS: set rotation_armed = 1
+        NS->>N: swap inside send_message on the next user turn
     end
 ```
 
 ## Live implementation
 
-- Hook: `~/.claude/hooks/rotation_check.py` (Python). Edit IS deploy —
-  no staging mirror.
-- Default threshold: `ROTATION_TOKEN_THRESHOLD=100000` (~10% of 1M
-  context). Char count ÷ 4 is the proxy.
-- Summary strategy: full-transcript map-reduce via Ollama, prose
-  carry-forward (no `last_turns` array). Consecutive same-role turns
-  are collapsed before the model sees them.
-- Rotation memory is also persisted to the NS sessions DB via
-  `POST /sessions/{sid}/rotation-memory` — so the carry-forward
-  survives even if `session-state.json` is lost.
+- Hook: `~/.claude/hooks/rotation_check.py` (`~/.codex/hooks/` for Codex
+  minds). Edit IS deploy — no staging mirror, no commit step.
+- Default threshold: `ROTATION_TOKEN_THRESHOLD=200000`. Transcript char
+  count ÷ 4 is the proxy, read off `st_size` so the every-Stop check stays
+  cheap.
+- The real work forks a detached child and the hook returns immediately —
+  a rotation takes minutes and must never block the turn that triggered it.
+  An `flock` on `rotation-<sid>.lock` keeps concurrent Stops from starting
+  rival rotations for the same session.
+- Summary strategy: full-transcript map-reduce via Ollama into a digest,
+  then structured passes for summary / per-project state. Consecutive
+  same-role turns are collapsed before the model sees them.
+- The carry-forward is persisted to the NS sessions DB via
+  `POST /sessions/{sid}/rotation-memory`, which writes the `session_memory`
+  row the successor's prompt is composed from.
 
-## `session-state.json`
+## Turns that land mid-rotation
 
-Path: `<repo-root>/data/session-state.json`
-(per-mind path; each mind uses its own data dir).
+The Ollama pass takes minutes, and the dying session stays live and
+answering the whole time. Those turns must not be lost.
 
-```json
-{
-  "injected": false,
-  "written_at": "<iso>",
-  "client_ref": "telegram:123456",
-  "summary": "prose carry-forward — what was happening and what's next",
-  "project": {
-    "active": true,
-    "goal": "one sentence",
-    "success_criteria": ["bullet", "bullet"],
-    "plan_steps": [{"n": 1, "what": "..."}],
-    "completed_steps": [1, 2],
-    "current_step": 3,
-    "files_touched": [{"path": "...", "lines": "12-47", "why": "..."}],
-    "notes": "open questions"
-  }
-}
-```
+- The hook stamps a watermark the moment real work begins, then queries
+  `GET /sessions/late-turns?since=<watermark>` before writing the
+  carry-forward.
+- That reads the durable `session_turns` ledger, not the transcript — a
+  turn accepted but never fully answered before the swap exists in the
+  ledger and would not be in a transcript tail.
+- Trailing user turns with no completed assistant reply become the
+  successor's `<pending-continuation>`; a cheap structured delta pass over
+  the late turns also refreshes `next_step` and in-flight state.
+- `send_message` fills the ledger for chat surfaces. The browser terminal
+  bypasses it entirely, so its Stop hook POSTs each completed turn to
+  `POST /sessions/record-turn` on every fire when `HIVE_SURFACE=terminal`.
 
-`project.active: false` → omit project block from inject. The summary
-prose still injects.
+## The swap
 
-## Why this works
+`POST /sessions/arm-rotation` is the hook's last step. What it does depends
+on whether the surface has a future turn to defer to.
 
-- **No mid-session pollution.** `injected:true` after first read means a
-  service restart mid-session doesn't re-inject content the transcript
-  already has.
-- **Self-healing on rotation.** Next Stop fires Ollama on a transcript
-  that includes the previously-injected summary + all new work → next
-  snapshot has the full state. No accumulation needed.
-- **No declared-update overhead.** The mind doesn't maintain a file
-  during work. Ollama distills at rotation.
+- **Chat surfaces** (Telegram/Discord) set `rotation_armed = 1`. The swap
+  happens inside `send_message` on the next user turn, so the rollover
+  lands on a user turn and never destroys an assistant reply in flight.
+- **Terminal-owned sessions** (`owner_ref == "terminal"`) finalize
+  immediately. Keystrokes are raw pty bytes, so `send_message` is never
+  called and an armed flag would sit unconsumed forever while the session
+  grew into native compaction. Finalizing here is still the last step of
+  already-backgrounded work, not a synchronous cost.
 
-## Test plan
+Finalizing creates the successor *before* killing the predecessor, so the
+new id can ride out on the `session_closed` event as `rotated_to`.
+`ws_attach` maps that to close code **4412** with the successor id as the
+reason and the attached tile reattaches directly. Plain 4410 still means
+ended with no successor.
 
-1. Force rotation → Stop hook exits <200ms; summary lands within ~15s.
-2. Fresh session reads, flips `injected:true`, inject visible in context.
-3. Service restart immediately after → SessionStart sees
-   `injected:true`, skips inject. No duplicate context.
-4. Second forced rotation → new snapshot reflects work done in fresh
-   session (project step incremented, new files in `files_touched`).
-5. Cold start (no file present) → SessionStart silently proceeds.
+## The successor's opening context
+
+Composition is NS-side, in `comms/bootstrap_loader::compose_prompt_blocks`,
+and lands in the order the continuation needs:
+
+1. `<soul>`
+2. `<recent-memory>` — decay-weighted
+3. `<session-memory>` — the rotation carry-forward
+4. `<pending-continuation>` — turns that arrived during the window
+
+The mind passes the composed string straight to
+`claude --append-system-prompt`. Composition is entirely NS-side; the
+`session_memory` table is the only carry-forward store.
+
+## Verifying a rotation
+
+1. Lower `ROTATION_TOKEN_THRESHOLD`, generate transcript, watch
+   `data/auto-remember/rotation.log` — the Stop hook should exit in
+   milliseconds while the child works.
+2. Keep typing during the window. The session answers normally; the turns
+   appear in `session_turns`.
+3. `ARMED` in the log is followed by a finalize for a terminal session, or
+   by a swap on the next user turn for a chat surface.
+4. A browser tile holding current JS reattaches on its own via 4412.
+5. The successor's opening context shows the carry-forward followed by the
+   turns typed during the window.

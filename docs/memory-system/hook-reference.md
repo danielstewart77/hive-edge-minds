@@ -8,10 +8,17 @@ Containerised minds in upstream hive-mind keep their own copies under
 ## UserPromptSubmit (every user turn)
 
 - **`contextual_retrieval.sh`** — pulls standing rules + cosine
-  similarity matches + known-persons cue from lucent and injects them
-  as `systemMessage`. See [`contextual-retrieval.md`](contextual-retrieval.md).
+  similarity matches + known-persons cue from lucent and injects them as
+  `hookSpecificOutput.additionalContext` (`systemMessage` is UI-only and
+  never reaches the model). See
+  [`contextual-retrieval.md`](contextual-retrieval.md).
 - **`time_inject.sh`** — injects the current date/time as a fresh anchor
   on every turn (date stamps drift otherwise).
+- **`surface_inject.sh`** — emits a `<message-surface>` block from
+  `HIVE_SURFACE` so the reply is shaped for where it lands.
+- **`prose_reminder.sh`** — keys off the same variable: the spoken-prose
+  rule fires for TTS surfaces and unset, and is skipped for `terminal`
+  and `local`.
 
 ## Stop (every assistant turn complete)
 
@@ -21,10 +28,17 @@ Containerised minds in upstream hive-mind keep their own copies under
   soul self-reflect against the Mind node's `soul_values`. Detached
   subshell — the hook returns instantly.
 - **`rotation_check.py`** — char-counts the transcript ÷ 4. Over
-  `ROTATION_TOKEN_THRESHOLD` (default 100k) → map-reduce summarize
-  via Ollama, write `data/session-state.json`, POST rotation-memory
-  to NS, POST `/clear` to rotate. Under threshold → exit. See
+  `ROTATION_TOKEN_THRESHOLD` (default 200000) → fork a detached child
+  that map-reduce summarizes via Ollama, folds in
+  `GET /sessions/late-turns`, POSTs the carry-forward to
+  `/sessions/{sid}/rotation-memory`, then `POST /sessions/arm-rotation`.
+  Under threshold → exit. Every fire, terminal sessions
+  (`HIVE_SURFACE=terminal`) also POST the completed turn to
+  `/sessions/record-turn` so the ledger the late-turn fold reads is not
+  blind to pty traffic. See
   [`session-rotation.md`](session-rotation.md).
+- **`training_capture.sh`** — archives the turn pair for training data.
+- **`skill_telemetry.sh`** — records which skills the turn invoked.
 
 ## SessionStart
 
@@ -35,10 +49,9 @@ in the dispatch payload — there is no local SessionStart hook doing it.
 Standing rules are **not** part of this composition; they are
 injected per turn by `contextual_retrieval.sh` (see above). The mind
 passes the composed string straight to
-`claude --append-system-prompt`.
-
-The one local SessionStart concern is `session-state.json` injection,
-handled by the rotation cycle's `SB` step above.
+`claude --append-system-prompt`. The rotation carry-forward reaches a
+successor the same way — as the `<session-memory>` block of that NS-side
+composition — so there is nothing for a local SessionStart hook to do.
 
 ## Identity convention in hooks
 
