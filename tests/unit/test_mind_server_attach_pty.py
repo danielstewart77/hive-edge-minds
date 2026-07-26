@@ -249,3 +249,79 @@ class TestAttachPty:
 
         spawn.assert_not_called()
         assert "sess-8" not in mind_server._ptys
+
+
+class TestRotatePty:
+    """POST /sessions/{id}/rotate-pty — the terminal follows the conversation.
+
+    A rotation replaces the conversation; the tile stays put. The mind swaps
+    the pane's process and re-keys the handle, so the socket the browser is
+    holding goes on bridging the same pty under the successor's id.
+    """
+
+    def test_rotating_rekeys_the_live_terminal(self, client):
+        test_client, mind_server = client
+        master_fd, slave_fd = pty.openpty()
+        proc = _fake_proc()
+        mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
+        mind_server.impl.rotate_pty_session = MagicMock(return_value=True)
+
+        with test_client.websocket_connect("/sessions/old-1/attach-pty?resume_sid=conv-1"):
+            pass
+        before = mind_server._ptys["old-1"]
+        resp = test_client.post(
+            "/sessions/old-1/rotate-pty",
+            json={"new_session_id": "new-1", "new_claude_sid": "conv-2",
+                  "model": "sonnet", "system_prompt": "carry-forward"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"session_id": "new-1", "rotated": True}
+        assert "old-1" not in mind_server._ptys
+        handle = mind_server._ptys["new-1"]
+        assert handle.session_id == "new-1"
+        assert handle.claude_sid == "conv-2"
+        assert handle.tmux_name == "example-new-1"
+        # Same handle object: the pty, its reader task and the attached
+        # queue all carried over rather than being rebuilt.
+        assert handle is before
+        seed = mind_server.impl.rotate_pty_session.call_args.kwargs
+        assert seed["system_prompt"] == "carry-forward"
+        assert seed["new_claude_sid"] == "conv-2"
+        os.close(slave_fd)
+
+    def test_rotating_a_session_with_no_terminal_declines(self, client):
+        test_client, mind_server = client
+        mind_server.impl.rotate_pty_session = MagicMock(return_value=True)
+
+        resp = test_client.post(
+            "/sessions/ghost/rotate-pty",
+            json={"new_session_id": "new-2", "new_claude_sid": "conv-2"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"session_id": "ghost", "rotated": False}
+        mind_server.impl.rotate_pty_session.assert_not_called()
+
+    def test_a_harness_that_cannot_rotate_declines(self, client):
+        """A codex-era mind without the entry point must say so, not 500."""
+        test_client, mind_server = client
+        master_fd, slave_fd = pty.openpty()
+        mind_server.impl.spawn_pty = MagicMock(return_value=(_fake_proc(), master_fd))
+
+        with test_client.websocket_connect("/sessions/old-3/attach-pty?resume_sid=conv-1"):
+            pass
+        del mind_server.impl.rotate_pty_session
+
+        resp = test_client.post(
+            "/sessions/old-3/rotate-pty",
+            json={"new_session_id": "new-3", "new_claude_sid": "conv-2"},
+        )
+
+        assert resp.json() == {"session_id": "old-3", "rotated": False}
+        os.close(slave_fd)
+
+    def test_rotating_without_a_successor_id_is_rejected(self, client):
+        test_client, mind_server = client
+        resp = test_client.post("/sessions/old-4/rotate-pty", json={"model": "sonnet"})
+        assert resp.status_code == 400

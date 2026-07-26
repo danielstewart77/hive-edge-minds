@@ -550,7 +550,7 @@ def _take_controlling_tty() -> None:
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-def _terminal_argv(thread_id: str | None) -> list[str]:
+def _terminal_argv(thread_id: str | None, prompt: str = "") -> list[str]:
     """The interactive `codex` that runs inside the tmux pane.
 
     Resumes a known thread (`codex resume <id>`) when one exists and has a
@@ -561,6 +561,12 @@ def _terminal_argv(thread_id: str | None) -> list[str]:
     `npm install -g @openai/codex`, which fails inside the container (the
     non-root user has no write access to the global npm dir) and kills
     codex with exit status 243 before it is ever usable.
+
+    ``prompt`` is codex's optional positional opening turn. Only a rotation
+    uses it: codex has no ``--append-system-prompt``, so the carry-forward
+    is delivered the same way the per-turn path delivers it — as text at the
+    head of the conversation — rather than pasted into the pane afterwards,
+    which would race the TUI's startup.
     """
     cmd = ["codex"]
     if thread_id:
@@ -572,6 +578,8 @@ def _terminal_argv(thread_id: str | None) -> list[str]:
         "--dangerously-bypass-hook-trust",
         "-c", "check_for_update_on_startup=false",
     ])
+    if prompt:
+        cmd.append(prompt)
     return cmd
 
 
@@ -583,14 +591,18 @@ def _tmux(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
 
 
 def pty_session_alive(session_id: str) -> bool:
-    """True while this session's terminal process is still running."""
-    return _tmux("has-session", "-t", tmux_session_name(session_id)).returncode == 0
+    """True while this session's terminal process is still running.
+
+    The `=` is exact-match: tmux targets are prefix-matched by default, so a
+    session whose id is a prefix of another's would answer for it.
+    """
+    return _tmux("has-session", "-t", f"={tmux_session_name(session_id)}").returncode == 0
 
 
 def kill_pty_session(session_id: str) -> bool:
     """End the terminal for good. True if there was one to end."""
     name = tmux_session_name(session_id)
-    if _tmux("kill-session", "-t", name).returncode != 0:
+    if _tmux("kill-session", "-t", f"={name}").returncode != 0:
         return False
     log.info("Killed tmux session %s", name)
     return True
@@ -650,6 +662,78 @@ def _watch_for_new_thread_in_background(session_id: str, before: set[Path]) -> N
     threading.Thread(
         target=_watch_for_new_thread, args=(session_id, before), daemon=True
     ).start()
+
+
+def rotate_pty_session(
+    old_session_id: str,
+    new_session_id: str,
+    new_claude_sid: str,
+    model: str = "",
+    system_prompt: str = "",
+    **kwargs: Any,
+) -> bool:
+    """Retire a terminal's conversation and start its successor *in place*.
+
+    A rotation replaces the conversation, not the terminal. The tmux session
+    is renamed to the successor's id and the pane's process respawned onto a
+    fresh codex thread, so the attached client — and therefore the pty, the
+    websocket and the browser tile above it — is never disturbed. From the
+    user's side the session id changes and typing continues in the same pane.
+
+    Codex mints its own thread ids and cannot be handed one, so the
+    successor starts bare and the same background watcher used by a fresh
+    terminal reports the id codex writes on the first turn. The rotation
+    carry-forward rides in as codex's opening prompt, which is the only
+    channel this harness has for it. Returns False when there was no live
+    terminal to rotate, leaving the caller to fall back to a plain swap.
+    """
+    del model, new_claude_sid, kwargs  # symmetry with the claude harness
+
+    old_name = tmux_session_name(old_session_id)
+    new_name = tmux_session_name(new_session_id)
+
+    if not pty_session_alive(old_session_id):
+        log.info("No live terminal for session %s — nothing to rotate in place",
+                 old_session_id)
+        return False
+
+    result = _tmux("rename-session", "-t", f"={old_name}", new_name)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tmux refused to rename {old_name} to {new_name}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    _forget_thread(old_session_id)
+
+    before = _existing_rollout_paths()
+    cmd = _terminal_argv(None, prompt=system_prompt)
+
+    env = os.environ.copy()
+    overrides = {"CODEX_HOME": str(CODEX_HOME), "HIVE_SURFACE": "terminal"}
+    env.update(overrides)
+
+    # respawn-pane -k replaces the pane's process without touching the
+    # window, the session, or any attached client.
+    # No `=` exact-match prefix here: that syntax is for session targets, and
+    # tmux parses a pane target differently. The rename above already left
+    # exactly one session by this name.
+    args = ["respawn-pane", "-k", "-t", new_name, "-c", str(PROJECT_DIR)]
+    for key, value in overrides.items():
+        args.extend(["-e", f"{key}={value}"])
+    args.append("--")
+    args.extend(cmd)
+
+    result = _tmux(*args, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tmux refused to respawn the pane for session {new_session_id}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+    _watch_for_new_thread_in_background(new_session_id, before)
+    log.info("Rotated terminal in place: %s -> %s (seed=%d chars)",
+             old_name, new_name, len(system_prompt))
+    return True
 
 
 def spawn_pty(

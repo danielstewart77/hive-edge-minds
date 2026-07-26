@@ -32,8 +32,10 @@ sequenceDiagram
     BG->>NS: POST /sessions/arm-rotation
 
     alt owner_ref == "terminal"
-        NS->>N: create successor, then kill old (rotated_to = new id)
-        NS-->>M: session_closed{rotated_to} → ws close 4412
+        NS->>N: create successor row + compose prompt
+        NS->>M: POST /sessions/{old}/rotate-pty on the mind
+        Note over M: tmux rename + respawn-pane -k<br/>pane, pty and socket survive
+        NS-->>M: session_closed{rotated_to, rotated_in_place}<br/>→ TEXT frame, socket stays open
     else chat surface
         Note over NS: set rotation_armed = 1
         NS->>N: swap inside send_message on the next user turn
@@ -44,9 +46,14 @@ sequenceDiagram
 
 - Hook: `~/.claude/hooks/rotation_check.py` (`~/.codex/hooks/` for Codex
   minds). Edit IS deploy — no staging mirror, no commit step.
-- Default threshold: `ROTATION_TOKEN_THRESHOLD=200000`. Transcript char
-  count ÷ 4 is the proxy, read off `st_size` so the every-Stop check stays
-  cheap.
+- Default threshold: `ROTATION_TOKEN_THRESHOLD=200000`, measured against
+  what is actually in the model's context — the last real `usage` block in
+  the transcript (Claude) or `last_token_usage.total_tokens` (Codex). File
+  size is only the fallback when no measurement is on disk yet: a transcript
+  only grows, so bytes ÷ 4 counts turns the model can no longer see and
+  rotates a session at a fraction of its real occupancy. Codex's
+  `total_token_usage` is cumulative over the whole session and must never be
+  thresholded on.
 - The real work forks a detached child and the hook returns immediately —
   a rotation takes minutes and must never block the turn that triggered it.
   An `flock` on `rotation-<sid>.lock` keeps concurrent Stops from starting
@@ -91,10 +98,29 @@ on whether the surface has a future turn to defer to.
   already-backgrounded work, not a synchronous cost.
 
 Finalizing creates the successor *before* killing the predecessor, so the
-new id can ride out on the `session_closed` event as `rotated_to`.
-`ws_attach` maps that to close code **4412** with the successor id as the
-reason and the attached tile reattaches directly. Plain 4410 still means
-ended with no successor.
+new id exists in time to be handed to the mind and to ride out on the
+`session_closed` event as `rotated_to`.
+
+### The terminal keeps its pane
+
+A rotation replaces the conversation, not the terminal. Before the old
+session is killed, hive-comms calls `POST /sessions/{old_id}/rotate-pty` on
+the mind with the successor's id, its conversation id, and the composed
+prompt. The mind renames the tmux session to the successor's id and
+`respawn-pane -k`s the pane onto a fresh harness process carrying the
+carry-forward (`--append-system-prompt` for claude; codex's positional
+opening prompt, since it has no such flag). The attached tmux client — and
+so the pty, the proxied websocket, and the browser tile — is never touched;
+`mind_server` just re-keys the pty handle to the new session id.
+
+`kill_session` then publishes `rotated_in_place` alongside `rotated_to`, and
+`ws_attach` answers it with a `{"type": "session_rotated"}` TEXT frame — the
+one frame type the mind never sends — and goes on bridging the same socket
+under the successor's id. The tile relabels itself and keeps typing.
+
+A rotation with no live terminal under it (the pty was already reaped)
+falls back to close code **4412** with the successor id as the reason, and
+the tile reattaches. Plain 4410 still means ended with no successor.
 
 ## The successor's opening context
 
@@ -119,6 +145,7 @@ The mind passes the composed string straight to
    appear in `session_turns`.
 3. `ARMED` in the log is followed by a finalize for a terminal session, or
    by a swap on the next user turn for a chat surface.
-4. A browser tile holding current JS reattaches on its own via 4412.
+4. The browser tile never blinks: same pane, same scrollback, and the
+   session id in the sidebar changes to the successor's.
 5. The successor's opening context shows the carry-forward followed by the
    turns typed during the window.

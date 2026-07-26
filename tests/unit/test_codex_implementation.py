@@ -293,18 +293,18 @@ def _spawned(alive: bool = False, tmux: "_TmuxRecorder | None" = None, **kwargs)
          patch("mind_templates.codex_cli_codex.pty.openpty", return_value=(11, 22)), \
          patch("mind_templates.codex_cli_codex.fcntl.ioctl"), \
          patch("mind_templates.codex_cli_codex.os.close"), \
-         patch("mind_templates.codex_cli_codex._create_terminal_thread",
-               return_value="thread-created") as create_thread, \
+         patch("mind_templates.codex_cli_codex._rollout_exists", return_value=True), \
+         patch("mind_templates.codex_cli_codex._watch_for_new_thread_in_background") as watcher, \
          patch("mind_templates.codex_cli_codex._report_thread", report_thread), \
          patch("mind_templates.codex_cli_codex.subprocess.Popen") as popen:
         popen.return_value = MagicMock(pid=999)
         result = impl.spawn_pty(**call_kwargs)
-    create_thread.report_thread = report_thread
-    return tmux, popen, create_thread, result
+    watcher.report_thread = report_thread
+    return tmux, popen, watcher, result
 
 
 class TestSpawnPty:
-    def test_pane_argv_resumes_precreated_thread_with_update_check_disabled(self):
+    def test_fresh_pane_argv_is_bare_codex_with_update_check_disabled(self):
         """The update-nag screen's Enter default runs `npm install -g` and
         kills codex when that fails inside the container (no write access
         to the global npm dir) — check_for_update_on_startup=false is the
@@ -313,7 +313,7 @@ class TestSpawnPty:
 
         cmd = tmux.pane_argv
         assert cmd[0] == "codex"
-        assert cmd[:3] == ["codex", "resume", "thread-created"]
+        assert "resume" not in cmd
         assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "check_for_update_on_startup=false"
         assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "--dangerously-bypass-hook-trust" in cmd
@@ -365,13 +365,13 @@ class TestSpawnPty:
 
     def test_an_existing_terminal_is_attached_not_restarted(self):
         """The bug this forecloses: a second `codex` on one conversation."""
-        tmux, popen, thread_cls, _ = _spawned(alive=True)
+        tmux, popen, watcher, _ = _spawned(alive=True)
 
         assert not any("new-session" in call for call in tmux.calls)
         assert popen.call_args.args[0][:5] == [
             "tmux", "-L", impl.TMUX_SOCKET, "attach-session", "-d"
         ]
-        thread_cls.assert_not_called()
+        watcher.assert_not_called()
 
     def test_attach_detaches_whoever_held_the_session(self):
         _, popen, _, _ = _spawned(alive=True)
@@ -425,28 +425,89 @@ class TestSpawnPty:
 
         assert mock_ioctl.call_args.args[0] == 22
 
-    def test_fresh_terminal_precreates_and_reports_exact_thread(self):
-        tmux, _, create_thread, _ = _spawned(session_id="s2")
+    def test_fresh_terminal_starts_bare_and_watches_for_the_thread_codex_mints(self):
+        """A thread id cannot be pre-minted: app-server hands one back without
+        writing its rollout, so `codex resume` on it dies. The pane starts
+        bare and a watcher reports the id codex writes on the first turn."""
+        impl.THREADS.pop("s2", None)
+        tmux, _, watcher, _ = _spawned(session_id="s2")
 
-        create_thread.assert_called_once_with("gpt-5.4")
-        create_thread.report_thread.assert_called_once_with("s2", "thread-created")
-        assert tmux.pane_argv[:3] == ["codex", "resume", "thread-created"]
+        assert tmux.pane_argv[0] == "codex" and "resume" not in tmux.pane_argv
+        assert watcher.call_args.args[0] == "s2"
+        watcher.report_thread.assert_not_called()
 
-    def test_gateway_thread_is_resumed_without_creating_another(self):
+    def test_gateway_thread_is_resumed_without_watching_for_another(self):
         impl.THREADS["s3"] = "thread-known"
-        tmux, _, create_thread, _ = _spawned(
+        tmux, _, watcher, _ = _spawned(
             session_id="s3", harness_sid="thread-gateway"
         )
 
-        create_thread.assert_not_called()
+        watcher.assert_not_called()
         assert tmux.pane_argv[:3] == ["codex", "resume", "thread-gateway"]
 
     def test_local_safety_copy_backfills_the_gateway(self):
         impl.THREADS["s4"] = "thread-local"
-        _, _, create_thread, _ = _spawned(session_id="s4")
+        _, _, watcher, _ = _spawned(session_id="s4")
 
-        create_thread.assert_not_called()
-        create_thread.report_thread.assert_called_once_with("s4", "thread-local")
+        watcher.assert_not_called()
+        watcher.report_thread.assert_called_once_with("s4", "thread-local")
+
+
+class TestRotatePtySession:
+    """A rotation replaces the conversation; the pane and its client stay."""
+
+    def _rotate(self, tmux=None, alive=True, **kwargs):
+        tmux = tmux or _TmuxRecorder()
+        call_kwargs = {"old_session_id": "old", "new_session_id": "new",
+                       "new_claude_sid": "conv-2", "system_prompt": "carry-forward"}
+        call_kwargs.update(kwargs)
+        with patch("mind_templates.codex_cli_codex._tmux", tmux), \
+             patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=alive), \
+             patch("mind_templates.codex_cli_codex._existing_rollout_paths", return_value=set()), \
+             patch("mind_templates.codex_cli_codex._watch_for_new_thread_in_background") as watcher:
+            rotated = impl.rotate_pty_session(**call_kwargs)
+        return tmux, watcher, rotated
+
+    def test_the_pane_is_renamed_and_respawned_not_recreated(self):
+        tmux, _, rotated = self._rotate()
+
+        assert rotated is True
+        assert tmux.calls[0] == ["rename-session", "-t", "=MIND_NAME-old", "MIND_NAME-new"]
+        respawn = next(c for c in tmux.calls if c[0] == "respawn-pane")
+        assert "-k" in respawn and respawn[respawn.index("-t") + 1] == "MIND_NAME-new"
+        # Nothing starts a second tmux session — that is the successor pane
+        # this whole path exists to avoid.
+        assert not any(c[0] == "new-session" for c in tmux.calls)
+
+    def test_the_carry_forward_rides_in_as_the_opening_prompt(self):
+        """Codex has no --append-system-prompt, so the seed goes where the
+        per-turn path puts it: at the head of the conversation."""
+        tmux, _, _ = self._rotate()
+
+        respawn = next(c for c in tmux.calls if c[0] == "respawn-pane")
+        argv = respawn[respawn.index("--") + 1:]
+        assert argv[0] == "codex" and "resume" not in argv
+        assert argv[-1] == "carry-forward"
+
+    def test_the_successor_thread_is_watched_for_under_the_new_id(self):
+        tmux, watcher, _ = self._rotate()
+        assert watcher.call_args.args[0] == "new"
+
+    def test_the_predecessors_thread_is_forgotten(self):
+        impl.THREADS["old"] = "thread-old"
+        self._rotate()
+        assert "old" not in impl.THREADS
+
+    def test_no_live_terminal_declines(self):
+        tmux, watcher, rotated = self._rotate(alive=False)
+
+        assert rotated is False
+        assert tmux.calls == []
+        watcher.assert_not_called()
+
+    def test_tmux_refusing_the_rename_is_raised_not_swallowed(self):
+        with pytest.raises(RuntimeError, match="no server running"):
+            self._rotate(tmux=_TmuxRecorder(returncode=1, stderr="no server running"))
 
 
 class TestTmuxSessionLifecycle:
@@ -466,7 +527,7 @@ class TestTmuxSessionLifecycle:
         tmux = _TmuxRecorder()
         with patch("mind_templates.codex_cli_codex._tmux", tmux):
             assert impl.kill_pty_session("s1") is True
-        assert tmux.calls[0] == ["kill-session", "-t", "MIND_NAME-s1"]
+        assert tmux.calls[0] == ["kill-session", "-t", "=MIND_NAME-s1"]
 
     def test_kill_reports_when_there_was_nothing_to_kill(self):
         with patch("mind_templates.codex_cli_codex._tmux", _TmuxRecorder(returncode=1)):
@@ -483,45 +544,6 @@ class TestThreadMap:
         impl._remember_thread("s1", "thread-one")
         impl._forget_thread("s1")
         assert impl._load_thread_map() == {}
-
-
-class TestCreateTerminalThread:
-    def test_app_server_returns_exact_empty_thread_id(self, monkeypatch):
-        class Input:
-            def __init__(self):
-                self.messages = []
-
-            def write(self, value):
-                self.messages.append(json.loads(value))
-
-            def flush(self):
-                pass
-
-        class Output:
-            def __init__(self):
-                self.lines = iter([
-                    json.dumps({"id": 1, "result": {}}) + "\n",
-                    json.dumps({"method": "thread/started", "params": {}}) + "\n",
-                    json.dumps({"id": 2, "result": {
-                        "thread": {"id": "thread-exact"}
-                    }}) + "\n",
-                ])
-
-            def readline(self):
-                return next(self.lines, "")
-
-        proc = MagicMock()
-        proc.stdin = Input()
-        proc.stdout = Output()
-        proc.poll.return_value = None
-        monkeypatch.setattr(impl.subprocess, "Popen", MagicMock(return_value=proc))
-        monkeypatch.setattr(impl.select, "select", lambda *args: ([proc.stdout], [], []))
-
-        assert impl._create_terminal_thread("gpt-5.4") == "thread-exact"
-        assert proc.stdin.messages[2]["method"] == "thread/start"
-        assert proc.stdin.messages[2]["params"]["model"] == "gpt-5.4"
-        assert "input" not in proc.stdin.messages[2]["params"]
-        proc.terminate.assert_called_once()
 
 
 class TestExtractAssistantTexts:

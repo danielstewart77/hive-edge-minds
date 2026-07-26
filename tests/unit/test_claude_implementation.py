@@ -312,7 +312,7 @@ class TestTmuxSessionLifecycle:
         tmux = _TmuxRecorder()
         with patch("mind_templates.claude_cli_claude._tmux", tmux):
             assert implementation.kill_pty_session("s1") is True
-        assert tmux.calls[0] == ["kill-session", "-t", "MIND_NAME-s1"]
+        assert tmux.calls[0] == ["kill-session", "-t", "=MIND_NAME-s1"]
 
     def test_kill_reports_when_there_was_nothing_to_kill(self):
         with patch("mind_templates.claude_cli_claude._tmux", _TmuxRecorder(returncode=1)):
