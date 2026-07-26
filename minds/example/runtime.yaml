@@ -1,4 +1,4 @@
-# Example mind — the outpost's one contract file.
+# Example mind — the edge mind's one contract file.
 #
 # `setup.sh` copies minds/example/ to minds/<your-mind>/ and fills this in;
 # you can also copy and edit it by hand. Identity and soul prose live in the
@@ -8,7 +8,13 @@ name: example
 # Stamped by setup.sh (uuidgen). Every write to the hive's memory carries
 # this id; the display name above is never written there.
 mind_id: <generated-uuid>
-description: "Example — starter outpost mind."
+description: "Example — starter edge mind."
+
+# Deployment profile. Sentinel adds a companion security-monitoring bundle
+# managed separately from this generic mind runtime.
+#   standard — one connected mind runtime
+#   sentinel — mind runtime plus hive-sentinel, telemetry, and observability
+profile: standard
 
 # What this mind is allowed to be on this machine.
 #   operator  — full host access by design: the mind operates the machine.

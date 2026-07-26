@@ -1,4 +1,4 @@
-# Federation — connecting an outpost to a second hive
+# Federation — connecting an edge mind to a second hive
 
 **Status: specified, not implemented.** No code in this repo speaks to more
 than one hive. This spec exists so the first implementation starts from a
@@ -6,9 +6,9 @@ security boundary, not from plumbing.
 
 ## The shape of the problem
 
-Every outpost today points at exactly one hive: one `COMMS_URL`, one
+Every edge mind today points at exactly one hive: one `COMMS_URL`, one
 `LUCENT_URL_SELF`, one bearer token for each. Federation is the ability to
-connect the same outpost to a *second* hive — a friend's, a second site of
+connect the same edge mind to a *second* hive — a friend's, a second site of
 your own — without collapsing the two into one trust domain.
 
 ## What crosses, what doesn't
@@ -26,7 +26,7 @@ The boundary is the entire feature:
   agreement, never the default — and the home hive's identity guard still
   rejects any write to another mind's nodes.
 - **Sessions do not cross.** A federated hive cannot spawn, adopt, or
-  attach to sessions on this outpost. Session ownership stays with the
+  attach to sessions on this edge mind. Session ownership stays with the
   home hive's comms.
 
 ## Wiring (when implemented)

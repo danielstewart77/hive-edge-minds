@@ -6,6 +6,7 @@ artifacts. No sudo, no venv build (a fake .venv/bin/python3 short-circuits
 it), no network.
 """
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,16 +36,21 @@ def repo(tmp_path):
     # Short-circuit the venv build in the systemd path.
     fake_python = tmp_path / ".venv" / "bin" / "python3"
     fake_python.parent.mkdir(parents=True)
-    fake_python.touch()
-    fake_python.chmod(0o755)
+    fake_python.symlink_to(Path("/usr/bin/python3"))
+    fake_tmux = tmp_path / ".test-bin" / "tmux"
+    fake_tmux.parent.mkdir()
+    fake_tmux.write_text("#!/bin/sh\nexit 0\n")
+    fake_tmux.chmod(0o755)
     return tmp_path
 
 
 def _run(repo: Path, *flags: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["PATH"] = f"{repo / '.test-bin'}:{env['PATH']}"
     return subprocess.run(
         ["bash", str(repo / "setup.sh"), *flags],
         cwd=repo, capture_output=True, text=True, timeout=60,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, env=env,
     )
 
 
@@ -60,6 +66,7 @@ def test_scaffolds_mind_and_stamps_env(repo):
 
     runtime = (repo / "minds/atlas/runtime.yaml").read_text()
     assert "name: atlas" in runtime
+    assert "profile: standard" in runtime
     assert "role: satellite" in runtime
     assert "deployment: systemd" in runtime
     assert "harness: claude_cli_claude" in runtime
@@ -69,10 +76,18 @@ def test_scaffolds_mind_and_stamps_env(repo):
     assert "MIND_NAME=atlas" in env
     assert "MIND_SERVER_PORT=8425" in env
     # MIND_ID stamped with a real uuid, not left blank
-    mind_id_line = [l for l in env.splitlines() if l.startswith("MIND_ID=")][0]
+    mind_id_line = [line for line in env.splitlines() if line.startswith("MIND_ID=")][0]
     assert len(mind_id_line.split("=", 1)[1]) == 36
 
     assert (repo / "souls/atlas.md").exists()
+
+
+def test_omitted_profile_defaults_to_standard_when_unattended(repo):
+    result = _run(repo, "--name", "atlas", "--role", "satellite",
+                  "--deployment", "windows-task", "--harness", "codex_cli_codex",
+                  "--surfaces", "none", "--port", "8421")
+    assert result.returncode == 0, result.stderr
+    assert "profile: standard" in (repo / "minds/atlas/runtime.yaml").read_text()
 
 
 def test_systemd_emits_unit_with_repo_paths(repo):
@@ -93,7 +108,7 @@ def test_container_emits_compose_with_operator_host_mount(repo):
                   "--surfaces", "telegram", "--port", "8432")
     assert result.returncode == 0, result.stderr
     compose = (repo / "docker-compose.yml").read_text()
-    assert "container_name: hive-outpost-atlas" in compose
+    assert "container_name: hive-edge-mind-atlas" in compose
     assert "- /:/host" in compose          # operator posture
     assert "name: hivemind" in compose
 
@@ -119,10 +134,28 @@ def test_windows_task_emits_ps1_installer(repo):
     assert "New-ScheduledTaskTrigger -AtLogOn" in ps1
 
 
+def test_sentinel_profile_is_recorded_without_changing_runtime_shape(repo):
+    result = _run(repo, "--name", "hex", "--profile", "sentinel",
+                  "--role", "operator", "--deployment", "container",
+                  "--harness", "codex_cli_codex", "--surfaces", "telegram",
+                  "--port", "8433")
+    assert result.returncode == 0, result.stderr
+
+    runtime = (repo / "minds/hex/runtime.yaml").read_text()
+    assert "profile: sentinel" in runtime
+    assert "container_name: hive-edge-mind-hex" in (
+        repo / "docker-compose.yml"
+    ).read_text()
+
+
 def test_rejects_bad_inputs(repo):
     assert _run(repo, "--name", "Bad Name!", "--role", "satellite",
                 "--deployment", "systemd", "--harness", "claude_cli_claude",
                 "--surfaces", "none", "--port", "8421").returncode != 0
+    assert _run(repo, "--name", "atlas", "--profile", "unknown",
+                "--role", "satellite", "--deployment", "systemd",
+                "--harness", "claude_cli_claude", "--surfaces", "none",
+                "--port", "8421").returncode != 0
     assert _run(repo, "--name", "ok", "--role", "emperor",
                 "--deployment", "systemd", "--harness", "claude_cli_claude",
                 "--surfaces", "none", "--port", "8421").returncode != 0

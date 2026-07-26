@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# hive-outpost setup — scaffold a mind and emit its installer.
+# hive-edge-minds setup — scaffold a mind and emit its installer.
 #
 # Interactive by default; every answer can be provided as a flag for
 # unattended runs:
 #
-#   ./setup.sh --name atlas --role operator --deployment systemd \
+#   ./setup.sh --name atlas --profile standard --role operator --deployment systemd \
 #              --harness claude_cli_claude --surfaces telegram --port 8421
 #
 # What it does:
@@ -24,7 +24,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-NAME="" ROLE="" DEPLOYMENT="" HARNESS="" SURFACES="" PORT=""
+NAME="" PROFILE="" ROLE="" DEPLOYMENT="" HARNESS="" SURFACES="" PORT=""
 
 usage() {
     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -34,6 +34,7 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --name)       NAME="$2"; shift 2 ;;
+        --profile)    PROFILE="$2"; shift 2 ;;
         --role)       ROLE="$2"; shift 2 ;;
         --deployment) DEPLOYMENT="$2"; shift 2 ;;
         --harness)    HARNESS="$2"; shift 2 ;;
@@ -53,6 +54,10 @@ ask() { # ask VAR "prompt" "default"
 }
 
 ask NAME       "Mind name (lowercase, [a-z0-9_-])" "example"
+if [ -z "$PROFILE" ] && [ ! -t 0 ]; then
+    PROFILE="standard"
+fi
+ask PROFILE    "Profile: standard or sentinel" "standard"
 ask ROLE       "Role: operator (full host access) or satellite" "satellite"
 ask DEPLOYMENT "Deployment: systemd, container, or windows-task" "systemd"
 ask HARNESS    "Harness: claude_cli_claude or codex_cli_codex" "claude_cli_claude"
@@ -61,6 +66,10 @@ ask PORT       "Mind server port" "8421"
 
 case "$NAME" in
     (*[!a-z0-9_-]*|"") echo "Invalid name: '$NAME' (want [a-z0-9_-]+)" >&2; exit 1 ;;
+esac
+case "$PROFILE" in
+    standard|sentinel) ;;
+    *) echo "Invalid profile: '$PROFILE'" >&2; exit 1 ;;
 esac
 case "$ROLE" in
     operator|satellite) ;;
@@ -123,7 +132,8 @@ if [ ! -f "minds/$NAME/runtime.yaml" ] || [ "$NAME" = "example" ]; then
     cat > "minds/$NAME/runtime.yaml" <<EOF
 name: $NAME
 mind_id: $MIND_ID
-description: "$NAME — hive-outpost mind."
+description: "$NAME — Hive Edge Mind."
+profile: $PROFILE
 role: $ROLE
 deployment: $DEPLOYMENT
 harness: $HARNESS
@@ -182,18 +192,19 @@ emit_systemd() {
     fi
     local node_dir=""
     command -v node >/dev/null 2>&1 && node_dir="$(dirname "$(command -v node)")"
+    local service_user="${USER:-$(id -un)}"
     local path_line="$bin_dir"
     [ -n "$node_dir" ] && [ "$node_dir" != "$bin_dir" ] && path_line+=":$node_dir"
     path_line+=":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
     cat > "deploy/$NAME.service" <<EOF
 [Unit]
-Description=$NAME — hive-outpost mind ($ROLE), bare-metal Linux service
+Description=$NAME — Hive Edge Mind ($ROLE), bare-metal Linux service
 After=network.target
 
 [Service]
 Type=simple
-User=$USER
+User=$service_user
 WorkingDirectory=$ROOT
 EnvironmentFile=$ROOT/.env
 Environment=PATH=$path_line
@@ -251,7 +262,7 @@ YAML
     # Mounting a named volume there lets every codex-harness container on
     # this host share one codex install: `npm install -g @openai/codex@latest`
     # run in any one of them updates it for all of them, no rebuild needed.
-    # The volume is local to this host's Docker daemon on purpose — outposts
+    # The volume is local to this host's Docker daemon on purpose — edge minds
     # on other hosts each get their own, updated separately (see
     # tools/stateless/update_codex/).
     local codex_volume_line="" codex_volumes_block=""
@@ -267,7 +278,7 @@ volumes:
     fi
 
     cat > docker-compose.yml <<EOF
-# $NAME — hive-outpost mind ($ROLE) as a container.
+# $NAME — Hive Edge Mind ($ROLE) as a container.
 # Joins the external \`hivemind\` network so hive-comms can reach it and its
 # hooks can reach lucent/comms by service name.
 services:
@@ -275,7 +286,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: hive-outpost-$NAME
+    container_name: hive-edge-mind-$NAME
     restart: unless-stopped
     working_dir: /usr/src/app
     env_file:
@@ -317,7 +328,7 @@ EOF
 
 emit_windows_task() {
     cat > "deploy/setup-task.ps1" <<EOF
-# Registers the $NAME hive-outpost mind as a logon-triggered scheduled task.
+# Registers the $NAME Hive Edge Mind as a logon-triggered scheduled task.
 # Run on the Windows box AS THE USER the mind should run under:
 #   powershell -ExecutionPolicy Bypass -File deploy\\setup-task.ps1
 \$ErrorActionPreference = "Stop"

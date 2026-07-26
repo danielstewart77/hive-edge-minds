@@ -33,7 +33,7 @@ def configured_surfaces() -> list[str]:
     """The runtime.yaml surfaces list for this mind; telegram if unreadable.
 
     The fallback keeps a pre-runtime.yaml install working unchanged — the
-    telegram-only single mind is what every outpost was before the contract
+    telegram-only single mind is what every edge mind was before the contract
     carried a surfaces list.
     """
     mind_name = os.environ.get("MIND_NAME", "")

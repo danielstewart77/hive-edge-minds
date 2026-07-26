@@ -27,7 +27,7 @@ Read this file first. Load only the specs relevant to the current task.
 |------|------|---------|
 | Containers | `specs/containers.md` | All Docker services: names, ports, volumes, build context |
 | Logging | `specs/logging.md` | Structured logging levels, silence rules, rotation config |
-| Federation | `specs/federation.md` | Connecting an outpost to a second hive — broker crosses, memory doesn't. Specified, not implemented |
+| Federation | `specs/federation.md` | Connecting an edge mind to a second hive — broker crosses, memory doesn't. Specified, not implemented |
 
 ## Skills
 | Spec | File | Summary |

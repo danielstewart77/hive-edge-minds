@@ -76,7 +76,7 @@ def _set_winsize(fd: int, cols: int, rows: int) -> None:
 @pytest.fixture
 def terminal(tmp_path, monkeypatch):
     """A real tmux session running the stubborn app, on a socket of our own."""
-    monkeypatch.setattr(implementation, "TMUX_SOCKET", f"outpost-test-{uuid.uuid4().hex[:8]}")
+    monkeypatch.setattr(implementation, "TMUX_SOCKET", f"edge-mind-test-{uuid.uuid4().hex[:8]}")
     app = tmp_path / "stubborn_app.py"
     app.write_text(_STUBBORN_APP)
     monkeypatch.setattr(
