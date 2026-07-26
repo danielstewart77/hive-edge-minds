@@ -108,10 +108,15 @@ new rollout file codex itself writes once the user's first real turn
 begins, extracts the thread id from its filename, and reports it via the
 same `harness_sid` path the per-turn chat flow uses — mirroring how that
 flow already captures `thread.started` in real time. Every later reattach
-launches `codex resume <id>` against that discovered id. `app-server` has
-its own arg parser and rejects `--profile` outright — unlike plain
-`codex`/`codex exec` invocations — so both paths read the config profile
-from `CODEX_HOME`'s `config.toml` directly instead.
+launches `codex resume <id>` against that discovered id — unless that
+thread's rollout no longer exists under this `CODEX_HOME` (a migration or
+a redeploy onto a fresh volume left `harness_sid` and the disk safety copy
+pointing at a thread minted elsewhere), in which case `_rollout_exists`
+discards it and the terminal falls back to the fresh-terminal path instead
+of handing back a pane that dies within a second of tmux starting it.
+`app-server` has its own arg parser and rejects `--profile` outright —
+unlike plain `codex`/`codex exec` invocations — so both paths read the
+config profile from `CODEX_HOME`'s `config.toml` directly instead.
 
 The process ends only on `DELETE /sessions/{id}` or via the idle reaper
 (`PTY_IDLE_TIMEOUT_SECONDS`, default one hour unattached). A turn in flight
