@@ -4,14 +4,14 @@ This file provides guidance to Claude Code when working in this repository.
 
 ## Project Overview
 
-**hive-outpost** is a single-mind installation of the
+**hive-edge-minds** is a single-mind installation of the
 [hive-mind](https://github.com/danielstewart77/hive-mind) system: one AI mind
 on one machine, connected to a hive's shared services (the `hive-comms`
 gateway and `hive-lucent` memory containers) over HTTP+bearer. The repo ships
 machinery only — a mind's identity (`minds/<name>/`, `souls/<name>.md`,
 `.env`, `config.yaml`) is per-host and gitignored.
 
-An outpost declares a **role** (`operator` — full host access by design;
+An edge mind declares a **role** (`operator` — full host access by design;
 `satellite` — connected but not operating the machine) and a **deployment**
 (`systemd`, `container`, or `windows-task`). `setup.sh` scaffolds the mind
 from `minds/example/` and emits the matching installer. It never runs sudo
@@ -28,7 +28,7 @@ bots in-process via `asyncio.gather()`:
 
 ```
                 ┌──────────────────────────────────────────────────┐
-                │  the outpost  (one Python process)               │
+                │  the edge mind  (one Python process)             │
                 │                                                  │
    Telegram ──► │  telegram_bot ──► COMMS_URL ──► mind_server.app  │
                 │              (hive-comms)            │           │

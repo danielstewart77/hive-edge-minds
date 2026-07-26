@@ -1,4 +1,4 @@
-# hive-outpost configuration.
+# hive-edge-minds configuration.
 # Copy to config.yaml. Non-secret settings only — secrets stay in .env.
 
 server_port: 8421

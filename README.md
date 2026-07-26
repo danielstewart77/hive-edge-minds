@@ -1,17 +1,17 @@
-# hive-outpost
+# hive-edge-minds
 
 One mind, connected to a hive.
 
-An **outpost** is a single-mind installation of the
+An **edge mind** is a single-mind installation of the
 [Hive Mind](https://github.com/danielstewart77/hive-mind) system: one AI mind
 running on a machine of your choosing — bare-metal Linux, a container, or a
 Windows box — wired back to a hive's nervous system for sessions, memory, and
-inter-mind messaging. The hive runs the shared services; the outpost runs the
+inter-mind messaging. The hive runs the shared services; the edge mind runs the
 mind.
 
 ```
                 ┌─────────────────────────────────────────────────┐
-                │  the outpost  (one process on your machine)     │
+                │  the edge mind  (one process on your machine)   │
                 │                                                 │
    Telegram ──► │  telegram_bot ──► COMMS_URL ──► mind_server     │
                 │                                      │          │
@@ -30,7 +30,7 @@ mind.
 
 ## Roles
 
-Every outpost declares what it is allowed to be on its machine:
+Every edge mind declares what it is allowed to be on its machine:
 
 - **operator** — full host access by design. The mind operates the machine:
   filesystem, processes, Docker, the lot. For a system-administrator mind on
@@ -42,6 +42,17 @@ Every outpost declares what it is allowed to be on its machine:
 Deployment is orthogonal to role: either role can run as a **systemd**
 service, a **container**, or a **windows-task** (logon-triggered scheduled
 task).
+
+## Profiles
+
+Every installation also declares a deployment profile:
+
+- **standard** — the generic one-mind runtime in this repository.
+- **sentinel** — the same runtime plus the separately managed
+  `hive-sentinel` security logic, telemetry collectors, Loki, and Grafana.
+
+The profile records what belongs to the installation without mixing
+specialized Sentinel code into the generic Edge Mind runtime.
 
 ## Prerequisites
 
@@ -58,12 +69,12 @@ task).
 ## Quickstart
 
 ```bash
-git clone https://github.com/danielstewart77/hive-outpost
-cd hive-outpost
+git clone https://github.com/danielstewart77/hive-edge-minds
+cd hive-edge-minds
 ./setup.sh
 ```
 
-The wizard asks five questions — name, role, deployment, harness, surfaces —
+The wizard asks for a name, profile, role, deployment, harness, and surfaces,
 then scaffolds the mind (`minds/<name>/`, `souls/<name>.md`), stamps `.env`,
 and emits the installer for your deployment into `deploy/` (or
 `docker-compose.yml`). It never runs sudo and never starts anything; it
@@ -83,7 +94,7 @@ hive-mind repo).
 ## What's in the box
 
 ```
-hive-outpost/
+hive-edge-minds/
 ├── setup.sh                        # the wizard — scaffold + installer emission
 ├── launch_mind_server_and_bots.py  # entry point: mind server + surface bots, one process
 ├── launch_windows.py               # Windows Task Scheduler bootstrap
@@ -144,7 +155,7 @@ prompt composition happens hive-side — see [`docs/memory-system/`](docs/memory
 
 ## Federation
 
-Connecting an outpost to a second hive is specified but not yet implemented —
+Connecting an edge mind to a second hive is specified but not yet implemented —
 see [`specs/federation.md`](specs/federation.md).
 
 ## Development

@@ -21,7 +21,7 @@ Skip trivia. An empty category is fine — save nothing rather than padding.
 2. Schedule the kill, detached, so this turn's reply is delivered before the process dies:
 
 ```bash
-set -a; source /opt/hive-outpost/.env; set +a
+set -a; source /opt/hive-edge-minds/.env; set +a
 SID=$(curl -s -H "Authorization: Bearer $COMMS_BEARER_TOKEN" "$COMMS_URL/sessions" | \
   jq -r --arg c "$CLAUDE_CODE_SESSION_ID" '.[] | select(.claude_sid==$c) | .id' | head -1)
 [ -n "$SID" ] && nohup bash -c "sleep 8; curl -s -X DELETE -H \"Authorization: Bearer $COMMS_BEARER_TOKEN\" \"$COMMS_URL/sessions/$SID\"" >/dev/null 2>&1 &

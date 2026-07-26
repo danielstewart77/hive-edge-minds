@@ -27,7 +27,7 @@ bearer token. Two surfaces:
 ## Setup (prepend before every invocation)
 
 ```bash
-set -a; source /opt/hive-outpost/.env; set +a   # provides LUCENT_URL_SELF, LUCENT_BEARER_TOKEN, MIND_ID
+set -a; source /opt/hive-edge-minds/.env; set +a   # provides LUCENT_URL_SELF, LUCENT_BEARER_TOKEN, MIND_ID
 AUTH="Authorization: Bearer $LUCENT_BEARER_TOKEN"
 ```
 

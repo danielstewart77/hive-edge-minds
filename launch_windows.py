@@ -1,6 +1,6 @@
 """Windows Task Scheduler entry point for a mind.
 
-systemd's ``EnvironmentFile=`` (how a Linux outpost injects ``.env``) has no
+systemd's ``EnvironmentFile=`` (how a Linux edge mind injects ``.env``) has no
 Windows equivalent, so this bootstrap loads ``.env`` into the process
 environment and puts the harness binary on ``PATH``, then hands off to the
 shared launcher unchanged.
