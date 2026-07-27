@@ -1,9 +1,15 @@
 # Session rotation cycle
 
-A session that is about to run out of context is retired and replaced by a
-fresh one carrying a distilled summary forward. The Stop hook decides and
-does the slow work; hive-comms owns the swap and composes the successor's
+A conversation that is about to run out of context is replaced by a fresh
+one carrying a distilled summary forward. The Stop hook decides and does the
+slow work; hive-comms owns the swap and composes the new conversation's
 opening context.
+
+What rotates is the *harness conversation*, not always the session. A
+terminal session keeps its row, its id and its pane, and only its
+`claude_sid` changes. A chat session is retired for a successor row, because
+there is no pane to respawn and the surface rebinds on the next turn either
+way.
 
 ## The whole loop
 
@@ -14,7 +20,7 @@ sequenceDiagram
     participant BG as detached child
     participant O as Ollama
     participant NS as hive-comms
-    participant N as successor session
+    participant N as new conversation
 
     M->>H: Stop event
     H->>H: transcript chars ÷ 4 over threshold?
@@ -32,13 +38,13 @@ sequenceDiagram
     BG->>NS: POST /sessions/arm-rotation
 
     alt owner_ref == "terminal"
-        NS->>N: create successor row + compose prompt
-        NS->>M: POST /sessions/{old}/rotate-pty on the mind
-        Note over M: tmux rename + respawn-pane -k<br/>pane, pty and socket survive
-        NS-->>M: session_closed{rotated_to, rotated_in_place}<br/>→ TEXT frame, socket stays open
+        Note over NS: compose prompt, mint a new claude_sid
+        NS->>M: POST /sessions/{id}/rotate-pty on the mind
+        Note over M: respawn-pane -k onto the new conversation<br/>session, pane, pty and socket all survive
+        NS->>NS: UPDATE sessions SET claude_sid
     else chat surface
         Note over NS: set rotation_armed = 1
-        NS->>N: swap inside send_message on the next user turn
+        NS->>N: successor row inside send_message on the next user turn
     end
 ```
 
@@ -63,7 +69,7 @@ sequenceDiagram
   same-role turns are collapsed before the model sees them.
 - The carry-forward is persisted to the NS sessions DB via
   `POST /sessions/{sid}/rotation-memory`, which writes the `session_memory`
-  row the successor's prompt is composed from.
+  row the new conversation's prompt is composed from.
 
 ## Turns that land mid-rotation
 
@@ -76,8 +82,8 @@ answering the whole time. Those turns must not be lost.
 - That reads the durable `session_turns` ledger, not the transcript — a
   turn accepted but never fully answered before the swap exists in the
   ledger and would not be in a transcript tail.
-- Trailing user turns with no completed assistant reply become the
-  successor's `<pending-continuation>`; a cheap structured delta pass over
+- Trailing user turns with no completed assistant reply become the new
+  conversation's `<pending-continuation>`; a cheap structured delta pass over
   the late turns also refreshes `next_step` and in-flight state.
 - `send_message` fills the ledger for chat surfaces. The browser terminal
   bypasses it entirely, so its Stop hook POSTs each completed turn to
@@ -91,38 +97,49 @@ on whether the surface has a future turn to defer to.
 - **Chat surfaces** (Telegram/Discord) set `rotation_armed = 1`. The swap
   happens inside `send_message` on the next user turn, so the rollover
   lands on a user turn and never destroys an assistant reply in flight.
-- **Terminal-owned sessions** (`owner_ref == "terminal"`) finalize
-  immediately. Keystrokes are raw pty bytes, so `send_message` is never
-  called and an armed flag would sit unconsumed forever while the session
-  grew into native compaction. Finalizing here is still the last step of
+  `_finalize_rotation` creates the successor row *before* killing the
+  predecessor, so the new id exists in time to ride out on the
+  `session_closed` event as `rotated_to`.
+- **Terminal-owned sessions** (`owner_ref == "terminal"`) rotate on the
+  spot. Keystrokes are raw pty bytes, so `send_message` is never called and
+  an armed flag would sit unconsumed forever while the session grew into
+  native compaction. Rotating here is still the last step of
   already-backgrounded work, not a synchronous cost.
 
-Finalizing creates the successor *before* killing the predecessor, so the
-new id exists in time to be handed to the mind and to ride out on the
-`session_closed` event as `rotated_to`.
+### The terminal keeps its session and its pane
 
-### The terminal keeps its pane
+The session row is the conversation's permanent identity — the tile, its
+label, the `session_turns` ledger and the `active_sessions` binding are all
+keyed to the session id. So a terminal rotation moves none of it.
+`_rotate_conversation_in_place` composes the prompt, mints a new
+`claude_sid`, and calls `POST /sessions/{id}/rotate-pty` on the mind with
+that id and the composed prompt. The mind `respawn-pane -k`s the pane onto a
+fresh harness process carrying the carry-forward
+(`--append-system-prompt` for claude; codex's positional opening prompt,
+since it has no such flag) — no rename, nothing killed. The attached tmux
+client, the pty, the proxied websocket and the browser tile are never
+touched, and `mind_server` just repoints the pty handle's `claude_sid`.
 
-A rotation replaces the conversation, not the terminal. Before the old
-session is killed, hive-comms calls `POST /sessions/{old_id}/rotate-pty` on
-the mind with the successor's id, its conversation id, and the composed
-prompt. The mind renames the tmux session to the successor's id and
-`respawn-pane -k`s the pane onto a fresh harness process carrying the
-carry-forward (`--append-system-prompt` for claude; codex's positional
-opening prompt, since it has no such flag). The attached tmux client — and
-so the pty, the proxied websocket, and the browser tile — is never touched;
-`mind_server` just re-keys the pty handle to the new session id.
+hive-comms then writes that id onto the same row
+(`UPDATE sessions SET claude_sid = ?, harness_sid = NULL`). Nothing above
+the harness is told anything, because nothing above the harness changed:
+the user keeps typing into the same pane under the same session id and only
+the context behind it reset.
 
-`kill_session` then publishes `rotated_in_place` alongside `rotated_to`, and
-`ws_attach` answers it with a `{"type": "session_rotated"}` TEXT frame — the
-one frame type the mind never sends — and goes on bridging the same socket
-under the successor's id. The tile relabels itself and keeps typing.
+The carry-forward reaches the pane in a file, not in the tmux command. A
+composed prompt runs to tens of thousands of characters; tmux rejects a
+`respawn-pane` that long outright with "command too long", and Linux caps a
+single argv entry at `MAX_ARG_STRLEN` (128 KiB) besides. The pane command is
+a one-line `sh -c` that reads the seed file, deletes it, and `exec`s the
+harness with the contents — and `_capped_seed` trims anything over 120,000
+chars to its tail first.
 
-A rotation with no live terminal under it (the pty was already reaped)
-falls back to close code **4412** with the successor id as the reason, and
-the tile reattaches. Plain 4410 still means ended with no successor.
+When the mind reports no live terminal (the pty was reaped), nothing is
+written: there is no pane burning context, and a fresh `claude_sid` with no
+process behind it would strand the session on a conversation that was never
+started and never seeded.
 
-## The successor's opening context
+## The new conversation's opening context
 
 Composition is NS-side, in `comms/bootstrap_loader::compose_prompt_blocks`,
 and lands in the order the continuation needs:
@@ -143,9 +160,10 @@ The mind passes the composed string straight to
    milliseconds while the child works.
 2. Keep typing during the window. The session answers normally; the turns
    appear in `session_turns`.
-3. `ARMED` in the log is followed by a finalize for a terminal session, or
-   by a swap on the next user turn for a chat surface.
-4. The browser tile never blinks: same pane, same scrollback, and the
-   session id in the sidebar changes to the successor's.
-5. The successor's opening context shows the carry-forward followed by the
-   turns typed during the window.
+3. `ARMED` in the log is followed by an in-place rotation for a terminal
+   session, or by a swap on the next user turn for a chat surface.
+4. The browser tile never blinks: same pane, same scrollback, same session
+   id — the harness announces a fresh conversation and the context meter
+   resets.
+5. The new conversation's opening context shows the carry-forward followed
+   by the turns typed during the window.
