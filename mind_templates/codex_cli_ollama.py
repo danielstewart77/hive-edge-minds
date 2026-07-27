@@ -33,16 +33,12 @@ async def spawn(
     config_obj: Any = None,
     is_group_session: bool = False,
 ) -> dict:
-    base = (
-        build_base_prompt(
-            allowed_directories=allowed_directories,
-            soul_file=soul_file,
-            mind_id=mind_id,
-            mind_name=mind_name,
-        )
-        if build_base_prompt else ""
-    )
-    full_prompt = base if not surface_prompt else f"{base}\n\n{surface_prompt}"
+    if system_prompt_blocks and surface_prompt:
+        full_prompt = f"{system_prompt_blocks}\n\n{surface_prompt}"
+    elif surface_prompt:
+        full_prompt = surface_prompt
+    else:
+        full_prompt = system_prompt_blocks
     state = {"system_prompt": full_prompt, "thread_id": resume_sid}
     _sessions[session_id] = state
     log.info("Session %s initialised (resume=%s)", session_id, resume_sid or "new")
@@ -64,6 +60,8 @@ async def send(session_id: str, content: str, images: list[dict] | None = None, 
         stdin_content = f"{state['system_prompt']}\n\n---\n\n{content}"
 
     proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=10*1024*1024)
+    assert proc.stdin is not None
+    assert proc.stdout is not None
     proc.stdin.write(stdin_content.encode())
     await proc.stdin.drain()
     proc.stdin.close()

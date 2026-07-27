@@ -21,7 +21,7 @@ _log = open(ROOT / "mind.log", "a", buffering=1, encoding="utf-8")
 sys.stdout = _log
 sys.stderr = _log
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402 - streams must be rebound first
 
 load_dotenv(ROOT / ".env")
 
@@ -44,6 +44,6 @@ os.environ["PATH"] = os.pathsep.join(
     [p for p in _PATH_PREPEND if os.path.isdir(p)] + [_existing]
 )
 
-import runpy
+import runpy  # noqa: E402 - environment must be prepared before handoff
 
 runpy.run_path(str(ROOT / "launch_mind_server_and_bots.py"), run_name="__main__")

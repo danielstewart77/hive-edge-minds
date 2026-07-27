@@ -13,15 +13,18 @@ over HTTP at COMMS_URL with COMMS_BEARER_TOKEN. Lucent (vector store + KG)
 lives in the hive-lucent container at LUCENT_URL_SELF.
 """
 import asyncio
+import logging
 import os
 from pathlib import Path
 
 import uvicorn
 import yaml
 
+from hive_logging import configure_logging, log_event
 from mind_server import app as mind_app
 
 PROJECT_DIR = Path(__file__).resolve().parent
+log = configure_logging("hive-mind-launcher")
 
 _SURFACE_RUNNERS = {
     "telegram": lambda: __import__("bots.telegram_bot", fromlist=["run_telegram_bot"]).run_telegram_bot(),
@@ -52,13 +55,25 @@ async def main() -> None:
     mind_port = int(os.environ["MIND_SERVER_PORT"])
 
     mind_cfg = uvicorn.Config(
-        mind_app, host="0.0.0.0", port=mind_port, log_level="info"
+        mind_app, host="0.0.0.0", port=mind_port, log_level="info",
+        log_config=None, access_log=False,
     )
     mind_server = uvicorn.Server(mind_cfg)
 
     coros = [mind_server.serve()]
-    coros.extend(_SURFACE_RUNNERS[s]() for s in configured_surfaces())
-    await asyncio.gather(*coros)
+    surfaces = configured_surfaces()
+    log_event(log, "service.started", component="mind-runtime", port=mind_port, surfaces=surfaces)
+    coros.extend(_SURFACE_RUNNERS[s]() for s in surfaces)
+    try:
+        await asyncio.gather(*coros)
+    except Exception as exc:
+        log_event(
+            log, "service.failed", level=logging.CRITICAL, component="mind-runtime",
+            error_type=type(exc).__name__, exc_info=True,
+        )
+        raise
+    finally:
+        log_event(log, "service.stopped", component="mind-runtime")
 
 
 if __name__ == "__main__":

@@ -29,12 +29,9 @@ from config import config
 from bots.bot_utils import get_lock, get_queue, time_ago
 from bots.gateway_client import GatewayClient
 from bots.skills import get_skills
+from hive_logging import configure_logging, log_event
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("hive-mind-telegram")
+log = configure_logging("hive-mind-telegram")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -291,10 +288,22 @@ SERVER_COMMANDS = {"/clear", "/model", "/autopilot", "/kill", "/prune", "/status
 async def _handle_server_command(content: str, user_id: int, chat_id: int) -> str:
     parts = content.split()
     cmd = parts[0]
+    log_event(
+        log, "surface.command.received", surface="telegram", command=cmd,
+        user_id=user_id, client_ref=chat_id,
+    )
     result = await gateway.server_command(user_id, chat_id, content)
 
     if "error" in result:
+        log_event(
+            log, "surface.command.failed", level=logging.WARNING, surface="telegram",
+            command=cmd, user_id=user_id, client_ref=chat_id,
+        )
         return f"Error: {result['error']}"
+    log_event(
+        log, "surface.command.completed", surface="telegram", command=cmd,
+        user_id=user_id, client_ref=chat_id,
+    )
 
     if cmd == "/sessions":
         return _format_sessions(result)
@@ -341,6 +350,10 @@ async def _handle_server_command(content: str, user_id: int, chat_id: int) -> st
 # ---------------------------------------------------------------------------
 async def _auth_check(update: Update) -> bool:
     if not _is_allowed_user(update.effective_user.id):
+        log_event(
+            log, "surface.auth.rejected", level=logging.WARNING, surface="telegram",
+            user_id=update.effective_user.id, client_ref=update.effective_chat.id,
+        )
         await update.message.reply_text("Not authorized.")
         return False
     return True
@@ -556,6 +569,10 @@ async def cmd_skill(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed_user(update.effective_user.id):
+        log_event(
+            log, "surface.auth.rejected", level=logging.WARNING, surface="telegram",
+            user_id=update.effective_user.id, client_ref=update.effective_chat.id,
+        )
         return
 
     # In group chats, only respond to @mentions
@@ -572,6 +589,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    log_event(
+        log, "surface.message.received", surface="telegram", message_type="text",
+        user_id=update.effective_user.id, client_ref=chat_id, content_chars=len(content),
+    )
     lock = get_lock(chat_id)
     queue = get_queue(chat_id)
 
@@ -636,6 +657,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     content = caption if caption else "Please analyze this image."
 
     chat_id = update.effective_chat.id
+    log_event(
+        log, "surface.message.received", surface="telegram", message_type="photo",
+        user_id=update.effective_user.id, client_ref=chat_id, caption_chars=len(content),
+    )
     lock = get_lock(chat_id)
 
     if lock.locked():
@@ -663,13 +688,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ts = datetime.now().strftime("%H%M%S_%f")
             saved_path = drop_dir / f"{ts}_{chat_id}_{photo.file_unique_id}.jpg"
             saved_path.write_bytes(photo_bytes)
-            log.info("Saved telegram photo to %s (%d bytes)", saved_path, len(photo_bytes))
+            relative = saved_path.relative_to(repo_root)
+            log_event(
+                log, "surface.photo.saved", surface="telegram", user_id=update.effective_user.id,
+                client_ref=chat_id, path=str(relative),
+                bytes=len(photo_bytes),
+            )
 
             images = [{"media_type": "image/jpeg", "data": b64_data}]
 
             # Tell the mind where the file lives so it can be moved into the
             # correct house's images folder in the same turn.
-            relative = saved_path.relative_to(repo_root)
             content_with_path = (
                 f"{content}\n\n[saved to {relative} \u2014 move into the active house's images folder if appropriate]"
             )
@@ -697,6 +726,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    log_event(
+        log, "surface.message.received", surface="telegram", message_type="voice",
+        user_id=update.effective_user.id, client_ref=chat_id,
+    )
     lock = get_lock(chat_id)
     queue = get_queue(chat_id)
 

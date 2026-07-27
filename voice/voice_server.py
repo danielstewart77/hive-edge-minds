@@ -14,7 +14,10 @@ import re
 import subprocess
 import tempfile
 
+from hive_logging import configure_logging, install_fastapi_logging, log_event
 from voice.wake_word import WakeWordController
+
+log = configure_logging("hive-mind.voice")
 
 # Check GPU compatibility BEFORE importing torch -- once torch initializes
 # CUDA, it's too late to hide the device from downstream libraries.
@@ -51,9 +54,8 @@ from fastapi import FastAPI, HTTPException, UploadFile  # noqa: E402
 from fastapi.responses import Response  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-log = logging.getLogger("hive-mind.voice")
-
 app = FastAPI(title="Hive Mind Voice Server")
+install_fastapi_logging(app, log, component="voice-server")
 
 _DEVICE = "cuda" if _GPU_OK and torch.cuda.is_available() else "cpu"
 _WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
@@ -306,7 +308,10 @@ async def stt(file: UploadFile):
     finally:
         os.unlink(tmp_path)
 
-    log.info("STT: %r", text[:80])
+    log_event(
+        log, "voice.stt.completed", audio_bytes=len(audio_bytes),
+        transcript_chars=len(text), device=_DEVICE,
+    )
     return {"text": text}
 
 
@@ -353,7 +358,10 @@ async def tts(req: TTSRequest):
     torchaudio.save(wav_buf, wav, _chatterbox_model.sr, format="WAV")
     ogg_bytes = _wav_to_ogg(wav_buf.getvalue(), speed=req.speed)
 
-    log.info("TTS (Chatterbox): %d chars -> %d bytes OGG", len(req.text), len(ogg_bytes))
+    log_event(
+        log, "voice.tts.completed", text_chars=len(req.text), audio_bytes=len(ogg_bytes),
+        voice_id=req.voice_id or "default", device=_DEVICE,
+    )
     return Response(content=ogg_bytes, media_type="audio/ogg")
 
 
@@ -377,11 +385,10 @@ async def wake_word_config(req: WakeWordConfigRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    log.info(
-        "Wake-word config updated: phrases=%s cancel_phrases=%s window=%.2fs",
-        config.phrases,
-        config.cancel_phrases,
-        config.followup_window_seconds,
+    log_event(
+        log, "voice.wake_word.configured", phrase_count=len(config.phrases),
+        cancel_phrase_count=len(config.cancel_phrases),
+        followup_window_seconds=config.followup_window_seconds,
     )
     return _wake_word.get_status()
 
@@ -409,5 +416,4 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    logging.basicConfig(level=logging.INFO)
-    uvicorn.run(app, host="0.0.0.0", port=8422)
+    uvicorn.run(app, host="0.0.0.0", port=8422, log_config=None, access_log=False)

@@ -16,7 +16,6 @@ geometry it has never drawn for, nothing the browser does can strand a tile.
 
 import fcntl
 import os
-import pty
 import select
 import shutil
 import struct
