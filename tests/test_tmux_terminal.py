@@ -203,11 +203,11 @@ def test_kill_ends_the_conversation(terminal):
     assert implementation.pty_session_alive(session_id) is False
 
 
-def test_rotation_keeps_the_pane_and_the_client(terminal, monkeypatch, tmp_path):
+def test_rotation_keeps_the_session_the_pane_and_the_client(terminal, monkeypatch, tmp_path):
     # The whole point of rotating in place: the conversation is replaced, the
-    # terminal is not. The attached client must still be the same process,
-    # still holding the same pty, and the successor's output must arrive on
-    # it without anything reattaching.
+    # session and the terminal are not. The tmux session keeps its name, the
+    # attached client is still the same process holding the same pty, and the
+    # new conversation's output arrives on it without anything reattaching.
     successor = tmp_path / "successor_app.py"
     successor.write_text(
         'import sys, time\n'
@@ -216,53 +216,83 @@ def test_rotation_keeps_the_pane_and_the_client(terminal, monkeypatch, tmp_path)
     )
     monkeypatch.setattr(
         implementation, "_rotation_argv",
-        lambda model, mcp_config, new_claude_sid, system_prompt: [
-            sys.executable, str(successor)
-        ],
+        lambda model, mcp_config, new_claude_sid: [sys.executable, str(successor)],
     )
 
     session_id, attach, detach = terminal
     proc, fd = attach(100, 30)
     try:
         assert _read_for(fd, 3.0), "the tile never got its first paint"
-        new_session_id = f"{session_id}-next"
 
         rotated = implementation.rotate_pty_session(
-            old_session_id=session_id,
-            new_session_id=new_session_id,
+            session_id=session_id,
             new_claude_sid="conv-2",
             model="sonnet",
-            system_prompt="carry-forward",
+            # A real carry-forward is a composed prompt, not a phrase: soul,
+            # recent memory, the summary, the turns typed during the window.
+            # Passed in the command, this is what tmux rejects outright with
+            # "command too long" — the rotation then never happens at all.
+            system_prompt="carry-forward " * 4000,
         )
 
         assert rotated is True
         assert proc.poll() is None, "the attached client died during the rotation"
-        assert implementation.pty_session_alive(new_session_id) is True
-        assert implementation.pty_session_alive(session_id) is False
+        # Same session, still alive under the same id — that id is the
+        # conversation's permanent identity everything above tmux is keyed to.
+        assert implementation.pty_session_alive(session_id) is True
         after = _read_for(fd, 4.0).decode("utf8", "replace")
         assert "SUCCESSOR-DELTA" in after
     finally:
         detach(proc, fd)
-        implementation.kill_pty_session(f"{session_id}-next")
 
 
 def test_rotation_declines_when_there_is_no_terminal(terminal):
-    # No live pane means no in-place swap to do; the gateway falls back to a
-    # plain session swap on a False.
+    # No live pane means no conversation to turn over; the gateway leaves the
+    # session's claude_sid alone on a False.
     session_id, _attach, _detach = terminal
     assert implementation.rotate_pty_session(
-        old_session_id=session_id,
-        new_session_id=f"{session_id}-next",
+        session_id=session_id,
         new_claude_sid="conv-2",
         model="sonnet",
     ) is False
 
 
-def test_rotation_argv_carries_the_seed_on_a_fresh_conversation():
-    argv = implementation._rotation_argv("sonnet", "", "conv-2", "carry-forward")
+def test_rotation_starts_a_fresh_conversation_rather_than_resuming():
+    argv = implementation._rotation_argv("sonnet", "", "conv-2")
     assert "--session-id" in argv and argv[argv.index("--session-id") + 1] == "conv-2"
     assert "--resume" not in argv
-    assert argv[argv.index("--append-system-prompt") + 1] == "carry-forward"
+
+
+def test_the_seed_reaches_the_pane_without_riding_in_the_command(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    seed = "carry-forward " * 4000
+
+    cmd = implementation._seeded_pane_command(["claude", "--model", "opus"], seed, "sess-9")
+
+    assert len(" ".join(cmd)) < 1000, "the seed is still in the command tmux has to parse"
+    seed_file = tmp_path / "rotation-seeds" / "sess-9.txt"
+    assert seed_file.read_text() == seed
+    assert str(seed_file) in cmd[-1]
+    assert "--append-system-prompt" in cmd[-1]
+
+
+def test_an_oversized_seed_is_trimmed_to_what_exec_can_carry(monkeypatch, tmp_path):
+    # Above MAX_ARG_STRLEN the exec fails and the pane dies a second after
+    # tmux starts it, which looks exactly like a rotation that worked.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    seed = ("head " * 40000) + "THE-PENDING-TURNS"
+
+    implementation._seeded_pane_command(["claude"], seed, "sess-big")
+
+    written = (tmp_path / "rotation-seeds" / "sess-big.txt").read_text()
+    assert len(written) < 131072
+    assert written.endswith("THE-PENDING-TURNS")  # the tail is what continues
+
+
+def test_a_rotation_with_no_seed_runs_the_harness_directly(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    argv = ["claude", "--model", "opus"]
+    assert implementation._seeded_pane_command(argv, "", "sess-9") == argv
 
 
 def test_a_second_attach_takes_the_keyboard_from_the_first(terminal):

@@ -122,32 +122,44 @@ The process ends only on `DELETE /sessions/{id}` or via the idle reaper
 (`PTY_IDLE_TIMEOUT_SECONDS`, default one hour unattached). A turn in flight
 survives a closed tab.
 
-A rotation replaces the conversation, not the terminal. Rotation normally
-arms a flag that hive-comms consumes on the conversation's next user turn,
-but keystrokes are raw bytes — the terminal never calls `send_message`, so
-there is no turn to consume it. For sessions whose `owner_ref` is
-`terminal`, `arm_rotation` finalizes on the spot: the successor's row and
-prompt are composed first, then hive-comms calls `POST
-/sessions/{old}/rotate-pty` on the mind. `rotate_pty_session` renames the
-tmux session to the successor's id and `respawn-pane -k`s the pane onto a
-fresh harness process carrying the carry-forward, so the attached tmux
+A rotation replaces the conversation, not the session and not the terminal.
+The session row is permanent — the tile, its label, the turn ledger and the
+`active_sessions` binding are all keyed to `sessions.id` — so what rotates
+under it is the harness conversation. Rotation normally arms a flag that
+hive-comms consumes on the conversation's next user turn, but keystrokes are
+raw bytes: the terminal never calls `send_message`, so there is no turn to
+consume it. For sessions whose `owner_ref` is `terminal`, `arm_rotation`
+rotates on the spot. It composes the carry-forward, mints a new `claude_sid`
+and calls `POST /sessions/{id}/rotate-pty` on the mind; `rotate_pty_session`
+`respawn-pane -k`s the pane onto a fresh harness process carrying that
+carry-forward, renaming nothing and killing nothing, so the attached tmux
 client — and with it the pty, the proxied socket and the browser tile — is
-never disturbed; `mind_server` re-keys the pty handle and nothing else
-moves. The user sees a new session id on the same pane, mid-typing. tmux
-targets are prefix-matched, so every session lookup uses the `=` exact-match
-form; without it a rename can leave one id answering for another's pane.
+never disturbed. `mind_server` repoints the pty handle's `claude_sid`, and
+hive-comms writes the same id onto the same row. The user keeps typing in
+the same pane under the same session id while the context behind it resets.
+Nothing is published and the tile is told nothing, because nothing it tracks
+changed. tmux targets are prefix-matched, so every session lookup uses the
+`=` exact-match form; without it one id can answer for another's pane.
 
-The old session is then killed with `rotated_to` *and* `rotated_in_place` on
-the published `session_closed` event; `ws_attach` answers that with a
-`{"type": "session_rotated"}` TEXT frame — the one frame type the mind never
-sends up the bridge — and keeps pumping. A rotation with no live pty under
-it (already reaped) still falls back to close code **4412** with the
-successor id as the reason, and the tile reattaches. Bare 4410 keeps its old
-meaning: ended, no successor.
+The carry-forward travels in a file, never in the tmux command: a composed
+prompt is tens of thousands of characters, tmux rejects a long
+`respawn-pane` with "command too long", and Linux caps one argv entry at
+`MAX_ARG_STRLEN` (128 KiB) regardless. The pane runs a one-line `sh -c` that
+reads the seed, deletes it and `exec`s the harness with it; `_capped_seed`
+trims anything past 120,000 chars to its tail. A mind reporting no live
+terminal writes nothing at all — a fresh `claude_sid` with no process behind
+it would strand the session on a conversation that was never seeded.
+
+Chat-surface rotation still retires the session for a successor row (there
+is no pane to respawn), and `kill_session` publishes `rotated_to` on the
+`session_closed` event so an attached observer reattaches via close code
+**4412** with the successor id as the reason. Bare 4410 keeps its meaning:
+ended, no successor.
 
 Terminal turns also have to reach the `session_turns` ledger, which is what
 `GET /sessions/late-turns` reads to fold turns typed during the rotation's
-multi-minute background window into the successor's `<pending-continuation>`.
+multi-minute background window into the new conversation's
+`<pending-continuation>`.
 `send_message` writes that ledger for chat surfaces; the pty bridge can't, so
 the Stop hook POSTs each completed turn to `POST /sessions/record-turn` on
 every fire when `HIVE_SURFACE=terminal`.

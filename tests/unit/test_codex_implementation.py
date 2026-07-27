@@ -8,6 +8,8 @@ real `codex exec`.
 import json
 import os
 import subprocess
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -454,49 +456,64 @@ class TestSpawnPty:
 
 
 class TestRotatePtySession:
-    """A rotation replaces the conversation; the pane and its client stay."""
+    """A rotation replaces the conversation; the session, the pane and its
+    client all stay. The session id is permanent — it is what the gateway,
+    the tile and the turn ledger are keyed to — so nothing is renamed."""
 
-    def _rotate(self, tmux=None, alive=True, **kwargs):
+    def _rotate(self, tmux=None, alive=True, seed_home=None, **kwargs):
         tmux = tmux or _TmuxRecorder()
-        call_kwargs = {"old_session_id": "old", "new_session_id": "new",
-                       "new_claude_sid": "conv-2", "system_prompt": "carry-forward"}
+        call_kwargs = {"session_id": "s1", "new_claude_sid": "conv-2",
+                       "system_prompt": "carry-forward"}
         call_kwargs.update(kwargs)
-        with patch("mind_templates.codex_cli_codex._tmux", tmux), \
+        with patch("mind_templates.codex_cli_codex.CODEX_HOME",
+                   seed_home or Path(tempfile.mkdtemp())), \
+             patch("mind_templates.codex_cli_codex._tmux", tmux), \
              patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=alive), \
              patch("mind_templates.codex_cli_codex._existing_rollout_paths", return_value=set()), \
              patch("mind_templates.codex_cli_codex._watch_for_new_thread_in_background") as watcher:
             rotated = impl.rotate_pty_session(**call_kwargs)
         return tmux, watcher, rotated
 
-    def test_the_pane_is_renamed_and_respawned_not_recreated(self):
+    def test_the_pane_is_respawned_in_the_session_that_already_exists(self):
         tmux, _, rotated = self._rotate()
 
         assert rotated is True
-        assert tmux.calls[0] == ["rename-session", "-t", "=MIND_NAME-old", "MIND_NAME-new"]
         respawn = next(c for c in tmux.calls if c[0] == "respawn-pane")
-        assert "-k" in respawn and respawn[respawn.index("-t") + 1] == "MIND_NAME-new"
-        # Nothing starts a second tmux session — that is the successor pane
-        # this whole path exists to avoid.
-        assert not any(c[0] == "new-session" for c in tmux.calls)
+        assert "-k" in respawn and respawn[respawn.index("-t") + 1] == "MIND_NAME-s1"
+        # Nothing renames the session and nothing starts a second one: both
+        # move the conversation out from under a tile that is holding it.
+        assert not any(c[0] in ("rename-session", "new-session") for c in tmux.calls)
 
-    def test_the_carry_forward_rides_in_as_the_opening_prompt(self):
+    def test_the_carry_forward_rides_in_as_the_opening_prompt(self, tmp_path):
         """Codex has no --append-system-prompt, so the seed goes where the
-        per-turn path puts it: at the head of the conversation."""
-        tmux, _, _ = self._rotate()
+        per-turn path puts it: at the head of the conversation. It travels in
+        a file — a real carry-forward is far past the length tmux will accept
+        in a respawn-pane command."""
+        tmux, _, _ = self._rotate(
+            seed_home=tmp_path, system_prompt="carry-forward " * 4000
+        )
 
         respawn = next(c for c in tmux.calls if c[0] == "respawn-pane")
         argv = respawn[respawn.index("--") + 1:]
-        assert argv[0] == "codex" and "resume" not in argv
-        assert argv[-1] == "carry-forward"
+        assert argv[0] == "/bin/sh"
+        assert len(" ".join(argv)) < 1000, "the seed is still in the tmux command"
+        seed_file = tmp_path / "rotation-seeds" / "s1.txt"
+        assert seed_file.read_text() == "carry-forward " * 4000
+        # Bare codex, no resume: rotation starts a fresh thread and the seed
+        # is its opening turn.
+        assert "exec codex " in argv[-1] and argv[-1].endswith('"$seed"')
+        assert "resume" not in argv[-1]
 
-    def test_the_successor_thread_is_watched_for_under_the_new_id(self):
+    def test_the_new_thread_is_watched_for_under_the_same_session(self):
         tmux, watcher, _ = self._rotate()
-        assert watcher.call_args.args[0] == "new"
+        assert watcher.call_args.args[0] == "s1"
 
-    def test_the_predecessors_thread_is_forgotten(self):
-        impl.THREADS["old"] = "thread-old"
+    def test_the_replaced_thread_is_forgotten(self):
+        """The old codex thread belongs to the conversation being retired. A
+        later reattach that resumed it would undo the rotation."""
+        impl.THREADS["s1"] = "thread-old"
         self._rotate()
-        assert "old" not in impl.THREADS
+        assert "s1" not in impl.THREADS
 
     def test_no_live_terminal_declines(self):
         tmux, watcher, rotated = self._rotate(alive=False)
@@ -505,7 +522,7 @@ class TestRotatePtySession:
         assert tmux.calls == []
         watcher.assert_not_called()
 
-    def test_tmux_refusing_the_rename_is_raised_not_swallowed(self):
+    def test_tmux_refusing_the_respawn_is_raised_not_swallowed(self):
         with pytest.raises(RuntimeError, match="no server running"):
             self._rotate(tmux=_TmuxRecorder(returncode=1, stderr="no server running"))
 

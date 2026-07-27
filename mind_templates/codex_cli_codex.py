@@ -33,6 +33,7 @@ import logging
 import os
 import pty
 import re
+import shlex
 import signal
 import struct
 import subprocess
@@ -550,7 +551,7 @@ def _take_controlling_tty() -> None:
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-def _terminal_argv(thread_id: str | None, prompt: str = "") -> list[str]:
+def _terminal_argv(thread_id: str | None) -> list[str]:
     """The interactive `codex` that runs inside the tmux pane.
 
     Resumes a known thread (`codex resume <id>`) when one exists and has a
@@ -562,11 +563,9 @@ def _terminal_argv(thread_id: str | None, prompt: str = "") -> list[str]:
     non-root user has no write access to the global npm dir) and kills
     codex with exit status 243 before it is ever usable.
 
-    ``prompt`` is codex's optional positional opening turn. Only a rotation
-    uses it: codex has no ``--append-system-prompt``, so the carry-forward
-    is delivered the same way the per-turn path delivers it — as text at the
-    head of the conversation — rather than pasted into the pane afterwards,
-    which would race the TUI's startup.
+    A rotation's carry-forward rides in as codex's positional opening turn
+    (this harness has no ``--append-system-prompt``), but not from here —
+    see ``_seeded_pane_command``.
     """
     cmd = ["codex"]
     if thread_id:
@@ -578,9 +577,58 @@ def _terminal_argv(thread_id: str | None, prompt: str = "") -> list[str]:
         "--dangerously-bypass-hook-trust",
         "-c", "check_for_update_on_startup=false",
     ])
-    if prompt:
-        cmd.append(prompt)
     return cmd
+
+
+# A single argv entry cannot exceed MAX_ARG_STRLEN (32 pages, 128 KiB on
+# Linux); exec fails outright above it. The seed reaches codex as one
+# argument however it is delivered, so it is capped short of that.
+MAX_SEED_CHARS = 120_000
+
+
+def _capped_seed(system_prompt: str) -> str:
+    """Trim an oversized carry-forward to what exec can actually carry.
+
+    The tail is what survives: composition puts the rotation summary and the
+    turns typed during the window last, and those are the ones the successor
+    has to pick the conversation up from.
+    """
+    if len(system_prompt) <= MAX_SEED_CHARS:
+        return system_prompt
+    log.warning("Rotation seed of %d chars exceeds the %d-char exec limit — "
+                "keeping the tail", len(system_prompt), MAX_SEED_CHARS)
+    return ("[earlier context omitted: the carry-forward was too large to "
+            "pass to the harness]\n\n" + system_prompt[-MAX_SEED_CHARS:])
+
+
+def _seeded_pane_command(
+    argv: list[str], system_prompt: str, seed_key: str
+) -> list[str]:
+    """Hand the pane its carry-forward without putting it in the command.
+
+    A rotation seed is a composed prompt — soul, recent memory, the summary,
+    the turns typed during the window — and tmux rejects a `respawn-pane`
+    whose command exceeds its own length limit with "command too long". So
+    the seed goes to a file and the pane reads it back through a one-line
+    shell that then `exec`s codex with it as the opening turn: the tmux
+    command stays short regardless of how much context is being carried.
+    """
+    if not system_prompt:
+        return argv
+
+    system_prompt = _capped_seed(system_prompt)
+    seed_dir = CODEX_HOME / "rotation-seeds"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    seed_file = seed_dir / f"{seed_key}.txt"
+    seed_file.write_text(system_prompt)
+    quoted_seed = shlex.quote(str(seed_file))
+    harness = " ".join(shlex.quote(arg) for arg in argv)
+    # Read then delete: the seed is one conversation's memory sitting in a
+    # file, and it is only ever needed once, at exec time.
+    return [
+        "/bin/sh", "-c",
+        f'seed=$(cat {quoted_seed}); rm -f {quoted_seed}; exec {harness} "$seed"',
+    ]
 
 
 def _tmux(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -665,48 +713,42 @@ def _watch_for_new_thread_in_background(session_id: str, before: set[Path]) -> N
 
 
 def rotate_pty_session(
-    old_session_id: str,
-    new_session_id: str,
+    session_id: str,
     new_claude_sid: str,
     model: str = "",
     system_prompt: str = "",
     **kwargs: Any,
 ) -> bool:
-    """Retire a terminal's conversation and start its successor *in place*.
+    """Start a fresh codex thread in a live terminal, in place.
 
-    A rotation replaces the conversation, not the terminal. The tmux session
-    is renamed to the successor's id and the pane's process respawned onto a
-    fresh codex thread, so the attached client — and therefore the pty, the
-    websocket and the browser tile above it — is never disturbed. From the
-    user's side the session id changes and typing continues in the same pane.
+    A rotation replaces the *conversation*, not the session and not the
+    terminal: the hive session id is permanent, so nothing is renamed. The
+    pane's process is respawned onto a fresh codex thread and the attached
+    client — and therefore the pty, the websocket and the browser tile above
+    it — is never disturbed.
 
-    Codex mints its own thread ids and cannot be handed one, so the
-    successor starts bare and the same background watcher used by a fresh
+    Codex mints its own thread ids and cannot be handed one, so the new
+    thread starts bare and the same background watcher used by a fresh
     terminal reports the id codex writes on the first turn. The rotation
     carry-forward rides in as codex's opening prompt, which is the only
     channel this harness has for it. Returns False when there was no live
-    terminal to rotate, leaving the caller to fall back to a plain swap.
+    terminal to rotate.
     """
     del model, new_claude_sid, kwargs  # symmetry with the claude harness
 
-    old_name = tmux_session_name(old_session_id)
-    new_name = tmux_session_name(new_session_id)
+    name = tmux_session_name(session_id)
 
-    if not pty_session_alive(old_session_id):
+    if not pty_session_alive(session_id):
         log.info("No live terminal for session %s — nothing to rotate in place",
-                 old_session_id)
+                 session_id)
         return False
 
-    result = _tmux("rename-session", "-t", f"={old_name}", new_name)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"tmux refused to rename {old_name} to {new_name}: "
-            f"{(result.stderr or result.stdout).strip()}"
-        )
-    _forget_thread(old_session_id)
+    # The old thread id must go: it belongs to the conversation being
+    # replaced, and a later reattach that resumed it would undo the rotation.
+    _forget_thread(session_id)
 
     before = _existing_rollout_paths()
-    cmd = _terminal_argv(None, prompt=system_prompt)
+    cmd = _seeded_pane_command(_terminal_argv(None), system_prompt, session_id)
 
     env = os.environ.copy()
     overrides = {"CODEX_HOME": str(CODEX_HOME), "HIVE_SURFACE": "terminal"}
@@ -715,9 +757,8 @@ def rotate_pty_session(
     # respawn-pane -k replaces the pane's process without touching the
     # window, the session, or any attached client.
     # No `=` exact-match prefix here: that syntax is for session targets, and
-    # tmux parses a pane target differently. The rename above already left
-    # exactly one session by this name.
-    args = ["respawn-pane", "-k", "-t", new_name, "-c", str(PROJECT_DIR)]
+    # tmux parses a pane target differently.
+    args = ["respawn-pane", "-k", "-t", name, "-c", str(PROJECT_DIR)]
     for key, value in overrides.items():
         args.extend(["-e", f"{key}={value}"])
     args.append("--")
@@ -726,13 +767,13 @@ def rotate_pty_session(
     result = _tmux(*args, env=env)
     if result.returncode != 0:
         raise RuntimeError(
-            f"tmux refused to respawn the pane for session {new_session_id}: "
+            f"tmux refused to respawn the pane for session {session_id}: "
             f"{(result.stderr or result.stdout).strip()}"
         )
 
-    _watch_for_new_thread_in_background(new_session_id, before)
-    log.info("Rotated terminal in place: %s -> %s (seed=%d chars)",
-             old_name, new_name, len(system_prompt))
+    _watch_for_new_thread_in_background(session_id, before)
+    log.info("Rotated the conversation in terminal %s (seed=%d chars)",
+             name, len(system_prompt))
     return True
 
 
