@@ -110,7 +110,10 @@ def test_container_emits_compose_with_operator_host_mount(repo):
     compose = (repo / "docker-compose.yml").read_text()
     assert "container_name: hive-edge-mind-atlas" in compose
     assert "- /:/host" in compose          # operator posture
-    assert "name: hivemind" in compose
+    assert '- "8432:8432"' in compose
+    assert "http://hive-comms:8424" not in compose
+    assert "http://hive-lucent:8424" not in compose
+    assert "name: hivemind" not in compose
 
 
 def test_container_satellite_gets_project_mount_only(repo):

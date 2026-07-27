@@ -280,8 +280,8 @@ volumes:
 
     cat > docker-compose.yml <<EOF
 # $NAME — Hive Edge Mind ($ROLE) as a container.
-# Joins the external \`hivemind\` network so hive-comms can reach it and its
-# hooks can reach lucent/comms by service name.
+# Publishes the Mind API on the selected host port. Hive service endpoints
+# come from .env so this deployment also works on a different machine.
 services:
   $NAME:
     build:
@@ -292,20 +292,12 @@ services:
     working_dir: /usr/src/app
     env_file:
       - .env
-    environment:
-      # Off loopback, onto the hivemind network (internal container ports).
-      COMMS_URL: http://hive-comms:8424
-      LUCENT_URL_SELF: http://hive-lucent:8424
+    ports:
+      - "$PORT:$PORT"
 $operator_block
-$codex_volume_line    networks:
-      - hivemind
+$codex_volume_line
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-networks:
-  hivemind:
-    external: true
-    name: hivemind
 $codex_volumes_block
 EOF
     echo "Wrote docker-compose.yml"
