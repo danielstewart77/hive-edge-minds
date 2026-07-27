@@ -712,11 +712,35 @@ def _watch_for_new_thread_in_background(session_id: str, before: set[Path]) -> N
     ).start()
 
 
+def _session_env(
+    client_ref: str | None, owner_type: str | None, owner_ref: str | None
+) -> dict[str, str]:
+    """Per-session env the hooks inside the pane need to reach the gateway.
+
+    A tmux pane inherits from the tmux *server*, which was started before
+    this session existed and knows nothing about it, so these ride on `-e`
+    per pane. Without CLIENT_REF the Stop hook's rotation check bails on
+    every fire and a terminal conversation never rotates at all — it just
+    grows until the harness's own compaction is the only thing left.
+    """
+    env: dict[str, str] = {}
+    if client_ref:
+        env["CLIENT_REF"] = client_ref
+    if owner_type:
+        env["OWNER_TYPE"] = owner_type
+    if owner_ref:
+        env["OWNER_REF"] = owner_ref
+    return env
+
+
 def rotate_pty_session(
     session_id: str,
     new_claude_sid: str,
     model: str = "",
     system_prompt: str = "",
+    client_ref: str | None = None,
+    owner_type: str | None = None,
+    owner_ref: str | None = None,
     **kwargs: Any,
 ) -> bool:
     """Start a fresh codex thread in a live terminal, in place.
@@ -733,6 +757,11 @@ def rotate_pty_session(
     carry-forward rides in as codex's opening prompt, which is the only
     channel this harness has for it. Returns False when there was no live
     terminal to rotate.
+
+    ``client_ref``/``owner_type``/``owner_ref`` are re-stamped on the new
+    process: ``respawn-pane`` builds the pane's environment from the tmux
+    server's, which never had them, so a rotation that dropped them would
+    hand back a pane whose Stop hook can no longer arm the *next* rotation.
     """
     del model, new_claude_sid, kwargs  # symmetry with the claude harness
 
@@ -752,6 +781,7 @@ def rotate_pty_session(
 
     env = os.environ.copy()
     overrides = {"CODEX_HOME": str(CODEX_HOME), "HIVE_SURFACE": "terminal"}
+    overrides.update(_session_env(client_ref, owner_type, owner_ref))
     env.update(overrides)
 
     # respawn-pane -k replaces the pane's process without touching the
@@ -789,6 +819,9 @@ def spawn_pty(
     mind_name: str = "MIND_NAME",
     cols: int = 80,
     rows: int = 24,
+    client_ref: str | None = None,
+    owner_type: str | None = None,
+    owner_ref: str | None = None,
     **kwargs: Any,
 ) -> tuple[subprocess.Popen, int]:
     """Attach a pty to this session's interactive `codex`, starting it if needed.
@@ -829,6 +862,7 @@ def spawn_pty(
         # which surface each turn arrived on.
         "HIVE_SURFACE": "terminal",
     }
+    overrides.update(_session_env(client_ref, owner_type, owner_ref))
     env.update(overrides)
 
     if not pty_session_alive(session_id):

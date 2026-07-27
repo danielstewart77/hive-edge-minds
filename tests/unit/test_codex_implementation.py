@@ -365,6 +365,26 @@ class TestSpawnPty:
         assert any(c.startswith("CODEX_HOME=") for c in tmux.new_session)
         assert popen.call_args.kwargs["env"]["CODEX_HOME"] == str(impl.CODEX_HOME)
 
+    def test_pane_carries_the_session_env_the_hooks_need(self):
+        """Without CLIENT_REF in the pane, the Stop hook's rotation check
+        bails on every fire and a codex terminal never rotates at all."""
+        tmux, popen, _, _ = _spawned(
+            client_ref="term-1", owner_type="terminal", owner_ref="tile-9"
+        )
+
+        call = tmux.new_session
+        assert "CLIENT_REF=term-1" in call
+        assert "OWNER_TYPE=terminal" in call
+        assert "OWNER_REF=tile-9" in call
+        assert popen.call_args.kwargs["env"]["CLIENT_REF"] == "term-1"
+
+    def test_absent_session_env_is_left_unset_rather_than_stamped_empty(self):
+        tmux, _, _, _ = _spawned()
+
+        assert not any(c.startswith("CLIENT_REF=") for c in tmux.new_session)
+        assert not any(c.startswith("OWNER_TYPE=") for c in tmux.new_session)
+        assert not any(c.startswith("OWNER_REF=") for c in tmux.new_session)
+
     def test_an_existing_terminal_is_attached_not_restarted(self):
         """The bug this forecloses: a second `codex` on one conversation."""
         tmux, popen, watcher, _ = _spawned(alive=True)
@@ -514,6 +534,19 @@ class TestRotatePtySession:
         impl.THREADS["s1"] = "thread-old"
         self._rotate()
         assert "s1" not in impl.THREADS
+
+    def test_the_respawned_pane_can_still_arm_the_next_rotation(self):
+        """respawn-pane builds the pane's env from the tmux server's, which
+        never had these. Dropping them rotates once and then never again."""
+        tmux, _, _ = self._rotate(
+            client_ref="term-1", owner_type="terminal", owner_ref="tile-9"
+        )
+
+        respawn = next(c for c in tmux.calls if c[0] == "respawn-pane")
+        assert "CLIENT_REF=term-1" in respawn
+        assert "OWNER_TYPE=terminal" in respawn
+        assert "OWNER_REF=tile-9" in respawn
+        assert "HIVE_SURFACE=terminal" in respawn
 
     def test_no_live_terminal_declines(self):
         tmux, watcher, rotated = self._rotate(alive=False)
