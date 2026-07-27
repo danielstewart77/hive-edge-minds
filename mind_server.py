@@ -26,11 +26,9 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("mind-server")
+from hive_logging import configure_logging, install_fastapi_logging, log_event, log_if_slow
+
+log = configure_logging("mind-server")
 
 MIND_ID = os.environ.get("MIND_ID")
 if not MIND_ID:
@@ -53,6 +51,7 @@ except ImportError:
     sys.exit(1)
 
 app = FastAPI(title=f"Mind Server: {MIND_ID}")
+install_fastapi_logging(app, log, component="mind-server")
 
 # In-memory session tracking — no database
 _sessions: dict[str, dict] = {}  # session_id -> {"proc": process, "model": str, ...}
@@ -845,6 +844,15 @@ async def create_session(request: Request):
     # here. The mind passes it straight to `claude --append-system-prompt`.
     system_prompt_blocks = body.get("system_prompt_blocks", "")
 
+    log_event(
+        log,
+        "session.create.started",
+        session_id=session_id,
+        mind_id=MIND_ID,
+        model=model,
+        surface=surface,
+        owner_type=owner_type,
+    )
     try:
         registry, config_obj, mcp_config = _load_registry_and_mcp_config()
 
@@ -891,16 +899,34 @@ async def create_session(request: Request):
         if getattr(proc, "stderr", None) is not None:
             session["stderr_task"] = asyncio.ensure_future(_drain_stderr(session, session_id))
 
-        log.info("Session %s created for %s (model=%s)", session_id, MIND_ID, model)
+        log_event(
+            log,
+            "session.created",
+            session_id=session_id,
+            mind_id=MIND_ID,
+            model=model,
+            surface=surface,
+            process_id=getattr(proc, "pid", None),
+        )
         return {"session_id": session_id, "mind_id": MIND_ID, "status": "running", "model": model}
 
     except Exception as exc:
-        log.exception("Failed to create session for %s", MIND_ID)
+        log_event(
+            log,
+            "session.create.failed",
+            level=logging.ERROR,
+            session_id=session_id,
+            mind_id=MIND_ID,
+            model=model,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.post("/sessions/{session_id}/message")
 async def send_message(session_id: str, request: Request):
+    started = time.monotonic()
     body = await request.json()
     content = body.get("content", "")
     images: list[dict] | None = body.get("images")
@@ -916,12 +942,22 @@ async def send_message(session_id: str, request: Request):
     # the *previous* turn's queued result. Refuse to start a second turn while
     # one is in flight; caller retries.
     if session.get("in_flight"):
+        log_event(log, "turn.rejected", level=logging.WARNING, session_id=session_id, reason="in_flight")
         return JSONResponse(
             {"error": "Turn in progress, retry shortly"},
             status_code=409,
         )
 
     proc = session["proc"]
+    log_event(
+        log,
+        "turn.started",
+        session_id=session_id,
+        mind_id=MIND_ID,
+        content_chars=len(content),
+        image_count=len(images or []),
+        transport="implementation" if hasattr(impl, "send") else "subprocess",
+    )
 
     # Check if implementation has a custom send function (SDK/Codex minds)
     if hasattr(impl, "send"):
@@ -933,8 +969,33 @@ async def send_message(session_id: str, request: Request):
             collected_events = []
             async for event in impl.send(session_id, content, db=None):
                 collected_events.append(event)
+        except Exception as exc:
+            log_event(
+                log,
+                "turn.failed",
+                level=logging.ERROR,
+                session_id=session_id,
+                mind_id=MIND_ID,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            raise
         finally:
             session["in_flight"] = False
+
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+        log_event(
+            log,
+            "turn.completed",
+            session_id=session_id,
+            mind_id=MIND_ID,
+            elapsed_ms=elapsed_ms,
+            event_count=len(collected_events),
+        )
+        log_if_slow(
+            log, "turn.slow", elapsed_ms, session_id=session_id, mind_id=MIND_ID,
+        )
 
         async def stream_collected():
             for event in collected_events:
@@ -968,6 +1029,7 @@ async def send_message(session_id: str, request: Request):
         cancel_event = session.get("cancel_event")
         stdout_lock = session.get("stdout_lock")
         assistant_texts: list[str] = []
+        result_received = False
         try:
             # Hold the stdout lock for the whole read so the idle drain can
             # never consume this turn's output concurrently.
@@ -996,9 +1058,22 @@ async def send_message(session_id: str, request: Request):
                     event = json.loads(decoded)
                     assistant_texts.extend(_extract_assistant_texts(event))
                     if event.get("type") == "result":
+                        result_received = True
                         break
                 except json.JSONDecodeError:
                     continue
+        except Exception as exc:
+            log_event(
+                log,
+                "turn.failed",
+                level=logging.ERROR,
+                session_id=session_id,
+                mind_id=MIND_ID,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
+            raise
         finally:
             # Mirror the completed turn into this session's terminal, if one
             # is open — a Telegram exchange must not go invisible to a
@@ -1011,6 +1086,19 @@ async def send_message(session_id: str, request: Request):
             # Clear in_flight on every exit path: normal completion, generator
             # cancellation (client disconnect), interrupt, or exception.
             session["in_flight"] = False
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+            log_event(
+                log,
+                "turn.completed" if result_received else "turn.ended_incomplete",
+                level=logging.INFO if result_received else logging.WARNING,
+                session_id=session_id,
+                mind_id=MIND_ID,
+                elapsed_ms=elapsed_ms,
+                result_received=result_received,
+            )
+            log_if_slow(
+                log, "turn.slow", elapsed_ms, session_id=session_id, mind_id=MIND_ID,
+            )
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
 
@@ -1022,7 +1110,10 @@ async def interrupt_session(session_id: str):
         return JSONResponse({"error": f"Session {session_id} not found"}, status_code=404)
 
     if not session.get("in_flight"):
+        log_event(log, "session.interrupt.noop", session_id=session_id, mind_id=MIND_ID)
         return {"ok": True, "session_id": session_id, "message": "nothing_running"}
+
+    log_event(log, "session.interrupt.started", session_id=session_id, mind_id=MIND_ID)
 
     # 1. Signal the streaming generator to exit on its next timeout tick
     cancel_event = session.get("cancel_event")
@@ -1062,7 +1153,7 @@ async def interrupt_session(session_id: str):
     if cancel_event:
         cancel_event.clear()
 
-    log.info("Interrupt complete for session %s — ready for next turn", session_id)
+    log_event(log, "session.interrupted", session_id=session_id, mind_id=MIND_ID)
     return {"ok": True, "session_id": session_id, "ready": True}
 
 
@@ -1138,7 +1229,14 @@ async def release_session_surface(session_id: str, surface: str):
             {"error": f"Unknown surface: {surface!r} (expected 'terminal' or 'stream')"},
             status_code=400,
         )
-    log.info("Released %s surface for session %s (was running=%s)", surface, session_id, released)
+    log_event(
+        log,
+        "session.surface.released",
+        session_id=session_id,
+        mind_id=MIND_ID,
+        surface=surface,
+        released=released,
+    )
     return {"session_id": session_id, "surface": surface, "released": released}
 
 
@@ -1211,6 +1309,14 @@ async def kill_session(session_id: str):
         log.warning("KILL_DIAG: session %s NOT in _sessions — returning 404, NO subprocess kill attempted", session_id)
         return JSONResponse({"error": f"Session {session_id} not found"}, status_code=404)
 
+    log_event(
+        log,
+        "session.closed",
+        session_id=session_id,
+        mind_id=MIND_ID,
+        terminal_closed=had_pty,
+        stream_closed=had_stream,
+    )
     return {"session_id": session_id, "status": "closed"}
 
 
@@ -1218,4 +1324,4 @@ async def kill_session(session_id: str):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("MIND_SERVER_PORT", "8420"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", log_config=None, access_log=False)

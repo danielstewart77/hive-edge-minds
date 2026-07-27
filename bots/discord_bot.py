@@ -9,7 +9,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import sys
 import tempfile
 import time
 
@@ -21,12 +20,9 @@ from config import config
 from bots.gateway_client import GatewayClient
 from bots.bot_utils import get_lock, time_ago
 from bots.skills import get_skills
+from hive_logging import configure_logging, log_event
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("hive-mind-discord")
+log = configure_logging("hive-mind-discord")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -274,10 +270,23 @@ async def _handle_server_command(content: str, user_id: int, channel_id: int) ->
     parts = content.split()
     cmd = parts[0]
 
+    log_event(
+        log, "surface.command.received", surface="discord", command=cmd,
+        user_id=user_id, client_ref=channel_id,
+    )
+
     result = await gateway.server_command(user_id, channel_id, content)
 
     if "error" in result:
+        log_event(
+            log, "surface.command.failed", level=logging.WARNING, surface="discord",
+            command=cmd, user_id=user_id, client_ref=channel_id,
+        )
         return f"Error: {result['error']}"
+    log_event(
+        log, "surface.command.completed", surface="discord", command=cmd,
+        user_id=user_id, client_ref=channel_id,
+    )
 
     if cmd == "/sessions":
         return _format_sessions(result)
@@ -554,6 +563,10 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
     if not _is_allowed_user(message.author.id):
+        log_event(
+            log, "surface.auth.rejected", level=logging.WARNING, surface="discord",
+            user_id=message.author.id, client_ref=message.channel.id,
+        )
         return
 
     is_dm = isinstance(message.channel, discord.DMChannel)
@@ -571,6 +584,10 @@ async def on_message(message: discord.Message):
         return
 
     channel_id = message.channel.id
+    log_event(
+        log, "surface.message.received", surface="discord", message_type="text",
+        user_id=message.author.id, client_ref=channel_id, content_chars=len(content),
+    )
     lock = get_lock(channel_id)
 
     if lock.locked():

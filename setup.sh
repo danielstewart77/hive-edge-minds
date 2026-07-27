@@ -298,6 +298,11 @@ $operator_block
 $codex_volume_line
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 $codex_volumes_block
 EOF
     echo "Wrote docker-compose.yml"

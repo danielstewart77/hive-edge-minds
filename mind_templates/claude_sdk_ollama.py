@@ -98,7 +98,7 @@ async def send(
                             await db.commit()
                     yield {"type": "result", "session_id": message.session_id, "stop_reason": message.subtype, "is_error": message.is_error}
                     return
-        except Exception as exc:
+        except Exception:
             if attempt < max_retries - 1:
                 await asyncio.sleep(2 ** attempt)
             else:

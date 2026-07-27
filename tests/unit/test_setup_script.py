@@ -114,6 +114,9 @@ def test_container_emits_compose_with_operator_host_mount(repo):
     assert "http://hive-comms:8424" not in compose
     assert "http://hive-lucent:8424" not in compose
     assert "name: hivemind" not in compose
+    assert 'driver: json-file' in compose
+    assert 'max-size: "20m"' in compose
+    assert 'max-file: "5"' in compose
 
 
 def test_container_satellite_gets_project_mount_only(repo):

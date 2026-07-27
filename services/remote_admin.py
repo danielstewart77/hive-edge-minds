@@ -7,7 +7,9 @@ WebSocket auth: ?token=<token> query param
 """
 
 import asyncio
+import hashlib
 import io
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -20,7 +22,11 @@ from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconn
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
+from hive_logging import configure_logging, install_fastapi_logging, log_event
+
 app = FastAPI(title="Remote Admin", version="1.0.0")
+log = configure_logging("remote-admin")
+install_fastapi_logging(app, log, component="remote-admin")
 security = HTTPBearer()
 
 # ---------------------------------------------------------------------------
@@ -32,8 +38,10 @@ ADMIN_TOKEN = os.getenv("REMOTE_ADMIN_TOKEN", "")
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     if not ADMIN_TOKEN:
+        log_event(log, "admin.auth.rejected", level=logging.ERROR, reason="not_configured")
         raise HTTPException(status_code=503, detail="REMOTE_ADMIN_TOKEN not configured")
     if credentials.credentials != ADMIN_TOKEN:
+        log_event(log, "admin.auth.rejected", level=logging.WARNING, reason="invalid_token")
         raise HTTPException(status_code=401, detail="Invalid token")
     return credentials.credentials
 
@@ -97,6 +105,14 @@ def _get(session_id: str) -> SSHSession:
 
 @app.post("/sessions", status_code=201)
 def create_session(req: ConnectRequest, _: str = Depends(verify_token)):
+    log_event(
+        log,
+        "admin.ssh.connect.started",
+        host=req.host,
+        port=req.port,
+        username=req.username,
+        auth_type="private_key" if req.private_key else "password" if req.password else "missing",
+    )
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -129,8 +145,17 @@ def create_session(req: ConnectRequest, _: str = Depends(verify_token)):
     try:
         client.connect(**connect_kwargs)
     except paramiko.AuthenticationException:
+        log_event(
+            log, "admin.ssh.connect.failed", level=logging.WARNING,
+            host=req.host, port=req.port, username=req.username, reason="authentication",
+        )
         raise HTTPException(status_code=401, detail="SSH authentication failed")
     except Exception as exc:
+        log_event(
+            log, "admin.ssh.connect.failed", level=logging.ERROR,
+            host=req.host, port=req.port, username=req.username,
+            error_type=type(exc).__name__, exc_info=True,
+        )
         raise HTTPException(status_code=502, detail=f"SSH connection failed: {exc}")
 
     session_id = str(uuid.uuid4())[:8]
@@ -140,6 +165,10 @@ def create_session(req: ConnectRequest, _: str = Depends(verify_token)):
         port=req.port,
         username=req.username,
         client=client,
+    )
+    log_event(
+        log, "admin.ssh.connected", session_id=session_id,
+        host=req.host, port=req.port, username=req.username,
     )
     return {"session_id": session_id, **_sessions[session_id].info()}
 
@@ -159,19 +188,36 @@ def close_session(session_id: str, _: str = Depends(verify_token)):
     session = _get(session_id)
     session.client.close()
     del _sessions[session_id]
+    log_event(log, "admin.ssh.closed", session_id=session_id, host=session.host, username=session.username)
     return {"closed": session_id}
 
 
 @app.post("/sessions/{session_id}/exec")
 def exec_command(session_id: str, req: ExecRequest, _: str = Depends(verify_token)):
     session = _get(session_id)
+    command_fingerprint = hashlib.sha256(req.command.encode()).hexdigest()[:12]
+    log_event(
+        log, "admin.command.started", session_id=session_id, host=session.host,
+        command_chars=len(req.command), command_fingerprint=command_fingerprint,
+    )
     try:
         _stdin, stdout, stderr = session.client.exec_command(req.command, timeout=req.timeout)
         out = stdout.read().decode(errors="replace")
         err = stderr.read().decode(errors="replace")
         exit_code = stdout.channel.recv_exit_status()
     except Exception as exc:
+        log_event(
+            log, "admin.command.failed", level=logging.ERROR, session_id=session_id,
+            host=session.host, command_fingerprint=command_fingerprint,
+            error_type=type(exc).__name__, exc_info=True,
+        )
         raise HTTPException(status_code=502, detail=f"Command execution failed: {exc}")
+    log_event(
+        log, "admin.command.completed",
+        level=logging.INFO if exit_code == 0 else logging.WARNING,
+        session_id=session_id, host=session.host, exit_code=exit_code,
+        stdout_chars=len(out), stderr_chars=len(err), command_fingerprint=command_fingerprint,
+    )
     return {"stdout": out, "stderr": err, "exit_code": exit_code}
 
 
@@ -180,15 +226,18 @@ async def stream_session(websocket: WebSocket, session_id: str):
     """Interactive WebSocket shell. Auth via ?token= query param."""
     token = websocket.query_params.get("token", "")
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        log_event(log, "admin.stream.rejected", level=logging.WARNING, session_id=session_id, reason="unauthorized")
         await websocket.close(code=1008, reason="Unauthorized")
         return
 
     if session_id not in _sessions:
+        log_event(log, "admin.stream.rejected", level=logging.WARNING, session_id=session_id, reason="not_found")
         await websocket.close(code=1008, reason="Session not found")
         return
 
     session = _sessions[session_id]
     await websocket.accept()
+    log_event(log, "admin.stream.opened", session_id=session_id, host=session.host)
 
     channel = session.client.invoke_shell(term="xterm", width=220, height=50)
     channel.setblocking(False)
@@ -230,6 +279,7 @@ async def stream_session(websocket: WebSocket, session_id: str):
             await websocket.close()
         except Exception:
             pass
+        log_event(log, "admin.stream.closed", session_id=session_id, host=session.host)
 
 
 # ---------------------------------------------------------------------------
@@ -237,4 +287,4 @@ async def stream_session(websocket: WebSocket, session_id: str):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8430)
+    uvicorn.run(app, host="0.0.0.0", port=8430, log_config=None, access_log=False)

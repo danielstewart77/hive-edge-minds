@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import logging
 import os
 import platform
 import shutil
@@ -25,9 +24,10 @@ from dataclasses import asdict, dataclass
 from math import sqrt
 from typing import Any, Callable, Protocol
 
+from hive_logging import configure_logging, log_event
 from voice.wake_word import WakeWordConfig, WakeWordController, WakeWordResult
 
-log = logging.getLogger("wake_word_app")
+log = configure_logging("wake-word-app")
 
 
 def _env_value(name: str, default: str) -> str:
@@ -265,7 +265,7 @@ class FfmpegMicrophoneTranscriptSource:
             await asyncio.sleep(1.0)
             return ""
         if transcript.strip():
-            log.info("Voice-server transcript=%r", transcript.strip())
+            log_event(log, "wake_word.transcript.received", transcript_chars=len(transcript.strip()))
             self._emit_event("transcript", "Transcript captured", transcript=transcript.strip())
         else:
             log.info("Voice-server returned empty transcript")
@@ -398,13 +398,14 @@ class WakeWordApp:
         wake_word = self._controller.process_transcript(transcript)
         response_text: str | None = None
         dispatched = False
-        log.info(
-            "Wake-word processed transcript=%r triggered=%s dispatch=%s command=%r session_active=%s",
-            transcript,
-            wake_word.triggered,
-            wake_word.should_dispatch,
-            wake_word.command_text,
-            wake_word.session_active,
+        log_event(
+            log,
+            "wake_word.processed",
+            transcript_chars=len(transcript),
+            triggered=wake_word.triggered,
+            should_dispatch=wake_word.should_dispatch,
+            command_chars=len(wake_word.command_text or ""),
+            session_active=wake_word.session_active,
         )
         self._emit_event(
             WakeWordAppEvent(
@@ -430,7 +431,10 @@ class WakeWordApp:
             )
             response_text = await self._dispatcher.dispatch(wake_word.command_text)
             dispatched = True
-            log.info("%s dispatch response length=%d", self._mind_name, len(response_text or ""))
+            log_event(
+                log, "wake_word.dispatch.completed", mind_name=self._mind_name,
+                command_chars=len(wake_word.command_text), response_chars=len(response_text or ""),
+            )
             self._emit_event(
                 WakeWordAppEvent(
                     kind="response",
