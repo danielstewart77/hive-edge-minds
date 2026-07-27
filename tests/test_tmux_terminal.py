@@ -203,6 +203,68 @@ def test_kill_ends_the_conversation(terminal):
     assert implementation.pty_session_alive(session_id) is False
 
 
+def test_rotation_keeps_the_pane_and_the_client(terminal, monkeypatch, tmp_path):
+    # The whole point of rotating in place: the conversation is replaced, the
+    # terminal is not. The attached client must still be the same process,
+    # still holding the same pty, and the successor's output must arrive on
+    # it without anything reattaching.
+    successor = tmp_path / "successor_app.py"
+    successor.write_text(
+        'import sys, time\n'
+        'sys.stdout.write("SUCCESSOR-DELTA\\r\\n"); sys.stdout.flush()\n'
+        'while True: time.sleep(3600)\n'
+    )
+    monkeypatch.setattr(
+        implementation, "_rotation_argv",
+        lambda model, mcp_config, new_claude_sid, system_prompt: [
+            sys.executable, str(successor)
+        ],
+    )
+
+    session_id, attach, detach = terminal
+    proc, fd = attach(100, 30)
+    try:
+        assert _read_for(fd, 3.0), "the tile never got its first paint"
+        new_session_id = f"{session_id}-next"
+
+        rotated = implementation.rotate_pty_session(
+            old_session_id=session_id,
+            new_session_id=new_session_id,
+            new_claude_sid="conv-2",
+            model="sonnet",
+            system_prompt="carry-forward",
+        )
+
+        assert rotated is True
+        assert proc.poll() is None, "the attached client died during the rotation"
+        assert implementation.pty_session_alive(new_session_id) is True
+        assert implementation.pty_session_alive(session_id) is False
+        after = _read_for(fd, 4.0).decode("utf8", "replace")
+        assert "SUCCESSOR-DELTA" in after
+    finally:
+        detach(proc, fd)
+        implementation.kill_pty_session(f"{session_id}-next")
+
+
+def test_rotation_declines_when_there_is_no_terminal(terminal):
+    # No live pane means no in-place swap to do; the gateway falls back to a
+    # plain session swap on a False.
+    session_id, _attach, _detach = terminal
+    assert implementation.rotate_pty_session(
+        old_session_id=session_id,
+        new_session_id=f"{session_id}-next",
+        new_claude_sid="conv-2",
+        model="sonnet",
+    ) is False
+
+
+def test_rotation_argv_carries_the_seed_on_a_fresh_conversation():
+    argv = implementation._rotation_argv("sonnet", "", "conv-2", "carry-forward")
+    assert "--session-id" in argv and argv[argv.index("--session-id") + 1] == "conv-2"
+    assert "--resume" not in argv
+    assert argv[argv.index("--append-system-prompt") + 1] == "carry-forward"
+
+
 def test_a_second_attach_takes_the_keyboard_from_the_first(terminal):
     # One conversation, one keyboard: the older client is detached by tmux
     # rather than left typing into the same pane.

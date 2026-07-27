@@ -212,6 +212,30 @@ def _terminal_argv(model: str, mcp_config: str, resume_sid: str, project_dir: Pa
     return cmd
 
 
+def _rotation_argv(
+    model: str, mcp_config: str, new_claude_sid: str, system_prompt: str
+) -> list[str]:
+    """The interactive `claude` a rotation respawns the pane onto.
+
+    Always `--session-id`, never `--resume`: the successor is a new
+    conversation that happens to open holding a summary of its predecessor.
+    That summary rides on `--append-system-prompt` — the one case where a
+    pty spawn needs it, since there is no transcript to carry it.
+    """
+    cmd = [
+        "claude",
+        "--permission-mode", "bypassPermissions",
+        "--dangerously-skip-permissions",
+        "--model", model,
+    ]
+    if mcp_config:
+        cmd.extend(["--mcp-config", mcp_config])
+    cmd.extend(["--session-id", new_claude_sid])
+    if system_prompt:
+        cmd.extend(["--append-system-prompt", system_prompt])
+    return cmd
+
+
 def _tmux(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["tmux", "-L", TMUX_SOCKET, *args],
@@ -220,16 +244,114 @@ def _tmux(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
 
 
 def pty_session_alive(session_id: str) -> bool:
-    """True while this session's terminal process is still running."""
-    return _tmux("has-session", "-t", tmux_session_name(session_id)).returncode == 0
+    """True while this session's terminal process is still running.
+
+    The `=` is exact-match: tmux targets are prefix-matched by default, so a
+    session whose id is a prefix of another's would answer for it.
+    """
+    return _tmux("has-session", "-t", f"={tmux_session_name(session_id)}").returncode == 0
 
 
 def kill_pty_session(session_id: str) -> bool:
     """End the terminal for good. True if there was one to end."""
     name = tmux_session_name(session_id)
-    if _tmux("kill-session", "-t", name).returncode != 0:
+    if _tmux("kill-session", "-t", f"={name}").returncode != 0:
         return False
     log.info("Killed tmux session %s", name)
+    return True
+
+
+def rotate_pty_session(
+    old_session_id: str,
+    new_session_id: str,
+    new_claude_sid: str,
+    model: str,
+    system_prompt: str = "",
+    mcp_config: str = "",
+    registry: Any = None,
+    client_ref: str | None = None,
+    owner_type: str | None = None,
+    owner_ref: str | None = None,
+    **kwargs: Any,
+) -> bool:
+    """Retire a terminal's conversation and start its successor *in place*.
+
+    A rotation replaces the conversation, not the terminal. The tile the user
+    is typing into has to survive it: the tmux session is renamed to the
+    successor's id and the pane's process is respawned onto the fresh
+    conversation, so the attached tmux client — and therefore the pty, the
+    websocket, and the browser tile above it — is never disturbed. From the
+    user's side the session id changes and the conversation continues in the
+    same pane.
+
+    The alternative, killing the session so the tile reattaches to a
+    successor, spawns a second pane and drops the socket mid-sentence. That
+    reads as having been thrown out of the conversation even when the
+    carry-forward arrived intact, and it is why this path exists.
+
+    ``system_prompt`` is the rotation carry-forward, delivered by
+    ``_rotation_argv``. Returns False when there was no live terminal to
+    rotate, leaving the caller to fall back to a plain swap.
+    """
+    del kwargs  # unused, kept for call-site symmetry with spawn_pty()
+
+    from config import PROJECT_DIR
+
+    old_name = tmux_session_name(old_session_id)
+    new_name = tmux_session_name(new_session_id)
+
+    if not pty_session_alive(old_session_id):
+        log.info("No live terminal for session %s — nothing to rotate in place",
+                 old_session_id)
+        return False
+
+    result = _tmux("rename-session", "-t", f"={old_name}", new_name)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"tmux refused to rename {old_name} to {new_name}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+    cmd = _rotation_argv(model, mcp_config, new_claude_sid, system_prompt)
+
+    env = os.environ.copy()
+    overrides: dict[str, str] = {}
+    provider = registry.get_provider(model) if registry else None
+    if provider:
+        overrides.update(provider.env_overrides)
+    overrides["CLAUDE_CODE_DISABLE_AGENT_VIEW"] = "1"
+    overrides["HIVE_SURFACE"] = "terminal"
+    if client_ref:
+        overrides["CLIENT_REF"] = client_ref
+    if owner_type:
+        overrides["OWNER_TYPE"] = owner_type
+    if owner_ref:
+        overrides["OWNER_REF"] = owner_ref
+    env.update(overrides)
+
+    # respawn-pane -k replaces the pane's process without touching the
+    # window, the session, or any attached client. `-e` per override because
+    # the tmux server's own environment predates this successor.
+    # No `=` exact-match prefix here: that syntax is for session targets, and
+    # tmux parses a pane target differently. The rename above already left
+    # exactly one session by this name.
+    args = ["respawn-pane", "-k", "-t", new_name, "-c", str(PROJECT_DIR)]
+    for key, value in overrides.items():
+        args.extend(["-e", f"{key}={value}"])
+    args.append("--")
+    args.extend(cmd)
+
+    result = _tmux(*args, env=env)
+    if result.returncode != 0:
+        # Leave the rename standing: the pane still holds the predecessor's
+        # process, and the caller's fallback re-spawns from the new id.
+        raise RuntimeError(
+            f"tmux refused to respawn the pane for session {new_session_id}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+    log.info("Rotated terminal in place: %s -> %s (claude_sid=%s, seed=%d chars)",
+             old_name, new_name, new_claude_sid, len(system_prompt))
     return True
 
 
