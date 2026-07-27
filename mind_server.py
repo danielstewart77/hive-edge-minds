@@ -1144,27 +1144,23 @@ async def release_session_surface(session_id: str, surface: str):
 
 @app.post("/sessions/{session_id}/rotate-pty")
 async def rotate_pty(session_id: str, request: Request):
-    """Move a live terminal onto a rotation's successor without disturbing it.
+    """Turn a live terminal's conversation over without disturbing the tile.
 
-    Rotation replaces the conversation; the tile stays. The pane's process is
-    swapped for one on the new conversation, seeded with the carry-forward,
-    while the tmux client — and so the pty, the socket, and the browser tile
-    holding them — is left alone. The alternative, ending the session so the
-    tile hunts a successor, tears down the socket and opens a second pane
-    mid-sentence, which is indistinguishable from being thrown out of the
-    conversation.
+    Rotation replaces the conversation; the session and the terminal stay.
+    The pane's process is swapped for one on a fresh harness conversation,
+    seeded with the carry-forward, while the tmux client — and so the pty,
+    the socket, and the browser tile holding them — is left alone. The
+    session id never changes, so nothing above this has to be told anything:
+    the user keeps typing into the same pane, and only the context behind it
+    turned over.
 
-    Reports ``rotated: false`` when there is no live terminal here, which is
-    the gateway's signal to fall back to a plain session swap. That is the
-    normal answer for a conversation nobody has a tile open on.
+    Reports ``rotated: false`` when there is no live terminal here. That is
+    the normal answer for a conversation nobody has a tile open on.
     """
     body = await request.json()
-    new_session_id = (body.get("new_session_id") or "").strip()
     new_claude_sid = (body.get("new_claude_sid") or "").strip()
-    if not new_session_id or not new_claude_sid:
-        return JSONResponse(
-            {"error": "new_session_id and new_claude_sid required"}, status_code=400
-        )
+    if not new_claude_sid:
+        return JSONResponse({"error": "new_claude_sid required"}, status_code=400)
 
     handle = _ptys.get(session_id)
     if handle is None or not hasattr(impl, "rotate_pty_session"):
@@ -1174,8 +1170,7 @@ async def rotate_pty(session_id: str, request: Request):
     rotated = await asyncio.to_thread(
         functools.partial(
             impl.rotate_pty_session,
-            old_session_id=session_id,
-            new_session_id=new_session_id,
+            session_id=session_id,
             new_claude_sid=new_claude_sid,
             model=body.get("model") or "",
             system_prompt=body.get("system_prompt") or "",
@@ -1189,18 +1184,14 @@ async def rotate_pty(session_id: str, request: Request):
     if not rotated:
         return {"session_id": session_id, "rotated": False}
 
-    # Re-key the handle. The pty, its reader task, and the attached queue all
-    # belong to a tmux client that survived the swap, so they carry over
-    # untouched — only the identity this terminal answers to changes.
-    _ptys.pop(session_id, None)
-    handle.session_id = new_session_id
-    handle.tmux_name = impl.tmux_session_name(new_session_id)
+    # The pty, its reader task and the attached queue all belong to a tmux
+    # client that survived the swap, so the handle carries over untouched —
+    # only the conversation it is pinned to changed.
     handle.claude_sid = new_claude_sid
-    _ptys[new_session_id] = handle
 
-    log.info("Rotated terminal for session %s onto %s in place",
-             session_id, new_session_id)
-    return {"session_id": new_session_id, "rotated": True}
+    log.info("Rotated the conversation in session %s's terminal onto %s",
+             session_id, new_claude_sid)
+    return {"session_id": session_id, "rotated": True, "claude_sid": new_claude_sid}
 
 
 @app.delete("/sessions/{session_id}")

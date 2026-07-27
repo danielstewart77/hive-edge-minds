@@ -9,6 +9,7 @@ import logging
 import fcntl
 import os
 import pty
+import shlex
 import signal
 import struct
 import subprocess
@@ -212,15 +213,13 @@ def _terminal_argv(model: str, mcp_config: str, resume_sid: str, project_dir: Pa
     return cmd
 
 
-def _rotation_argv(
-    model: str, mcp_config: str, new_claude_sid: str, system_prompt: str
-) -> list[str]:
+def _rotation_argv(model: str, mcp_config: str, new_claude_sid: str) -> list[str]:
     """The interactive `claude` a rotation respawns the pane onto.
 
-    Always `--session-id`, never `--resume`: the successor is a new
-    conversation that happens to open holding a summary of its predecessor.
-    That summary rides on `--append-system-prompt` — the one case where a
-    pty spawn needs it, since there is no transcript to carry it.
+    Always `--session-id`, never `--resume`: rotation starts a fresh harness
+    conversation under the same hive session, and it opens holding a summary
+    of the one it replaced. The summary itself is not here — see
+    `_seeded_pane_command`.
     """
     cmd = [
         "claude",
@@ -231,9 +230,59 @@ def _rotation_argv(
     if mcp_config:
         cmd.extend(["--mcp-config", mcp_config])
     cmd.extend(["--session-id", new_claude_sid])
-    if system_prompt:
-        cmd.extend(["--append-system-prompt", system_prompt])
     return cmd
+
+
+# A single argv entry cannot exceed MAX_ARG_STRLEN (32 pages, 128 KiB on
+# Linux); exec fails outright above it. The seed reaches the harness as one
+# argument however it is delivered, so it is capped short of that.
+MAX_SEED_CHARS = 120_000
+
+
+def _capped_seed(system_prompt: str) -> str:
+    """Trim an oversized carry-forward to what exec can actually carry.
+
+    The tail is what survives: composition puts the rotation summary and the
+    turns typed during the window last, and those are the ones the successor
+    has to pick the conversation up from.
+    """
+    if len(system_prompt) <= MAX_SEED_CHARS:
+        return system_prompt
+    log.warning("Rotation seed of %d chars exceeds the %d-char exec limit — "
+                "keeping the tail", len(system_prompt), MAX_SEED_CHARS)
+    return ("[earlier context omitted: the carry-forward was too large to "
+            "pass to the harness]\n\n" + system_prompt[-MAX_SEED_CHARS:])
+
+
+def _seeded_pane_command(
+    argv: list[str], system_prompt: str, seed_key: str
+) -> list[str]:
+    """Hand the pane its carry-forward without putting it in the command.
+
+    A rotation seed is a composed prompt — soul, recent memory, the summary,
+    the turns typed during the window — and tmux rejects a `respawn-pane`
+    whose command exceeds its own length limit with "command too long". So
+    the seed goes to a file and the pane reads it back through a one-line
+    shell that then `exec`s the harness: the tmux command stays short
+    regardless of how much context the successor is carrying.
+    """
+    if not system_prompt:
+        return argv
+
+    system_prompt = _capped_seed(system_prompt)
+    seed_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "/tmp")) / "rotation-seeds"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    seed_file = seed_dir / f"{seed_key}.txt"
+    seed_file.write_text(system_prompt)
+    quoted_seed = shlex.quote(str(seed_file))
+    harness = " ".join(shlex.quote(arg) for arg in argv)
+    # Read then delete: the seed is one process's opening context, and it is
+    # the whole conversation's memory sitting in a world-readable file.
+    return [
+        "/bin/sh", "-c",
+        f'seed=$(cat {quoted_seed}); rm -f {quoted_seed}; '
+        f'exec {harness} --append-system-prompt "$seed"',
+    ]
 
 
 def _tmux(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -262,8 +311,7 @@ def kill_pty_session(session_id: str) -> bool:
 
 
 def rotate_pty_session(
-    old_session_id: str,
-    new_session_id: str,
+    session_id: str,
     new_claude_sid: str,
     model: str,
     system_prompt: str = "",
@@ -274,45 +322,35 @@ def rotate_pty_session(
     owner_ref: str | None = None,
     **kwargs: Any,
 ) -> bool:
-    """Retire a terminal's conversation and start its successor *in place*.
+    """Start a fresh harness conversation in a live terminal, in place.
 
-    A rotation replaces the conversation, not the terminal. The tile the user
-    is typing into has to survive it: the tmux session is renamed to the
-    successor's id and the pane's process is respawned onto the fresh
-    conversation, so the attached tmux client — and therefore the pty, the
-    websocket, and the browser tile above it — is never disturbed. From the
-    user's side the session id changes and the conversation continues in the
-    same pane.
-
-    The alternative, killing the session so the tile reattaches to a
-    successor, spawns a second pane and drops the socket mid-sentence. That
-    reads as having been thrown out of the conversation even when the
-    carry-forward arrived intact, and it is why this path exists.
+    A rotation replaces the *conversation*, not the session and not the
+    terminal. The hive session id is permanent — it is what every surface,
+    label and ledger row is keyed to — so nothing here renames anything. The
+    pane's process is respawned onto a new harness conversation seeded with
+    the carry-forward, and the attached tmux client (and therefore the pty,
+    the websocket and the browser tile above it) is never disturbed. The
+    user keeps typing into the same pane under the same id; only the context
+    behind it turned over.
 
     ``system_prompt`` is the rotation carry-forward, delivered by
-    ``_rotation_argv``. Returns False when there was no live terminal to
-    rotate, leaving the caller to fall back to a plain swap.
+    ``_seeded_pane_command``. Returns False when there was no live terminal
+    to rotate.
     """
     del kwargs  # unused, kept for call-site symmetry with spawn_pty()
 
     from config import PROJECT_DIR
 
-    old_name = tmux_session_name(old_session_id)
-    new_name = tmux_session_name(new_session_id)
+    name = tmux_session_name(session_id)
 
-    if not pty_session_alive(old_session_id):
+    if not pty_session_alive(session_id):
         log.info("No live terminal for session %s — nothing to rotate in place",
-                 old_session_id)
+                 session_id)
         return False
 
-    result = _tmux("rename-session", "-t", f"={old_name}", new_name)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"tmux refused to rename {old_name} to {new_name}: "
-            f"{(result.stderr or result.stdout).strip()}"
-        )
-
-    cmd = _rotation_argv(model, mcp_config, new_claude_sid, system_prompt)
+    cmd = _seeded_pane_command(
+        _rotation_argv(model, mcp_config, new_claude_sid), system_prompt, new_claude_sid
+    )
 
     env = os.environ.copy()
     overrides: dict[str, str] = {}
@@ -331,11 +369,10 @@ def rotate_pty_session(
 
     # respawn-pane -k replaces the pane's process without touching the
     # window, the session, or any attached client. `-e` per override because
-    # the tmux server's own environment predates this successor.
+    # the tmux server's own environment predates this conversation.
     # No `=` exact-match prefix here: that syntax is for session targets, and
-    # tmux parses a pane target differently. The rename above already left
-    # exactly one session by this name.
-    args = ["respawn-pane", "-k", "-t", new_name, "-c", str(PROJECT_DIR)]
+    # tmux parses a pane target differently.
+    args = ["respawn-pane", "-k", "-t", name, "-c", str(PROJECT_DIR)]
     for key, value in overrides.items():
         args.extend(["-e", f"{key}={value}"])
     args.append("--")
@@ -343,15 +380,16 @@ def rotate_pty_session(
 
     result = _tmux(*args, env=env)
     if result.returncode != 0:
-        # Leave the rename standing: the pane still holds the predecessor's
-        # process, and the caller's fallback re-spawns from the new id.
+        # The pane still holds the old conversation's process, which is the
+        # safe failure: the user keeps typing, the context just didn't turn
+        # over, and the next Stop hook fire tries again.
         raise RuntimeError(
-            f"tmux refused to respawn the pane for session {new_session_id}: "
+            f"tmux refused to respawn the pane for session {session_id}: "
             f"{(result.stderr or result.stdout).strip()}"
         )
 
-    log.info("Rotated terminal in place: %s -> %s (claude_sid=%s, seed=%d chars)",
-             old_name, new_name, new_claude_sid, len(system_prompt))
+    log.info("Rotated the conversation in terminal %s onto claude_sid=%s "
+             "(seed=%d chars)", name, new_claude_sid, len(system_prompt))
     return True
 
 
