@@ -55,7 +55,7 @@ def _run(repo: Path, *flags: str) -> subprocess.CompletedProcess:
 
 
 def test_scaffolds_mind_and_stamps_env(repo):
-    result = _run(repo, "--name", "atlas", "--role", "satellite",
+    result = _run(repo, "--name", "atlas", "--role", "sandboxed",
                   "--deployment", "systemd", "--harness", "claude_cli_claude",
                   "--surfaces", "telegram", "--port", "8425")
     assert result.returncode == 0, result.stderr
@@ -67,7 +67,7 @@ def test_scaffolds_mind_and_stamps_env(repo):
     runtime = (repo / "minds/atlas/runtime.yaml").read_text()
     assert "name: atlas" in runtime
     assert "profile: standard" in runtime
-    assert "role: satellite" in runtime
+    assert "role: sandboxed" in runtime
     assert "deployment: systemd" in runtime
     assert "harness: claude_cli_claude" in runtime
     assert "- telegram" in runtime
@@ -83,7 +83,7 @@ def test_scaffolds_mind_and_stamps_env(repo):
 
 
 def test_omitted_profile_defaults_to_standard_when_unattended(repo):
-    result = _run(repo, "--name", "atlas", "--role", "satellite",
+    result = _run(repo, "--name", "atlas", "--role", "sandboxed",
                   "--deployment", "windows-task", "--harness", "codex_cli_codex",
                   "--surfaces", "none", "--port", "8421")
     assert result.returncode == 0, result.stderr
@@ -120,7 +120,7 @@ def test_container_emits_compose_with_operator_host_mount(repo):
 
 
 def test_container_satellite_gets_project_mount_only(repo):
-    result = _run(repo, "--name", "atlas", "--role", "satellite",
+    result = _run(repo, "--name", "atlas", "--role", "sandboxed",
                   "--deployment", "container", "--harness", "codex_cli_codex",
                   "--surfaces", "telegram", "--port", "8432")
     assert result.returncode == 0, result.stderr
@@ -130,7 +130,7 @@ def test_container_satellite_gets_project_mount_only(repo):
 
 
 def test_windows_task_emits_ps1_installer(repo):
-    result = _run(repo, "--name", "atlas", "--role", "satellite",
+    result = _run(repo, "--name", "atlas", "--role", "sandboxed",
                   "--deployment", "windows-task", "--harness", "codex_cli_codex",
                   "--surfaces", "telegram", "--port", "8433")
     assert result.returncode == 0, result.stderr
@@ -155,27 +155,27 @@ def test_sentinel_profile_is_recorded_without_changing_runtime_shape(repo):
 
 
 def test_rejects_bad_inputs(repo):
-    assert _run(repo, "--name", "Bad Name!", "--role", "satellite",
+    assert _run(repo, "--name", "Bad Name!", "--role", "sandboxed",
                 "--deployment", "systemd", "--harness", "claude_cli_claude",
                 "--surfaces", "none", "--port", "8421").returncode != 0
     assert _run(repo, "--name", "atlas", "--profile", "unknown",
-                "--role", "satellite", "--deployment", "systemd",
+                "--role", "sandboxed", "--deployment", "systemd",
                 "--harness", "claude_cli_claude", "--surfaces", "none",
                 "--port", "8421").returncode != 0
     assert _run(repo, "--name", "ok", "--role", "emperor",
                 "--deployment", "systemd", "--harness", "claude_cli_claude",
                 "--surfaces", "none", "--port", "8421").returncode != 0
-    assert _run(repo, "--name", "ok", "--role", "satellite",
+    assert _run(repo, "--name", "ok", "--role", "sandboxed",
                 "--deployment", "cloud", "--harness", "claude_cli_claude",
                 "--surfaces", "none", "--port", "8421").returncode != 0
-    assert _run(repo, "--name", "ok", "--role", "satellite",
+    assert _run(repo, "--name", "ok", "--role", "sandboxed",
                 "--deployment", "systemd", "--harness", "no_such_harness",
                 "--surfaces", "none", "--port", "8421").returncode != 0
 
 
 def test_existing_env_mind_id_is_reused(repo):
     (repo / ".env").write_text("MIND_NAME=old\nMIND_ID=11111111-2222-3333-4444-555555555555\n")
-    result = _run(repo, "--name", "atlas", "--role", "satellite",
+    result = _run(repo, "--name", "atlas", "--role", "sandboxed",
                   "--deployment", "windows-task", "--harness", "codex_cli_codex",
                   "--surfaces", "none", "--port", "8421")
     assert result.returncode == 0, result.stderr

@@ -18,8 +18,8 @@ profile: standard
 
 # What this mind is allowed to be on this machine.
 #   operator  — full host access by design: the mind operates the machine.
-#   satellite — a connected mind on this machine without the operator posture.
-role: satellite
+#   sandboxed — a connected mind on this machine without the operator posture.
+role: sandboxed
 
 # How the mind runs on this machine. setup.sh emits the matching installer.
 #   systemd      — bare-metal Linux service (deploy/<name>.service)
