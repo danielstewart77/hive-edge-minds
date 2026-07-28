@@ -96,3 +96,14 @@ def test_main_emits_codex_block_contract(monkeypatch, capsys):
         "decision": "block",
         "reason": "closing",
     }
+
+
+def test_paths_resolve_against_the_checkout_it_lives_in():
+    # The hook is shipped in every edge mind's checkout and reads that
+    # install's own .env. Anchoring on the script's location is what makes
+    # one copy correct on three hosts with three different directory names.
+    checkout = SCRIPT.resolve().parents[1]
+
+    assert hook.PROJECT_ROOT == checkout
+    assert hook.ENV_PATH == checkout / ".env"
+    assert hook.LOG_PATH.parent == checkout / "data" / "auto-remember"

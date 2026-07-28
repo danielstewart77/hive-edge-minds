@@ -41,8 +41,8 @@ RUN npm install -g @openai/codex \
     && chown -R hivemind:hivemind /home/hivemind/.npm-global
 
 # Operator pattern: the host root is bind-mounted at /host (see
-# docker-compose.yml), and every hardcoded path in Mordecai's repo/config/
-# hooks/.env is his real host path, /home/daniel/Storage/mordecai/... — so
+# docker-compose.yml), and every host path in an operator mind's config and
+# hooks is written as the real host path under /home/daniel — so
 # /home/daniel has to resolve through the mount. The target doesn't exist at
 # build time, only at runtime once /host is mounted; a symlink doesn't care.
 RUN ln -sfn /host/home/daniel /home/daniel
