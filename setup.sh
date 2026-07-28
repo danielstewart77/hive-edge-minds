@@ -58,7 +58,7 @@ if [ -z "$PROFILE" ] && [ ! -t 0 ]; then
     PROFILE="standard"
 fi
 ask PROFILE    "Profile: standard or sentinel" "standard"
-ask ROLE       "Role: operator (full host access) or satellite" "satellite"
+ask ROLE       "Role: operator (full host access) or sandboxed" "sandboxed"
 ask DEPLOYMENT "Deployment: systemd, container, or windows-task" "systemd"
 ask HARNESS    "Harness: claude_cli_claude or codex_cli_codex" "claude_cli_claude"
 ask SURFACES   "Surfaces (comma-separated: telegram,discord — or none)" "telegram"
@@ -72,7 +72,7 @@ case "$PROFILE" in
     *) echo "Invalid profile: '$PROFILE'" >&2; exit 1 ;;
 esac
 case "$ROLE" in
-    operator|satellite) ;;
+    operator|sandboxed) ;;
     *) echo "Invalid role: '$ROLE'" >&2; exit 1 ;;
 esac
 case "$DEPLOYMENT" in
@@ -245,7 +245,7 @@ emit_container() {
         operator_block="$(cat <<'YAML'
     # Operator posture: the entire host root filesystem, live read-write, at
     # /host — and the Docker socket through it. Deliberately un-hardened;
-    # remove this mount (and switch role to satellite) if that is not what
+    # remove this mount (and switch role to sandboxed) if that is not what
     # you want this mind to be.
     volumes:
       - /:/host

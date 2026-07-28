@@ -35,9 +35,10 @@ Every edge mind declares what it is allowed to be on its machine:
 - **operator** — full host access by design. The mind operates the machine:
   filesystem, processes, Docker, the lot. For a system-administrator mind on
   a workstation or server you own.
-- **satellite** — a connected mind without the operator posture. For a family
-  member's PC, a secondary box, or any machine where the mind should
-  converse and remember but not run the place.
+- **sandboxed** — a connected mind without the operator posture: it sees its
+  own project directory and nothing else of the host. For a family member's
+  PC, a secondary box, or any machine where the mind should converse and
+  remember but not run the place.
 
 Deployment is orthogonal to role: either role can run as a **systemd**
 service, a **container**, or a **windows-task** (logon-triggered scheduled
@@ -53,6 +54,15 @@ Every installation also declares a deployment profile:
 
 The profile records what belongs to the installation without mixing
 specialized Sentinel code into the generic Edge Mind runtime.
+
+The four axes — harness, deployment, role, profile — are independent. The
+installations this repository runs today cover the corners:
+
+| Mind | Harness | Deployment | Role | Profile |
+|---|---|---|---|---|
+| skippy | `claude_cli_claude` | systemd | operator | standard |
+| mordecai | `codex_cli_codex` | container | operator | standard |
+| hex | `codex_cli_codex` | container | sandboxed | sentinel |
 
 ## Prerequisites
 
@@ -121,7 +131,7 @@ pulling updates never touches who your mind is.
 ```yaml
 name: atlas
 mind_id: 2f1c9e58-...        # generated once; every memory write carries it
-role: operator                # operator | satellite
+role: operator                # operator | sandboxed
 deployment: systemd           # systemd | container | windows-task
 harness: claude_cli_claude    # mind_templates/ basename
 provider: anthropic
@@ -145,7 +155,7 @@ written there.
   conversations survive closed tabs. Claude harness only.
 - **Discord** — optional second chat surface.
 - **Wake-word desktop app** — a kid-friendly smart-speaker window
-  (`launch_listener.py`) for Windows satellite minds with a microphone.
+  (`launch_listener.py`) for Windows sandboxed minds with a microphone.
 
 ## Memory
 

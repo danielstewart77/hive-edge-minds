@@ -12,7 +12,7 @@ machinery only — a mind's identity (`minds/<name>/`, `souls/<name>.md`,
 `.env`, `config.yaml`) is per-host and gitignored.
 
 An edge mind declares a **role** (`operator` — full host access by design;
-`satellite` — connected but not operating the machine) and a **deployment**
+`sandboxed` — connected but not operating the machine) and a **deployment**
 (`systemd`, `container`, or `windows-task`). `setup.sh` scaffolds the mind
 from `minds/example/` and emits the matching installer. It never runs sudo
 and never starts anything.
@@ -60,7 +60,7 @@ stream-json path (claude).
 - `codex_cli_codex` — one `codex exec --json` subprocess per turn, plus
   `spawn_pty` for the browser terminal. Codex mints its own thread ids and
   cannot adopt the gateway's conversation id; hive-comms persists that
-  provider-native id as `harness_sid`, while the outpost keeps a local
+  provider-native id as `harness_sid`, while the edge mind keeps a local
   disk-backed safety copy. A failed or incomplete turn clears both so the
   next turn never resumes a broken one. POSIX spawns use `start_new_session`
   + `killpg`
