@@ -21,8 +21,12 @@ import urllib.error
 import urllib.request
 
 
-ENV_PATH = Path("/home/daniel/Storage/mordecai/.env")
-LOG_PATH = Path("/home/daniel/Storage/mordecai/data/auto-remember/end-session.log")
+# The checkout this script lives in — scripts/ sits directly under it. A
+# hardcoded host path pinned the hook to one mind's install directory and
+# broke silently the moment that directory was renamed.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = PROJECT_ROOT / ".env"
+LOG_PATH = PROJECT_ROOT / "data" / "auto-remember" / "end-session.log"
 COMMANDS = {"$end-session", "/end-session"}
 
 
