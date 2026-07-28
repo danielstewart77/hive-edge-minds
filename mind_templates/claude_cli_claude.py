@@ -20,6 +20,25 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+def _ctx1m(model: str) -> str:
+    """Pin the 1M-context variant of a Claude model.
+
+    The gateway stores bare aliases (``opus``, ``sonnet``); against a custom
+    ``ANTHROPIC_BASE_URL`` the harness does not auto-upgrade those to the 1M
+    window, so a bare alias runs a 200k conversation that the rotation
+    threshold (sized for 1M-era sessions) may never catch before the API
+    rejects with "Prompt is too long". Appending ``[1m]`` requests the
+    long-context variant explicitly. Models that already carry a variant
+    suffix, haiku (no 1M variant), and hosts that opted out via
+    ``CLAUDE_CODE_DISABLE_1M_CONTEXT`` pass through untouched.
+    """
+    if os.environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT"):
+        return model
+    if not model or "[" in model or "haiku" in model:
+        return model
+    return f"{model}[1m]"
+
+
 async def spawn(
     session_id: str,
     model: str,
@@ -60,7 +79,7 @@ async def spawn(
         "--forward-subagent-text",
         "--permission-mode", "bypassPermissions",
         "--dangerously-skip-permissions",
-        "--model", model,
+        "--model", _ctx1m(model),
         "--mcp-config", mcp_config,
         "--append-system-prompt", full_prompt,
     ]
@@ -205,7 +224,7 @@ def _terminal_argv(model: str, mcp_config: str, resume_sid: str, project_dir: Pa
         "claude",
         "--permission-mode", "bypassPermissions",
         "--dangerously-skip-permissions",
-        "--model", model,
+        "--model", _ctx1m(model),
     ]
     if mcp_config:
         cmd.extend(["--mcp-config", mcp_config])
@@ -225,7 +244,7 @@ def _rotation_argv(model: str, mcp_config: str, new_claude_sid: str) -> list[str
         "claude",
         "--permission-mode", "bypassPermissions",
         "--dangerously-skip-permissions",
-        "--model", model,
+        "--model", _ctx1m(model),
     ]
     if mcp_config:
         cmd.extend(["--mcp-config", mcp_config])
