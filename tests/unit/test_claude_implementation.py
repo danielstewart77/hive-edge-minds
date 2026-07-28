@@ -85,7 +85,7 @@ class TestSpawnPty:
         assert "--input-format" not in cmd
         assert "--output-format" not in cmd
         assert "--append-system-prompt" not in cmd
-        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "sonnet"
+        assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "sonnet[1m]"
 
     def test_refuses_to_spawn_without_a_conversation_id(self):
         """A mind that invents an id creates a conversation only it knows

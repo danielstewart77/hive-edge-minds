@@ -25,6 +25,7 @@ import tempfile
 import termios
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -260,6 +261,31 @@ def test_rotation_starts_a_fresh_conversation_rather_than_resuming():
     argv = implementation._rotation_argv("sonnet", "", "conv-2")
     assert "--session-id" in argv and argv[argv.index("--session-id") + 1] == "conv-2"
     assert "--resume" not in argv
+
+
+def test_a_bare_model_alias_is_pinned_to_the_1m_context_variant(monkeypatch):
+    # A bare alias against a custom ANTHROPIC_BASE_URL runs a 200k window
+    # that fills before the rotation threshold — the API then rejects every
+    # turn with "Prompt is too long" and the session jams at 100%.
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_1M_CONTEXT", raising=False)
+    for argv_fn in (
+        lambda m: implementation._terminal_argv(m, "", "conv-1", Path("/tmp")),
+        lambda m: implementation._rotation_argv(m, "", "conv-1"),
+    ):
+        argv = argv_fn("opus")
+        assert argv[argv.index("--model") + 1] == "opus[1m]"
+
+
+def test_models_without_a_1m_variant_pass_through_unpinned(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_1M_CONTEXT", raising=False)
+    assert implementation._ctx1m("haiku") == "haiku"
+    assert implementation._ctx1m("opus[1m]") == "opus[1m]"
+    assert implementation._ctx1m("") == ""
+
+
+def test_the_1m_pin_respects_the_harness_opt_out(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1")
+    assert implementation._ctx1m("opus") == "opus"
 
 
 def test_the_seed_reaches_the_pane_without_riding_in_the_command(monkeypatch, tmp_path):
