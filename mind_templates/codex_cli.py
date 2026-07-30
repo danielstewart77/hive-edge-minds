@@ -369,6 +369,14 @@ async def spawn(
         "client_ref": client_ref or "",
         "owner_type": kwargs.get("owner_type") or "",
         "owner_ref": kwargs.get("owner_ref") or "",
+        # The surface this conversation serves (telegram, discord, ...). The
+        # gateway sends the clean label; the owner_type prefix is only a
+        # fallback for a gateway that predates it. Codex is per-turn, so like
+        # the provider this has to survive spawn() to reach send().
+        "surface": (
+            kwargs.get("surface")
+            or (kwargs.get("owner_type") or "").split(":", 1)[0]
+        ),
         "is_group_session": is_group_session,
     }
     _sessions[session_id] = state
@@ -423,8 +431,15 @@ async def send(
         env["OWNER_TYPE"] = state["owner_type"]
     if state.get("owner_ref"):
         env["OWNER_REF"] = state["owner_ref"]
+    if state.get("surface"):
+        env["HIVE_SURFACE"] = state["surface"]
     if state.get("is_group_session"):
         env["HIVEMIND_GROUP_SESSION"] = "1"
+    # The gateway's own session id. Codex exports CODEX_THREAD_ID into shell
+    # tool calls, but that names the harness conversation, not the session row
+    # — the end-session skill needs the row to close it, and matching back
+    # through harness_sid is a lookup that can go wrong. Hand it the id.
+    env["HIVE_SESSION_ID"] = session_id
 
     log.info("Codex session %s: spawning turn (thread=%s)", session_id, thread_id or "new")
     proc = await asyncio.create_subprocess_exec(
@@ -961,6 +976,9 @@ def spawn_pty(
         # derivation needed. surface_inject.sh reads this to tell the model
         # which surface each turn arrived on.
         "HIVE_SURFACE": "terminal",
+        # The gateway's session row id, for skills that act on the session
+        # itself (end-session closes it). Same reason as the chat path.
+        "HIVE_SESSION_ID": session_id,
     }
     overrides.update(provider_env)
     overrides.update(_session_env(client_ref, owner_type, owner_ref))

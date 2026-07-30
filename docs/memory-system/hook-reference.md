@@ -20,12 +20,6 @@ Containerised minds in upstream hive-mind keep their own copies under
 - **`prose_reminder.sh`** — keys off the same variable: the spoken-prose
   rule fires for TTS surfaces and unset, and is skipped for `terminal`
   and `local`.
-- **`codex_end_session_hook.py`** — Codex-only command interceptor. An
-  exact `$end-session` or `/end-session` blocks the provider request,
-  resolves the gateway session by `CODEX_THREAD_ID`, and schedules its
-  deletion in a detached process. This keeps session closure available
-  while the model provider is rate-limited; completed turns have already
-  passed through `auto_remember.sh`.
 
 ## Stop (every assistant turn complete)
 
