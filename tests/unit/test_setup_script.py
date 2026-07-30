@@ -21,8 +21,8 @@ _SKELETON = [
     ".env.example",
     "config.yaml.example",
     "souls/example.md",
-    "mind_templates/claude_cli_claude.py",
-    "mind_templates/codex_cli_codex.py",
+    "mind_templates/claude_cli.py",
+    "mind_templates/codex_cli.py",
 ]
 
 
@@ -56,7 +56,7 @@ def _run(repo: Path, *flags: str) -> subprocess.CompletedProcess:
 
 def test_scaffolds_mind_and_stamps_env(repo):
     result = _run(repo, "--name", "atlas", "--role", "sandboxed",
-                  "--deployment", "systemd", "--harness", "claude_cli_claude",
+                  "--deployment", "systemd", "--harness", "claude_cli",
                   "--surfaces", "telegram", "--port", "8425")
     assert result.returncode == 0, result.stderr
 
@@ -69,7 +69,7 @@ def test_scaffolds_mind_and_stamps_env(repo):
     assert "profile: standard" in runtime
     assert "role: sandboxed" in runtime
     assert "deployment: systemd" in runtime
-    assert "harness: claude_cli_claude" in runtime
+    assert "harness: claude_cli" in runtime
     assert "- telegram" in runtime
 
     env = (repo / ".env").read_text()
@@ -84,7 +84,7 @@ def test_scaffolds_mind_and_stamps_env(repo):
 
 def test_omitted_profile_defaults_to_standard_when_unattended(repo):
     result = _run(repo, "--name", "atlas", "--role", "sandboxed",
-                  "--deployment", "windows-task", "--harness", "codex_cli_codex",
+                  "--deployment", "windows-task", "--harness", "codex_cli",
                   "--surfaces", "none", "--port", "8421")
     assert result.returncode == 0, result.stderr
     assert "profile: standard" in (repo / "minds/atlas/runtime.yaml").read_text()
@@ -92,7 +92,7 @@ def test_omitted_profile_defaults_to_standard_when_unattended(repo):
 
 def test_systemd_emits_unit_with_repo_paths(repo):
     result = _run(repo, "--name", "atlas", "--role", "operator",
-                  "--deployment", "systemd", "--harness", "claude_cli_claude",
+                  "--deployment", "systemd", "--harness", "claude_cli",
                   "--surfaces", "none", "--port", "8421")
     assert result.returncode == 0, result.stderr
     unit = (repo / "deploy/atlas.service").read_text()
@@ -104,7 +104,7 @@ def test_systemd_emits_unit_with_repo_paths(repo):
 
 def test_container_emits_compose_with_operator_host_mount(repo):
     result = _run(repo, "--name", "atlas", "--role", "operator",
-                  "--deployment", "container", "--harness", "codex_cli_codex",
+                  "--deployment", "container", "--harness", "codex_cli",
                   "--surfaces", "telegram", "--port", "8432")
     assert result.returncode == 0, result.stderr
     compose = (repo / "docker-compose.yml").read_text()
@@ -121,7 +121,7 @@ def test_container_emits_compose_with_operator_host_mount(repo):
 
 def test_container_satellite_gets_project_mount_only(repo):
     result = _run(repo, "--name", "atlas", "--role", "sandboxed",
-                  "--deployment", "container", "--harness", "codex_cli_codex",
+                  "--deployment", "container", "--harness", "codex_cli",
                   "--surfaces", "telegram", "--port", "8432")
     assert result.returncode == 0, result.stderr
     compose = (repo / "docker-compose.yml").read_text()
@@ -131,7 +131,7 @@ def test_container_satellite_gets_project_mount_only(repo):
 
 def test_windows_task_emits_ps1_installer(repo):
     result = _run(repo, "--name", "atlas", "--role", "sandboxed",
-                  "--deployment", "windows-task", "--harness", "codex_cli_codex",
+                  "--deployment", "windows-task", "--harness", "codex_cli",
                   "--surfaces", "telegram", "--port", "8433")
     assert result.returncode == 0, result.stderr
     ps1 = (repo / "deploy/setup-task.ps1").read_text()
@@ -143,7 +143,7 @@ def test_windows_task_emits_ps1_installer(repo):
 def test_sentinel_profile_is_recorded_without_changing_runtime_shape(repo):
     result = _run(repo, "--name", "hex", "--profile", "sentinel",
                   "--role", "operator", "--deployment", "container",
-                  "--harness", "codex_cli_codex", "--surfaces", "telegram",
+                  "--harness", "codex_cli", "--surfaces", "telegram",
                   "--port", "8433")
     assert result.returncode == 0, result.stderr
 
@@ -156,27 +156,84 @@ def test_sentinel_profile_is_recorded_without_changing_runtime_shape(repo):
 
 def test_rejects_bad_inputs(repo):
     assert _run(repo, "--name", "Bad Name!", "--role", "sandboxed",
-                "--deployment", "systemd", "--harness", "claude_cli_claude",
+                "--deployment", "systemd", "--harness", "claude_cli",
                 "--surfaces", "none", "--port", "8421").returncode != 0
     assert _run(repo, "--name", "atlas", "--profile", "unknown",
                 "--role", "sandboxed", "--deployment", "systemd",
-                "--harness", "claude_cli_claude", "--surfaces", "none",
+                "--harness", "claude_cli", "--surfaces", "none",
                 "--port", "8421").returncode != 0
     assert _run(repo, "--name", "ok", "--role", "emperor",
-                "--deployment", "systemd", "--harness", "claude_cli_claude",
+                "--deployment", "systemd", "--harness", "claude_cli",
                 "--surfaces", "none", "--port", "8421").returncode != 0
     assert _run(repo, "--name", "ok", "--role", "sandboxed",
-                "--deployment", "cloud", "--harness", "claude_cli_claude",
+                "--deployment", "cloud", "--harness", "claude_cli",
                 "--surfaces", "none", "--port", "8421").returncode != 0
     assert _run(repo, "--name", "ok", "--role", "sandboxed",
                 "--deployment", "systemd", "--harness", "no_such_harness",
                 "--surfaces", "none", "--port", "8421").returncode != 0
 
 
+@pytest.mark.parametrize(
+    "harness,provider,model",
+    [
+        ("claude_cli", "anthropic", "sonnet"),
+        ("claude_cli", "ollama", "qwen3:8b"),
+        ("codex_cli", "openai", "gpt-5.4"),
+        ("codex_cli", "ollama", "qwen3:8b"),
+    ],
+)
+@pytest.mark.parametrize("deployment", ["systemd", "container", "windows-task"])
+def test_every_harness_provider_pair_scaffolds(
+    repo, harness, provider, model, deployment
+):
+    """Harness and provider are orthogonal — all four pairs install, on
+    every deployment. Provider used to be baked into the harness name, which
+    made codex-on-ollama unreachable."""
+    result = _run(repo, "--name", "atlas", "--role", "operator",
+                  "--deployment", deployment, "--harness", harness,
+                  "--provider", provider, "--surfaces", "telegram",
+                  "--port", "8421")
+    assert result.returncode == 0, result.stderr
+
+    runtime = (repo / "minds/atlas/runtime.yaml").read_text()
+    assert f"harness: {harness}" in runtime
+    assert f"provider: {provider}" in runtime
+    assert f"default_model: {model}" in runtime
+
+
+def test_rejects_harness_provider_pairs_the_cli_cannot_serve(repo):
+    for harness, provider in [("claude_cli", "openai"), ("codex_cli", "anthropic")]:
+        result = _run(repo, "--name", "atlas", "--role", "operator",
+                      "--deployment", "systemd", "--harness", harness,
+                      "--provider", provider, "--surfaces", "none",
+                      "--port", "8421")
+        assert result.returncode != 0, f"{harness}+{provider} should be rejected"
+        assert provider in result.stderr
+
+    bogus = _run(repo, "--name", "atlas", "--role", "operator",
+                 "--deployment", "systemd", "--harness", "claude_cli",
+                 "--provider", "bogus", "--surfaces", "none", "--port", "8421")
+    assert bogus.returncode != 0
+
+
+def test_satellite_role_is_accepted_and_normalised(repo):
+    """The Hive console emits --role satellite; setup.sh's word is sandboxed.
+    The console's spelling has to install, and only one reaches runtime.yaml."""
+    result = _run(repo, "--name", "atlas", "--role", "satellite",
+                  "--deployment", "systemd", "--harness", "claude_cli",
+                  "--provider", "anthropic", "--surfaces", "none",
+                  "--port", "8421")
+    assert result.returncode == 0, result.stderr
+
+    runtime = (repo / "minds/atlas/runtime.yaml").read_text()
+    assert "role: sandboxed" in runtime
+    assert "satellite" not in runtime
+
+
 def test_existing_env_mind_id_is_reused(repo):
     (repo / ".env").write_text("MIND_NAME=old\nMIND_ID=11111111-2222-3333-4444-555555555555\n")
     result = _run(repo, "--name", "atlas", "--role", "sandboxed",
-                  "--deployment", "windows-task", "--harness", "codex_cli_codex",
+                  "--deployment", "windows-task", "--harness", "codex_cli",
                   "--surfaces", "none", "--port", "8421")
     assert result.returncode == 0, result.stderr
     runtime = (repo / "minds/atlas/runtime.yaml").read_text()

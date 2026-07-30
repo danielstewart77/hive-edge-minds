@@ -11,14 +11,25 @@ autopilot_guards:
   max_turns_without_input: 50
   max_minutes_without_input: 30
 
-# Providers — env overrides applied per-subprocess, not globally
+# Providers — env overrides applied per-subprocess, not globally.
+#
+# The provider is orthogonal to the harness: either harness runs against
+# either provider. The claude harness needs only the ANTHROPIC_* env below;
+# the codex harness additionally emits `-c model_providers.*` flags built
+# from OLLAMA_BASE_URL (codex has no base-URL env var of its own).
+#
+# If OPENAI_API_KEY is set, codex declares env_key and sends a bearer token —
+# right for a metering proxy in front of Ollama, unnecessary for bare Ollama.
 providers:
   anthropic: {}
+  openai: {}
   ollama:
     env:
       ANTHROPIC_AUTH_TOKEN: "ollama"
       ANTHROPIC_API_KEY: ""
       ANTHROPIC_BASE_URL: "http://your-ollama-host:11434"
+      OLLAMA_BASE_URL: "http://your-ollama-host:11434/v1"
+      OPENAI_API_KEY: ""
     api_base: "http://your-ollama-host:11434"
 
 # Static model -> provider mappings (Ollama models auto-discovered)

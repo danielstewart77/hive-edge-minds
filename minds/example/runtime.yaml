@@ -29,10 +29,16 @@ deployment: systemd
 
 # Harness adapter, by mind_templates/ basename. setup.sh instantiates it at
 # minds/<name>/implementation.py.
-#   claude_cli_claude — Claude Code CLI (stream-json turns + tmux browser terminal)
-#   codex_cli_codex   — Codex CLI (one `codex exec --json` subprocess per turn)
-harness: claude_cli_claude
+#   claude_cli — Claude Code CLI (stream-json turns + tmux browser terminal)
+#   codex_cli  — Codex CLI (one `codex exec --json` subprocess per turn)
+harness: claude_cli
 
+# Where this mind's inference goes. Orthogonal to the harness: either CLI runs
+# against ollama, and both keep the browser terminal either way. The provider's
+# env block lives in config.yaml; this names which one to apply.
+#   anthropic — claude_cli only
+#   openai    — codex_cli only
+#   ollama    — either harness
 provider: anthropic
 default_model: sonnet
 mind_server_port: 8421

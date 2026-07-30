@@ -60,9 +60,9 @@ installations this repository runs today cover the corners:
 
 | Mind | Harness | Deployment | Role | Profile |
 |---|---|---|---|---|
-| skippy | `claude_cli_claude` | systemd | operator | standard |
-| mordecai | `codex_cli_codex` | container | operator | standard |
-| hex | `codex_cli_codex` | container | sandboxed | sentinel |
+| skippy | `claude_cli` | systemd | operator | standard |
+| mordecai | `codex_cli` | container | operator | standard |
+| hex | `codex_cli` | container | sandboxed | sentinel |
 
 ## Prerequisites
 
@@ -94,8 +94,20 @@ Unattended:
 
 ```bash
 ./setup.sh --name atlas --role operator --deployment systemd \
-           --harness claude_cli_claude --surfaces telegram --port 8421
+           --harness claude_cli --provider anthropic \
+           --surfaces telegram --port 8421
 ```
+
+Harness and provider are orthogonal. The harness picks the CLI, the provider
+picks where inference goes, and every pair below keeps the browser terminal:
+
+| | `anthropic` | `openai` | `ollama` |
+|---|---|---|---|
+| `claude_cli` | yes | — | yes |
+| `codex_cli` | — | yes | yes |
+
+`--role satellite` is accepted as a synonym for `sandboxed`, so a command
+copied from the Hive console installs as-is.
 
 Then fill in `.env` (tokens), edit `souls/<name>.md`, run the printed
 install commands, and register the mind with your hive (`/add-mind` in the
@@ -133,8 +145,8 @@ name: atlas
 mind_id: 2f1c9e58-...        # generated once; every memory write carries it
 role: operator                # operator | sandboxed
 deployment: systemd           # systemd | container | windows-task
-harness: claude_cli_claude    # mind_templates/ basename
-provider: anthropic
+harness: claude_cli           # mind_templates/ basename
+provider: anthropic           # anthropic | openai | ollama
 default_model: sonnet
 mind_server_port: 8421
 surfaces: [telegram]

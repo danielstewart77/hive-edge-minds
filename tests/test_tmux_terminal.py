@@ -33,7 +33,7 @@ os.environ.setdefault("MIND_ID", "test-mind-id")
 os.environ.setdefault("MIND_NAME", "example")
 os.environ.setdefault("CLAUDE_CONFIG_DIR", tempfile.mkdtemp(prefix="tmux-terminal-test-"))
 
-import mind_templates.claude_cli_claude as implementation  # noqa: E402
+import mind_templates.claude_cli as implementation  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
 

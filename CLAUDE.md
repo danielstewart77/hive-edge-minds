@@ -55,10 +55,25 @@ routes by shape: a `send` coroutine plus session-id `kill` means the
 per-turn path (codex); a long-lived process from `spawn` means the
 stream-json path (claude).
 
-- `claude_cli_claude` — long-lived `claude --stream-json` per session, plus
-  `spawn_pty` for the browser terminal.
-- `codex_cli_codex` — one `codex exec --json` subprocess per turn, plus
-  `spawn_pty` for the browser terminal. Codex mints its own thread ids and
+There are two templates, not one per harness-and-provider pair. The provider
+is a separate axis, named in `runtime.yaml` and resolved through
+`config.yaml`'s `providers:` block: `ModelRegistry.get_provider(model)` returns
+the env overrides each spawn applies. An Ollama-backed mind is the same
+harness with a different provider, and keeps its browser terminal — which is
+why no `*_ollama` template exists to lose it.
+
+- `claude_cli` — long-lived `claude --stream-json` per session, plus
+  `spawn_pty` for the browser terminal. Ollama needs nothing beyond the
+  provider's `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` overrides.
+- `codex_cli` — one `codex exec --json` subprocess per turn, plus
+  `spawn_pty` for the browser terminal. Codex has no base-URL environment
+  variable, so a non-default provider is declared as a
+  `model_providers.<mind>_ollama` config block and selected with
+  `model_provider` — `_provider_args` builds those `-c` flags, and the pane
+  caches them because a rotation respawns it with no registry in hand.
+  `env_key` is declared only when a key is actually configured: bare Ollama
+  needs no auth, a metering proxy in front of it does.
+  Codex mints its own thread ids and
   cannot adopt the gateway's conversation id; hive-comms persists that
   provider-native id as `harness_sid`, while the edge mind keeps a local
   disk-backed safety copy. A failed or incomplete turn clears both so the

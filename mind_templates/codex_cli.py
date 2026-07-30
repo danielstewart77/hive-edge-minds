@@ -83,6 +83,11 @@ _sessions: dict[str, dict] = {}
 _THREAD_MAP_PATH = CODEX_HOME / "hive-thread-map.json"
 _THREAD_MAP_LOCK = threading.Lock()
 
+# session_id -> {"args": [...], "env": {...}} for the pane's provider routing.
+# A rotation respawns the pane with no registry in hand, so what spawn_pty
+# resolved has to outlive the call that resolved it.
+_PTY_PROVIDER: dict[str, dict[str, Any]] = {}
+
 
 def _load_thread_map() -> dict[str, str]:
     try:
@@ -165,10 +170,64 @@ def _spawn_isolation() -> dict:
     return {"start_new_session": True}
 
 
-def _base_cmd() -> list[str]:
+def _resolve_provider(registry: Any, model: str) -> Any:
+    """The registry's Provider for ``model``, or None when unresolvable.
+
+    A mind spawned without a registry (tests, a bare invocation) keeps the
+    default provider rather than failing the turn.
+    """
+    if registry is None or not model:
+        return None
+    try:
+        return registry.get_provider(model)
+    except (ValueError, KeyError):
+        return None
+
+
+def _provider_args(provider: Any, mind_name: str = "MIND_NAME") -> list[str]:
+    """Codex ``-c`` overrides pointing the CLI at an Ollama-backed provider.
+
+    Codex has no ``ANTHROPIC_BASE_URL`` equivalent: a non-default provider is
+    declared as a ``model_providers.<key>`` config block and selected with
+    ``model_provider``. That is the whole reason this exists — the claude
+    harness gets the same job done through ``provider.env_overrides`` alone,
+    so it needs no counterpart.
+
+    Returns [] for every other provider, so an OpenAI-backed mind spawns the
+    exact argv it did before.
+    """
+    if provider is None or getattr(provider, "name", "") != "ollama":
+        return []
+
+    env = getattr(provider, "env_overrides", None) or {}
+    base_url = str(env.get("OLLAMA_BASE_URL") or env.get("OPENAI_BASE_URL") or "")
+    if not base_url:
+        # api_base is the anthropic-shaped field; codex speaks the
+        # OpenAI-compatible dialect, which Ollama serves under /v1.
+        api_base = str(getattr(provider, "api_base", None) or "").rstrip("/")
+        base_url = f"{api_base}/v1" if api_base else "http://localhost:11434/v1"
+    base_url = base_url.rstrip("/")
+
+    provider_key = f"{mind_name}_ollama"
+    args = [
+        "-c", f'model_provider="{provider_key}"',
+        "-c", f'model_providers.{provider_key}.name="{mind_name.capitalize()} Ollama"',
+        "-c", f'model_providers.{provider_key}.base_url="{base_url}"',
+    ]
+    if env.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY"):
+        # The "ollama" endpoint may really be a metering proxy in front of
+        # Ollama, which authenticates by bearer key. Codex only sends one when
+        # the provider declares env_key; bare Ollama needs no auth, so the
+        # declaration is gated on a key actually being present.
+        args += ["-c", f'model_providers.{provider_key}.env_key="OPENAI_API_KEY"']
+    return args
+
+
+def _base_cmd(provider_args: list[str] | None = None) -> list[str]:
     cmd = ["codex", "exec", "--json"]
     if CODEX_PROFILE:
         cmd.extend(["--profile", CODEX_PROFILE])
+    cmd.extend(provider_args or [])
     # `--dangerously-bypass-hook-trust` is required for the Stop/UserPromptSubmit
     # hooks (capture, auto_remember, rotation, contextual_retrieval) to fire under
     # headless `codex exec`. Without it Codex enables hooks via config but refuses
@@ -303,6 +362,10 @@ async def spawn(
         "thread_id": harness_sid or THREADS.get(session_id),
         "model": model,
         "proc": None,
+        # Codex is per-turn: the subprocess is built in send(), so the
+        # provider resolved here has to survive until then.
+        "provider": _resolve_provider(registry, model),
+        "mind_name": mind_name,
         "client_ref": client_ref or "",
         "owner_type": kwargs.get("owner_type") or "",
         "owner_ref": kwargs.get("owner_ref") or "",
@@ -332,12 +395,15 @@ async def send(
         yield {"type": "result", "is_error": True}
         return
 
+    provider = state.get("provider")
+    provider_args = _provider_args(provider, state.get("mind_name") or "MIND_NAME")
+
     thread_id = state.get("thread_id")
     if thread_id:
-        cmd = _base_cmd() + ["resume", thread_id, "-"]
+        cmd = _base_cmd(provider_args) + ["resume", thread_id, "-"]
         stdin_content = content
     else:
-        cmd = _base_cmd() + ["-"]
+        cmd = _base_cmd(provider_args) + ["-"]
         stdin_content = f"{state['system_prompt']}\n\n---\n\n{content}"
 
     if images:
@@ -345,6 +411,10 @@ async def send(
 
     env = os.environ.copy()
     env["CODEX_HOME"] = str(CODEX_HOME)
+    # env_key above only names the variable; codex still reads it from the
+    # environment, so the provider's overrides have to be on the subprocess.
+    if provider is not None:
+        env.update(getattr(provider, "env_overrides", None) or {})
     # Per-session attribution for the Stop hooks (rotation_check, etc.).
     if state.get("client_ref"):
         env["HIVEMIND_CLIENT_REF"] = state["client_ref"]
@@ -561,7 +631,9 @@ def _take_controlling_tty() -> None:
     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
 
-def _terminal_argv(thread_id: str | None) -> list[str]:
+def _terminal_argv(
+    thread_id: str | None, provider_args: list[str] | None = None
+) -> list[str]:
     """The interactive `codex` that runs inside the tmux pane.
 
     Resumes a known thread (`codex resume <id>`) when one exists and has a
@@ -582,6 +654,7 @@ def _terminal_argv(thread_id: str | None) -> list[str]:
         cmd.extend(["resume", thread_id])
     if CODEX_PROFILE:
         cmd.extend(["--profile", CODEX_PROFILE])
+    cmd.extend(provider_args or [])
     cmd.extend([
         "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
@@ -660,6 +733,7 @@ def pty_session_alive(session_id: str) -> bool:
 def kill_pty_session(session_id: str) -> bool:
     """End the terminal for good. True if there was one to end."""
     name = tmux_session_name(session_id)
+    _PTY_PROVIDER.pop(session_id, None)
     if _tmux("kill-session", "-t", f"={name}").returncode != 0:
         return False
     log.info("Killed tmux session %s", name)
@@ -787,10 +861,19 @@ def rotate_pty_session(
     _forget_thread(session_id)
 
     before = _existing_rollout_paths()
-    cmd = _seeded_pane_command(_terminal_argv(None), system_prompt, session_id)
+    # respawn-pane builds the pane's environment from the tmux server's, which
+    # never had the provider routing either — re-stamp it alongside the
+    # session attribution or the rotated pane falls back to OpenAI.
+    pty_provider = _PTY_PROVIDER.get(session_id) or {}
+    cmd = _seeded_pane_command(
+        _terminal_argv(None, pty_provider.get("args")),
+        system_prompt,
+        session_id,
+    )
 
     env = os.environ.copy()
     overrides = {"CODEX_HOME": str(CODEX_HOME), "HIVE_SURFACE": "terminal"}
+    overrides.update(pty_provider.get("env") or {})
     overrides.update(_session_env(client_ref, owner_type, owner_ref))
     env.update(overrides)
 
@@ -852,7 +935,14 @@ def spawn_pty(
     redeploy onto a fresh volume), in which case it is discarded and
     treated as fresh.
     """
-    del mind_id, mind_name, kwargs, mcp_config, config_obj, registry, model  # unused
+    del mind_id, kwargs, mcp_config, config_obj  # unused
+
+    # A rotation respawns this pane without a registry in hand, so the
+    # provider routing is resolved once here and kept for the pane's life.
+    provider = _resolve_provider(registry, model)
+    provider_args = _provider_args(provider, mind_name)
+    provider_env = (getattr(provider, "env_overrides", None) or {}) if provider else {}
+    _PTY_PROVIDER[session_id] = {"args": provider_args, "env": provider_env}
 
     if not resume_sid:
         raise ValueError(
@@ -872,6 +962,7 @@ def spawn_pty(
         # which surface each turn arrived on.
         "HIVE_SURFACE": "terminal",
     }
+    overrides.update(provider_env)
     overrides.update(_session_env(client_ref, owner_type, owner_ref))
     env.update(overrides)
 
@@ -897,7 +988,7 @@ def spawn_pty(
         # let it mint its own on the user's first turn (see
         # _watch_for_new_thread for why this can't be pre-created).
         before = _existing_rollout_paths() if not thread_id else set()
-        cmd = _terminal_argv(thread_id)
+        cmd = _terminal_argv(thread_id, provider_args)
 
         args: list[str] = []
         for option in _TMUX_OPTIONS:

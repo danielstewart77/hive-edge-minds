@@ -5,7 +5,12 @@
 # unattended runs:
 #
 #   ./setup.sh --name atlas --profile standard --role operator --deployment systemd \
-#              --harness claude_cli_claude --surfaces telegram --port 8421
+#              --harness claude_cli --provider anthropic --surfaces telegram \
+#              --port 8421
+#
+# Harness and provider are orthogonal: either harness runs against either
+# provider. The harness picks the CLI (claude or codex); the provider picks
+# where its inference goes (anthropic, openai, or ollama).
 #
 # What it does:
 #   1. Scaffolds minds/<name>/ (runtime.yaml + implementation.py from the
@@ -24,10 +29,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-NAME="" PROFILE="" ROLE="" DEPLOYMENT="" HARNESS="" SURFACES="" PORT=""
+NAME="" PROFILE="" ROLE="" DEPLOYMENT="" HARNESS="" PROVIDER="" SURFACES="" PORT=""
 
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -38,6 +43,7 @@ while [ $# -gt 0 ]; do
         --role)       ROLE="$2"; shift 2 ;;
         --deployment) DEPLOYMENT="$2"; shift 2 ;;
         --harness)    HARNESS="$2"; shift 2 ;;
+        --provider)   PROVIDER="$2"; shift 2 ;;
         --surfaces)   SURFACES="$2"; shift 2 ;;
         --port)       PORT="$2"; shift 2 ;;
         -h|--help)    usage ;;
@@ -46,21 +52,22 @@ while [ $# -gt 0 ]; do
 done
 
 ask() { # ask VAR "prompt" "default"
-    local var="$1" prompt="$2" default="$3" answer
+    local var="$1" prompt="$2" default="$3" answer=""
     if [ -z "${!var}" ]; then
-        read -r -p "$prompt [$default]: " answer
+        # An unattended run has no stdin to read: `read` fails, and under
+        # `set -e` that would abort the script instead of taking the default.
+        read -r -p "$prompt [$default]: " answer || answer=""
         printf -v "$var" '%s' "${answer:-$default}"
     fi
 }
 
 ask NAME       "Mind name (lowercase, [a-z0-9_-])" "example"
-if [ -z "$PROFILE" ] && [ ! -t 0 ]; then
-    PROFILE="standard"
-fi
 ask PROFILE    "Profile: standard or sentinel" "standard"
 ask ROLE       "Role: operator (full host access) or sandboxed" "sandboxed"
 ask DEPLOYMENT "Deployment: systemd, container, or windows-task" "systemd"
-ask HARNESS    "Harness: claude_cli_claude or codex_cli_codex" "claude_cli_claude"
+ask HARNESS    "Harness: claude_cli or codex_cli" "claude_cli"
+ask PROVIDER   "Provider: anthropic, openai, or ollama" \
+               "$([ "$HARNESS" = codex_cli ] && echo openai || echo anthropic)"
 ask SURFACES   "Surfaces (comma-separated: telegram,discord — or none)" "telegram"
 ask PORT       "Mind server port" "8421"
 
@@ -71,6 +78,10 @@ case "$PROFILE" in
     standard|sentinel) ;;
     *) echo "Invalid profile: '$PROFILE'" >&2; exit 1 ;;
 esac
+# `satellite` is the Hive console's word for the same posture. Accept it so a
+# command copied from the console installs, but write `sandboxed` — one
+# spelling reaches runtime.yaml.
+[ "$ROLE" = "satellite" ] && ROLE="sandboxed"
 case "$ROLE" in
     operator|sandboxed) ;;
     *) echo "Invalid role: '$ROLE'" >&2; exit 1 ;;
@@ -83,13 +94,35 @@ if [ ! -f "mind_templates/${HARNESS}.py" ]; then
     echo "Unknown harness: '$HARNESS' (no mind_templates/${HARNESS}.py)" >&2
     exit 1
 fi
+case "$PROVIDER" in
+    anthropic|openai|ollama) ;;
+    *) echo "Invalid provider: '$PROVIDER' (want anthropic, openai, or ollama)" >&2
+       exit 1 ;;
+esac
+# Each CLI speaks one first-party dialect; ollama is the shared alternative.
+case "$HARNESS:$PROVIDER" in
+    claude_cli:openai)
+        echo "claude_cli cannot use the openai provider (want anthropic or ollama)" >&2
+        exit 1 ;;
+    codex_cli:anthropic)
+        echo "codex_cli cannot use the anthropic provider (want openai or ollama)" >&2
+        exit 1 ;;
+esac
 case "$PORT" in
     (*[!0-9]*|"") echo "Invalid port: '$PORT'" >&2; exit 1 ;;
 esac
 
+# A starting model the chosen provider can actually serve. Swap it in
+# runtime.yaml (and config.yaml) once the mind is up — nothing here is pinned.
+case "$PROVIDER" in
+    anthropic) DEFAULT_MODEL="sonnet" ;;
+    openai)    DEFAULT_MODEL="gpt-5.4" ;;
+    ollama)    DEFAULT_MODEL="qwen3:8b" ;;
+esac
+
 # The browser terminal runs each claude session inside tmux — a systemd
 # claude mind without it fails at the worst place: the moment a tile opens.
-if [ "$DEPLOYMENT" = "systemd" ] && [ "$HARNESS" = "claude_cli_claude" ] \
+if [ "$DEPLOYMENT" = "systemd" ] && [ "$HARNESS" = "claude_cli" ] \
         && ! command -v tmux >/dev/null 2>&1; then
     echo "tmux is required for the browser terminal (apt install tmux)" >&2
     exit 1
@@ -137,8 +170,8 @@ profile: $PROFILE
 role: $ROLE
 deployment: $DEPLOYMENT
 harness: $HARNESS
-provider: anthropic
-default_model: sonnet
+provider: $PROVIDER
+default_model: $DEFAULT_MODEL
 mind_server_port: $PORT
 surfaces:
 ${SURFACES_YAML:-  []}
@@ -182,7 +215,7 @@ emit_systemd() {
     # PATH for the unit: wherever the harness CLI actually resolves, plus the
     # standard system dirs. No hardcoded homes, no pinned node versions.
     local harness_bin="claude"
-    [ "$HARNESS" = "codex_cli_codex" ] && harness_bin="codex"
+    [ "$HARNESS" = "codex_cli" ] && harness_bin="codex"
     local bin_dir=""
     if command -v "$harness_bin" >/dev/null 2>&1; then
         bin_dir="$(dirname "$(command -v "$harness_bin")")"
@@ -267,7 +300,7 @@ YAML
     # on other hosts each get their own, updated separately (see
     # tools/stateless/update_codex/).
     local codex_volume_line="" codex_volumes_block=""
-    if [ "$HARNESS" = "codex_cli_codex" ]; then
+    if [ "$HARNESS" = "codex_cli" ]; then
         codex_volume_line="      - codex-global:/home/hivemind/.npm-global
 "
         codex_volumes_block="
@@ -306,7 +339,7 @@ $codex_volume_line
 $codex_volumes_block
 EOF
     echo "Wrote docker-compose.yml"
-    if [ "$HARNESS" = "codex_cli_codex" ]; then
+    if [ "$HARNESS" = "codex_cli" ]; then
         cat <<EOF
 Note: this mind shares codex updates with sibling codex-harness containers
 on this host via the codex-global volume. Create it once per host before

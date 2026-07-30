@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import mind_templates.codex_cli_codex as impl
+import mind_templates.codex_cli as impl
 
 
 class FakeStdin:
@@ -290,15 +290,15 @@ def _spawned(alive: bool = False, tmux: "_TmuxRecorder | None" = None, **kwargs)
     call_kwargs = {"session_id": "s1", "model": "gpt-5.4", "resume_sid": "conv-1"}
     call_kwargs.update(kwargs)
     report_thread = MagicMock()
-    with patch("mind_templates.codex_cli_codex._tmux", tmux), \
-         patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=alive), \
-         patch("mind_templates.codex_cli_codex.pty.openpty", return_value=(11, 22)), \
-         patch("mind_templates.codex_cli_codex.fcntl.ioctl"), \
-         patch("mind_templates.codex_cli_codex.os.close"), \
-         patch("mind_templates.codex_cli_codex._rollout_exists", return_value=True), \
-         patch("mind_templates.codex_cli_codex._watch_for_new_thread_in_background") as watcher, \
-         patch("mind_templates.codex_cli_codex._report_thread", report_thread), \
-         patch("mind_templates.codex_cli_codex.subprocess.Popen") as popen:
+    with patch("mind_templates.codex_cli._tmux", tmux), \
+         patch("mind_templates.codex_cli.pty_session_alive", return_value=alive), \
+         patch("mind_templates.codex_cli.pty.openpty", return_value=(11, 22)), \
+         patch("mind_templates.codex_cli.fcntl.ioctl"), \
+         patch("mind_templates.codex_cli.os.close"), \
+         patch("mind_templates.codex_cli._rollout_exists", return_value=True), \
+         patch("mind_templates.codex_cli._watch_for_new_thread_in_background") as watcher, \
+         patch("mind_templates.codex_cli._report_thread", report_thread), \
+         patch("mind_templates.codex_cli.subprocess.Popen") as popen:
         popen.return_value = MagicMock(pid=999)
         result = impl.spawn_pty(**call_kwargs)
     watcher.report_thread = report_thread
@@ -420,12 +420,12 @@ class TestSpawnPty:
 
     def test_pty_wired_as_stdio_and_slave_closed_after_spawn(self):
         tmux = _TmuxRecorder()
-        with patch("mind_templates.codex_cli_codex._tmux", tmux), \
-             patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=True), \
-             patch("mind_templates.codex_cli_codex.pty.openpty", return_value=(11, 22)), \
-             patch("mind_templates.codex_cli_codex.fcntl.ioctl"), \
-             patch("mind_templates.codex_cli_codex.os.close") as mock_close, \
-             patch("mind_templates.codex_cli_codex.subprocess.Popen") as popen:
+        with patch("mind_templates.codex_cli._tmux", tmux), \
+             patch("mind_templates.codex_cli.pty_session_alive", return_value=True), \
+             patch("mind_templates.codex_cli.pty.openpty", return_value=(11, 22)), \
+             patch("mind_templates.codex_cli.fcntl.ioctl"), \
+             patch("mind_templates.codex_cli.os.close") as mock_close, \
+             patch("mind_templates.codex_cli.subprocess.Popen") as popen:
             popen.return_value = MagicMock(pid=999)
             impl.spawn_pty(session_id="s1", model="gpt-5.4", resume_sid="conv-1")
 
@@ -435,12 +435,12 @@ class TestSpawnPty:
 
     def test_initial_winsize_set_on_slave_before_spawn(self):
         tmux = _TmuxRecorder()
-        with patch("mind_templates.codex_cli_codex._tmux", tmux), \
-             patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=True), \
-             patch("mind_templates.codex_cli_codex.pty.openpty", return_value=(11, 22)), \
-             patch("mind_templates.codex_cli_codex.fcntl.ioctl") as mock_ioctl, \
-             patch("mind_templates.codex_cli_codex.os.close"), \
-             patch("mind_templates.codex_cli_codex.subprocess.Popen") as popen:
+        with patch("mind_templates.codex_cli._tmux", tmux), \
+             patch("mind_templates.codex_cli.pty_session_alive", return_value=True), \
+             patch("mind_templates.codex_cli.pty.openpty", return_value=(11, 22)), \
+             patch("mind_templates.codex_cli.fcntl.ioctl") as mock_ioctl, \
+             patch("mind_templates.codex_cli.os.close"), \
+             patch("mind_templates.codex_cli.subprocess.Popen") as popen:
             popen.return_value = MagicMock(pid=999)
             impl.spawn_pty(session_id="s1", model="gpt-5.4",
                             resume_sid="conv-1", cols=132, rows=43)
@@ -485,12 +485,12 @@ class TestRotatePtySession:
         call_kwargs = {"session_id": "s1", "new_claude_sid": "conv-2",
                        "system_prompt": "carry-forward"}
         call_kwargs.update(kwargs)
-        with patch("mind_templates.codex_cli_codex.CODEX_HOME",
+        with patch("mind_templates.codex_cli.CODEX_HOME",
                    seed_home or Path(tempfile.mkdtemp())), \
-             patch("mind_templates.codex_cli_codex._tmux", tmux), \
-             patch("mind_templates.codex_cli_codex.pty_session_alive", return_value=alive), \
-             patch("mind_templates.codex_cli_codex._existing_rollout_paths", return_value=set()), \
-             patch("mind_templates.codex_cli_codex._watch_for_new_thread_in_background") as watcher:
+             patch("mind_templates.codex_cli._tmux", tmux), \
+             patch("mind_templates.codex_cli.pty_session_alive", return_value=alive), \
+             patch("mind_templates.codex_cli._existing_rollout_paths", return_value=set()), \
+             patch("mind_templates.codex_cli._watch_for_new_thread_in_background") as watcher:
             rotated = impl.rotate_pty_session(**call_kwargs)
         return tmux, watcher, rotated
 
@@ -566,21 +566,21 @@ class TestTmuxSessionLifecycle:
 
     def test_alive_follows_has_session(self):
         tmux = _TmuxRecorder()
-        with patch("mind_templates.codex_cli_codex._tmux", tmux):
+        with patch("mind_templates.codex_cli._tmux", tmux):
             assert impl.pty_session_alive("s1") is True
         assert tmux.calls[0][:2] == ["has-session", "-t"]
 
-        with patch("mind_templates.codex_cli_codex._tmux", _TmuxRecorder(returncode=1)):
+        with patch("mind_templates.codex_cli._tmux", _TmuxRecorder(returncode=1)):
             assert impl.pty_session_alive("s1") is False
 
     def test_kill_ends_the_named_session(self):
         tmux = _TmuxRecorder()
-        with patch("mind_templates.codex_cli_codex._tmux", tmux):
+        with patch("mind_templates.codex_cli._tmux", tmux):
             assert impl.kill_pty_session("s1") is True
         assert tmux.calls[0] == ["kill-session", "-t", "=MIND_NAME-s1"]
 
     def test_kill_reports_when_there_was_nothing_to_kill(self):
-        with patch("mind_templates.codex_cli_codex._tmux", _TmuxRecorder(returncode=1)):
+        with patch("mind_templates.codex_cli._tmux", _TmuxRecorder(returncode=1)):
             assert impl.kill_pty_session("s1") is False
 
 

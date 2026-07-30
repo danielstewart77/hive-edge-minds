@@ -258,7 +258,7 @@ Three pieces:
 name: <name>
 mind_id: <uuid>                         # same UUID as MIND_ID in .env
 model: opus
-harness: claude_cli_claude
+harness: claude_cli
 gateway_url: http://localhost:<MIND_SERVER_PORT>
 deployment: bare-metal
 install_path: <INSTALL_PATH>
