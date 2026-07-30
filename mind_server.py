@@ -804,7 +804,10 @@ def _load_registry_and_mcp_config() -> tuple[object | None, object | None, str]:
         providers = {}
         for pname, pdata in _config.providers.items():
             env_overrides = pdata.get("env", {}) if isinstance(pdata, dict) else {}
-            providers[pname] = Provider(name=pname, env_overrides=env_overrides)
+            api_base = pdata.get("api_base") if isinstance(pdata, dict) else None
+            providers[pname] = Provider(
+                name=pname, env_overrides=env_overrides, api_base=api_base
+            )
         registry = ModelRegistry(providers=providers, static_models=_config.models)
         mcp_config_path = PROJECT_DIR / ".mcp.container.json"
         if not mcp_config_path.exists():

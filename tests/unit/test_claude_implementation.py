@@ -1,4 +1,4 @@
-"""Tests for mind_templates/claude_cli_claude.py::spawn_pty.
+"""Tests for mind_templates/claude_cli.py::spawn_pty.
 
 The web terminal's `claude` runs inside a tmux session named for the hive
 session; a browser attach is a tmux client in a pty. So `spawn_pty` has two
@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import mind_templates.claude_cli_claude as implementation
+import mind_templates.claude_cli as implementation
 
 
 def _fake_registry(env_overrides=None):
@@ -64,12 +64,12 @@ def _spawned(alive: bool = False, tmux: _TmuxRecorder | None = None, **kwargs):
     tmux = tmux or _TmuxRecorder()
     call_kwargs = {"session_id": "s1", "model": "sonnet", "resume_sid": "conv-1"}
     call_kwargs.update(kwargs)
-    with patch("mind_templates.claude_cli_claude._tmux", tmux), \
-         patch("mind_templates.claude_cli_claude.pty_session_alive", return_value=alive), \
-         patch("mind_templates.claude_cli_claude.pty.openpty", return_value=(11, 22)), \
-         patch("mind_templates.claude_cli_claude.fcntl.ioctl"), \
-         patch("mind_templates.claude_cli_claude.os.close"), \
-         patch("mind_templates.claude_cli_claude.subprocess.Popen") as popen:
+    with patch("mind_templates.claude_cli._tmux", tmux), \
+         patch("mind_templates.claude_cli.pty_session_alive", return_value=alive), \
+         patch("mind_templates.claude_cli.pty.openpty", return_value=(11, 22)), \
+         patch("mind_templates.claude_cli.fcntl.ioctl"), \
+         patch("mind_templates.claude_cli.os.close"), \
+         patch("mind_templates.claude_cli.subprocess.Popen") as popen:
         popen.return_value = MagicMock(pid=999)
         result = implementation.spawn_pty(**call_kwargs)
     return tmux, popen, result
@@ -94,7 +94,7 @@ class TestSpawnPty:
             implementation.spawn_pty(session_id="s1", model="sonnet")
 
     def test_mcp_config_is_wired_when_given(self):
-        with patch("mind_templates.claude_cli_claude._claude_transcript_exists", return_value=True):
+        with patch("mind_templates.claude_cli._claude_transcript_exists", return_value=True):
             tmux, _, _ = _spawned(model="opus", resume_sid="sid-123", mcp_config="/opt/mcp.json")
 
         cmd = tmux.pane_argv
@@ -108,7 +108,7 @@ class TestSpawnPty:
     def test_conversation_without_a_transcript_is_declared_not_resumed(self):
         """The session's first process. The id is still the gateway's — it
         is being pinned for the first time, not invented."""
-        with patch("mind_templates.claude_cli_claude._claude_transcript_exists", return_value=False):
+        with patch("mind_templates.claude_cli._claude_transcript_exists", return_value=False):
             tmux, _, _ = _spawned(resume_sid="sid-ghost")
 
         cmd = tmux.pane_argv
@@ -116,7 +116,7 @@ class TestSpawnPty:
         assert cmd[cmd.index("--session-id") + 1] == "sid-ghost"
 
     def test_conversation_with_a_transcript_is_resumed_in_place(self):
-        with patch("mind_templates.claude_cli_claude._claude_transcript_exists", return_value=True):
+        with patch("mind_templates.claude_cli._claude_transcript_exists", return_value=True):
             tmux, _, _ = _spawned(resume_sid="sid-real")
 
         cmd = tmux.pane_argv
@@ -228,12 +228,12 @@ class TestSpawnPty:
 
     def test_pty_wired_as_stdio_and_slave_closed_after_spawn(self):
         tmux = _TmuxRecorder()
-        with patch("mind_templates.claude_cli_claude._tmux", tmux), \
-             patch("mind_templates.claude_cli_claude.pty_session_alive", return_value=True), \
-             patch("mind_templates.claude_cli_claude.pty.openpty", return_value=(11, 22)), \
-             patch("mind_templates.claude_cli_claude.fcntl.ioctl"), \
-             patch("mind_templates.claude_cli_claude.os.close") as mock_close, \
-             patch("mind_templates.claude_cli_claude.subprocess.Popen") as popen:
+        with patch("mind_templates.claude_cli._tmux", tmux), \
+             patch("mind_templates.claude_cli.pty_session_alive", return_value=True), \
+             patch("mind_templates.claude_cli.pty.openpty", return_value=(11, 22)), \
+             patch("mind_templates.claude_cli.fcntl.ioctl"), \
+             patch("mind_templates.claude_cli.os.close") as mock_close, \
+             patch("mind_templates.claude_cli.subprocess.Popen") as popen:
             popen.return_value = MagicMock(pid=999)
             implementation.spawn_pty(session_id="s1", model="sonnet", resume_sid="conv-1")
 
@@ -245,12 +245,12 @@ class TestSpawnPty:
         # The client must start at the tile's size, or its first paint is
         # drawn for a geometry the browser doesn't have.
         tmux = _TmuxRecorder()
-        with patch("mind_templates.claude_cli_claude._tmux", tmux), \
-             patch("mind_templates.claude_cli_claude.pty_session_alive", return_value=True), \
-             patch("mind_templates.claude_cli_claude.pty.openpty", return_value=(11, 22)), \
-             patch("mind_templates.claude_cli_claude.fcntl.ioctl") as mock_ioctl, \
-             patch("mind_templates.claude_cli_claude.os.close"), \
-             patch("mind_templates.claude_cli_claude.subprocess.Popen") as popen:
+        with patch("mind_templates.claude_cli._tmux", tmux), \
+             patch("mind_templates.claude_cli.pty_session_alive", return_value=True), \
+             patch("mind_templates.claude_cli.pty.openpty", return_value=(11, 22)), \
+             patch("mind_templates.claude_cli.fcntl.ioctl") as mock_ioctl, \
+             patch("mind_templates.claude_cli.os.close"), \
+             patch("mind_templates.claude_cli.subprocess.Popen") as popen:
             popen.return_value = MagicMock(pid=999)
             implementation.spawn_pty(session_id="s1", model="sonnet",
                                      resume_sid="conv-1", cols=132, rows=43)
@@ -276,7 +276,7 @@ class TestSpawnSurfaceEnv:
         # spawn copies os.environ, and this suite may itself run inside a
         # surface-stamped process — mask the inherited value so the tests
         # see only what spawn sets.
-        with patch("mind_templates.claude_cli_claude.asyncio.create_subprocess_exec", exec_mock), \
+        with patch("mind_templates.claude_cli.asyncio.create_subprocess_exec", exec_mock), \
              patch.dict("os.environ", {}, clear=False) as _env:
             os.environ.pop("HIVE_SURFACE", None)
             asyncio.run(implementation.spawn(**call))
@@ -301,19 +301,19 @@ class TestTmuxSessionLifecycle:
 
     def test_alive_follows_has_session(self):
         tmux = _TmuxRecorder()
-        with patch("mind_templates.claude_cli_claude._tmux", tmux):
+        with patch("mind_templates.claude_cli._tmux", tmux):
             assert implementation.pty_session_alive("s1") is True
         assert tmux.calls[0][:2] == ["has-session", "-t"]
 
-        with patch("mind_templates.claude_cli_claude._tmux", _TmuxRecorder(returncode=1)):
+        with patch("mind_templates.claude_cli._tmux", _TmuxRecorder(returncode=1)):
             assert implementation.pty_session_alive("s1") is False
 
     def test_kill_ends_the_named_session(self):
         tmux = _TmuxRecorder()
-        with patch("mind_templates.claude_cli_claude._tmux", tmux):
+        with patch("mind_templates.claude_cli._tmux", tmux):
             assert implementation.kill_pty_session("s1") is True
         assert tmux.calls[0] == ["kill-session", "-t", "=MIND_NAME-s1"]
 
     def test_kill_reports_when_there_was_nothing_to_kill(self):
-        with patch("mind_templates.claude_cli_claude._tmux", _TmuxRecorder(returncode=1)):
+        with patch("mind_templates.claude_cli._tmux", _TmuxRecorder(returncode=1)):
             assert implementation.kill_pty_session("s1") is False

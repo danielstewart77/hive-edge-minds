@@ -21,8 +21,8 @@ import time
 
 import pytest
 
-import mind_templates.claude_cli_claude as claude_impl
-import mind_templates.codex_cli_codex as codex_impl
+import mind_templates.claude_cli as claude_impl
+import mind_templates.codex_cli as codex_impl
 import minds.example.implementation as example_impl
 
 MOUSE_ON = ["set", "-g", "mouse", "on"]

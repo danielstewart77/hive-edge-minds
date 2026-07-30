@@ -10,7 +10,7 @@ this source guard keeps the tracked template from regressing anywhere.
 """
 from pathlib import Path
 
-TEMPLATE = Path(__file__).resolve().parents[2] / "mind_templates" / "codex_cli_codex.py"
+TEMPLATE = Path(__file__).resolve().parents[2] / "mind_templates" / "codex_cli.py"
 
 
 def test_template_spawns_with_hidden_console_on_windows():

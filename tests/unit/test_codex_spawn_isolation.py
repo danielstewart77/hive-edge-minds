@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import subprocess
 
-import mind_templates.codex_cli_codex as codex_template
+import mind_templates.codex_cli as codex_template
 
 # Win32 creation-flag constants (mirrors CPython's subprocess values).
 DETACHED_PROCESS = 0x00000008
