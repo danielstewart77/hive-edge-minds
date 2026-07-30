@@ -191,6 +191,15 @@ that arrive while a terminal tile is open are mirrored into the attached
 socket by `_mirror_turn_to_pty` (a live overlay; tmux can't be told about
 bytes it didn't produce).
 
+### Project instructions per harness
+
+Claude reads `CLAUDE.md`; codex reads `AGENTS.md` and ignores `CLAUDE.md`
+entirely. `AGENTS.md` is therefore a tracked symlink to `CLAUDE.md` — one
+source, both harnesses. Codex resolves no `@path` imports inside it, so there
+is no split-file equivalent of `CLAUDE.local.md` at the repo root; a codex
+mind's per-install notes go in `$CODEX_HOME/AGENTS.md`, which codex loads
+alongside the repo file.
+
 ## Identity convention
 
 | Variable | Purpose |

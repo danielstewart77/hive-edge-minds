@@ -5,6 +5,7 @@ folding, the codex-event parsing, and the thread_id lifecycle without spawning a
 real `codex exec`.
 """
 
+import asyncio
 import json
 import os
 import subprocess
@@ -159,6 +160,51 @@ async def test_send_new_thread_cmd_stdin_and_events(monkeypatch):
     assert result["is_error"] is False
     assert result["stop_reason"] == "end_turn"
     assert result["session_id"] == "t1"
+
+
+class TestChatTurnEnv:
+    """Codex is per-turn, so what spawn() resolves has to reach send()'s
+    subprocess env — that env is what the UserPromptSubmit hooks read.
+    """
+
+    @staticmethod
+    def _turn_env(monkeypatch, **spawn_kwargs):
+        async def _go():
+            call = {
+                "session_id": "row-9",
+                "model": "gpt-5.4",
+                "resume_sid": None,
+                "system_prompt_blocks": "SOUL",
+                "client_ref": "tg:123",
+            }
+            call.update(spawn_kwargs)
+            await impl.spawn(**call)
+            rec = {}
+            _install_fake_exec(monkeypatch, [_ev({"type": "turn.completed"})], rec)
+            [ev async for ev in impl.send(call["session_id"], "ping")]
+            return rec["kwargs"]["env"]
+
+        # This suite may itself run inside a surface-stamped process; send()
+        # copies os.environ, so mask the inherited value.
+        monkeypatch.delenv("HIVE_SURFACE", raising=False)
+        return asyncio.run(_go())
+
+    def test_surface_from_the_gateway_reaches_the_turn(self, monkeypatch):
+        env = self._turn_env(monkeypatch, surface="telegram",
+                             owner_type="telegram:uuid")
+        assert env["HIVE_SURFACE"] == "telegram"
+
+    def test_missing_surface_falls_back_to_the_owner_type_prefix(self, monkeypatch):
+        env = self._turn_env(monkeypatch, owner_type="discord:uuid")
+        assert env["HIVE_SURFACE"] == "discord"
+
+    def test_no_surface_and_no_owner_type_sets_nothing(self, monkeypatch):
+        env = self._turn_env(monkeypatch)
+        assert "HIVE_SURFACE" not in env
+
+    def test_gateway_session_id_reaches_the_turn(self, monkeypatch):
+        env = self._turn_env(monkeypatch)
+        assert env["HIVE_SESSION_ID"] == "row-9"
 
 
 async def test_gateway_conversation_id_is_not_used_as_a_codex_thread():
@@ -358,6 +404,15 @@ class TestSpawnPty:
 
         assert "HIVE_SURFACE=terminal" in tmux.new_session
         assert popen.call_args.kwargs["env"]["HIVE_SURFACE"] == "terminal"
+
+    def test_pane_gets_the_gateway_session_id(self):
+        """The end-session skill closes the session row it runs inside, so the
+        row's id has to be on the harness process. CODEX_THREAD_ID names the
+        codex conversation, not the row."""
+        tmux, popen, _, _ = _spawned(session_id="row-77")
+
+        assert "HIVE_SESSION_ID=row-77" in tmux.new_session
+        assert popen.call_args.kwargs["env"]["HIVE_SESSION_ID"] == "row-77"
 
     def test_pane_gets_codex_home(self):
         tmux, popen, _, _ = _spawned()
