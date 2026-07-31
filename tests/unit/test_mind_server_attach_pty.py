@@ -45,7 +45,7 @@ class TestAttachPty:
         test_client, mind_server = client
         mind_server.impl = MagicMock(spec=[])  # no spawn_pty attribute
 
-        with test_client.websocket_connect("/sessions/sess-1/attach-pty?resume_sid=abc") as ws:
+        with test_client.websocket_connect("/sessions/sess-1/attach-pty?model=sonnet&resume_sid=abc") as ws:
             with pytest.raises(Exception):
                 ws.receive_bytes()
 
@@ -56,7 +56,7 @@ class TestAttachPty:
         mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
 
         with test_client.websocket_connect(
-            "/sessions/sess-1/attach-pty?resume_sid=abc&model=sonnet"
+            "/sessions/sess-1/attach-pty?model=sonnet&resume_sid=abc"
         ) as ws:
             # The pty line discipline runs even with no child attached to the
             # slave side, so a bare \n written here comes out \r\n on master.
@@ -81,7 +81,7 @@ class TestAttachPty:
 
         with test_client.websocket_connect(
             "/sessions/sess-9/attach-pty"
-            "?resume_sid=abc&client_ref=terminal-abc&owner_type=web&owner_ref=u1"
+            "?model=sonnet&resume_sid=abc&client_ref=terminal-abc&owner_type=web&owner_ref=u1"
         ):
             pass
 
@@ -99,7 +99,7 @@ class TestAttachPty:
 
         with test_client.websocket_connect(
             "/sessions/sess-codex/attach-pty"
-            "?resume_sid=gateway-id&harness_sid=codex-thread-7"
+            "?model=sonnet&resume_sid=gateway-id&harness_sid=codex-thread-7"
         ):
             pass
 
@@ -117,7 +117,7 @@ class TestAttachPty:
         mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
 
         with test_client.websocket_connect(
-            "/sessions/sess-42/attach-pty?resume_sid=abc&owner_type=web&owner_ref=u1"
+            "/sessions/sess-42/attach-pty?model=sonnet&resume_sid=abc&owner_type=web&owner_ref=u1"
         ):
             pass
 
@@ -131,7 +131,7 @@ class TestAttachPty:
         proc = _fake_proc()
         mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
 
-        with test_client.websocket_connect("/sessions/sess-2/attach-pty?resume_sid=abc") as ws:
+        with test_client.websocket_connect("/sessions/sess-2/attach-pty?model=sonnet&resume_sid=abc") as ws:
             ws.send_bytes(b"/help\n")
             time.sleep(0.1)
             assert os.read(slave_fd, 4096) == b"/help\n"
@@ -151,7 +151,7 @@ class TestAttachPty:
         proc = _fake_proc()
         mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
 
-        with test_client.websocket_connect("/sessions/sess-3/attach-pty?resume_sid=abc"):
+        with test_client.websocket_connect("/sessions/sess-3/attach-pty?model=sonnet&resume_sid=abc"):
             pass
 
         mind_server.impl.kill_pty_session.assert_not_called()
@@ -168,9 +168,9 @@ class TestAttachPty:
         spawn = MagicMock(side_effect=[(procs[0], fds[0][0]), (procs[1], fds[1][0])])
         mind_server.impl.spawn_pty = spawn
 
-        with test_client.websocket_connect("/sessions/sess-6/attach-pty?resume_sid=abc"):
+        with test_client.websocket_connect("/sessions/sess-6/attach-pty?model=sonnet&resume_sid=abc"):
             pass
-        with test_client.websocket_connect("/sessions/sess-6/attach-pty?resume_sid=abc"):
+        with test_client.websocket_connect("/sessions/sess-6/attach-pty?model=sonnet&resume_sid=abc"):
             pass
 
         assert len(mind_server._ptys) == 1
@@ -189,7 +189,7 @@ class TestAttachPty:
         mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
         mind_server._PTY_KEEPALIVE_S = 0.05  # beat fast so the test is quick
 
-        with test_client.websocket_connect("/sessions/sess-ka/attach-pty?resume_sid=abc") as ws:
+        with test_client.websocket_connect("/sessions/sess-ka/attach-pty?model=sonnet&resume_sid=abc") as ws:
             saw_beat = False
             for _ in range(30):
                 if ws.receive_bytes() == mind_server._PTY_KEEPALIVE_BYTE:
@@ -209,9 +209,9 @@ class TestAttachPty:
             (procs[1], fds[1][0]),
         ])
 
-        with test_client.websocket_connect("/sessions/sess-a/attach-pty?resume_sid=sid-a"):
+        with test_client.websocket_connect("/sessions/sess-a/attach-pty?model=sonnet&resume_sid=sid-a"):
             pass
-        with test_client.websocket_connect("/sessions/sess-b/attach-pty?resume_sid=sid-b"):
+        with test_client.websocket_connect("/sessions/sess-b/attach-pty?model=sonnet&resume_sid=sid-b"):
             pass
 
         assert mind_server._ptys["sess-a"].tmux_name != mind_server._ptys["sess-b"].tmux_name
@@ -226,7 +226,7 @@ class TestAttachPty:
         proc = _fake_proc()
         mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
 
-        with test_client.websocket_connect("/sessions/sess-7/attach-pty?resume_sid=abc"):
+        with test_client.websocket_connect("/sessions/sess-7/attach-pty?model=sonnet&resume_sid=abc"):
             pass
         resp = test_client.delete("/sessions/sess-7")
 
@@ -267,7 +267,7 @@ class TestRotatePty:
         mind_server.impl.spawn_pty = MagicMock(return_value=(proc, master_fd))
         mind_server.impl.rotate_pty_session = MagicMock(return_value=True)
 
-        with test_client.websocket_connect("/sessions/old-1/attach-pty?resume_sid=conv-1"):
+        with test_client.websocket_connect("/sessions/old-1/attach-pty?model=sonnet&resume_sid=conv-1"):
             pass
         before = mind_server._ptys["old-1"]
         resp = test_client.post(
@@ -312,7 +312,7 @@ class TestRotatePty:
         master_fd, slave_fd = pty.openpty()
         mind_server.impl.spawn_pty = MagicMock(return_value=(_fake_proc(), master_fd))
 
-        with test_client.websocket_connect("/sessions/old-3/attach-pty?resume_sid=conv-1"):
+        with test_client.websocket_connect("/sessions/old-3/attach-pty?model=sonnet&resume_sid=conv-1"):
             pass
         del mind_server.impl.rotate_pty_session
 
