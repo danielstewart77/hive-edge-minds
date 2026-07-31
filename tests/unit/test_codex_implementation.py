@@ -676,3 +676,48 @@ class TestExtractAssistantTexts:
     ])
     def test_non_assistant_events_yield_nothing(self, event):
         assert impl.extract_assistant_texts(event) == []
+
+
+class TestReportThreadAuth:
+    """_report_thread authenticates with the canonical comms bearer token."""
+
+    def _capture(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["auth"] = request.headers.get("Authorization")
+            return FakeResponse()
+
+        monkeypatch.setenv("COMMS_URL", "http://127.0.0.1:8426")
+        monkeypatch.setattr(impl.urllib.request, "urlopen", fake_urlopen)
+        return captured
+
+    def test_prefers_comms_bearer_token(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        monkeypatch.setenv("COMMS_BEARER_TOKEN", "canonical")
+        monkeypatch.setenv("HIVEMIND_BROKER_TOKEN", "legacy")
+        impl._report_thread("sess-1", "thread-1")
+        assert captured["auth"] == "Bearer canonical"
+
+    def test_falls_back_to_legacy_alias(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        monkeypatch.delenv("COMMS_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("HIVEMIND_BROKER_TOKEN", "legacy")
+        impl._report_thread("sess-1", "thread-1")
+        assert captured["auth"] == "Bearer legacy"
+
+    def test_no_token_sends_no_auth_header(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        monkeypatch.delenv("COMMS_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("HIVEMIND_BROKER_TOKEN", raising=False)
+        impl._report_thread("sess-1", "thread-1")
+        assert captured["auth"] is None
