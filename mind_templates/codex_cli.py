@@ -127,7 +127,11 @@ def _report_thread(session_id: str, thread_id: str) -> None:
     if not base_url:
         log.warning("Cannot report Codex thread for %s: HIVEMIND_BROKER_URL unset", session_id)
         return
-    token = os.environ.get("HIVEMIND_BROKER_TOKEN", "")
+    # COMMS_BEARER_TOKEN is canonical; HIVEMIND_BROKER_TOKEN is the legacy
+    # alias carrying the same value on bare-metal installs.
+    token = os.environ.get("COMMS_BEARER_TOKEN") or os.environ.get(
+        "HIVEMIND_BROKER_TOKEN", ""
+    )
     request = urllib.request.Request(
         f"{base_url}/sessions/{session_id}/harness-state",
         data=json.dumps({"harness_sid": thread_id}).encode(),
