@@ -52,7 +52,7 @@ except ImportError:
     log.error("No implementation found for mind: %s", MIND_NAME)
     sys.exit(1)
 
-app = FastAPI(title=f"Mind Server: {MIND_ID}")
+app = FastAPI(title=f"Mind Server: {MIND_ID}", docs_url=None, redoc_url=None, openapi_url=None)
 install_fastapi_logging(app, log, component="mind-server")
 
 # In-memory session tracking — no database

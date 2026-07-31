@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from hive_logging import configure_logging, install_fastapi_logging, log_event
 
-app = FastAPI(title="Remote Admin", version="1.0.0")
+app = FastAPI(title="Remote Admin", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
 log = configure_logging("remote-admin")
 install_fastapi_logging(app, log, component="remote-admin")
 security = HTTPBearer()
