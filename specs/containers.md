@@ -120,33 +120,6 @@ No separate container. Lucent is an embedded SQLite-backed graph and vector stor
 
 ---
 
-### planka-db
-
-| Property | Value |
-|----------|-------|
-| Image | `postgres:14-alpine` |
-| Container | `hive-mind-planka-db` |
-| Port | None (internal) |
-| Restart | `unless-stopped` |
-
-**Volumes:** `planka-db:/var/lib/postgresql/data`
-
----
-
-### planka
-
-| Property | Value |
-|----------|-------|
-| Image | `ghcr.io/plankanban/planka:latest` |
-| Container | `hive-mind-planka` |
-| Port | `3000:1337` |
-| Restart | `unless-stopped` |
-| Depends on | planka-db |
-
-**Volumes:** `planka-data` mounted to avatars, backgrounds, and attachments.
-
----
-
 ## Network
 
 All services share the `hivemind` bridge network (external, must exist before `docker compose up`):
@@ -160,8 +133,6 @@ docker network create hivemind
 |----------|------|----------|
 | `server` | 8420 | HTTP |
 | `voice-server` | 8422 | HTTP |
-| `planka-db` | 5432 | PostgreSQL |
-| `planka` | 1337 | HTTP |
 
 ---
 
@@ -170,8 +141,6 @@ docker network create hivemind
 | Volume | Container path | Contents | Survives rebuild? |
 |--------|---------------|----------|-------------------|
 | `sessions-db` | `/usr/src/app/data` | SQLite sessions DB + Lucent graph/vector store | Yes |
-| `planka-db` | `/var/lib/postgresql/data` | Kanban DB | Yes |
-| `planka-data` | `/app/public/*`, `/app/private/attachments` | Kanban files | Yes |
 | `whisper-cache` | `/home/hivemind/.cache` | Whisper STT + Chatterbox TTS models | Yes |
 
 Named volumes survive `docker compose down`, image rebuilds, and container recreation. They are only destroyed by explicit `docker volume rm`.

@@ -68,7 +68,6 @@ Or via the thin `core/secrets.py::get_credential(key)` wrapper, retained so a fu
 | `COMMS_BEARER_TOKEN`, `COMMS_ADMIN_BEARER_TOKEN` | Comms gateway auth |
 | `LUCENT_BEARER_TOKEN` | Lucent KG + vector store auth |
 | `HIVE_TOOLS_TOKEN` | hive-tools API auth |
-| `PLANKA_EMAIL`, `PLANKA_PASSWORD`, `PLANKA_URL` | Kanban board |
 
 ## Environment Variables (Per-Container)
 

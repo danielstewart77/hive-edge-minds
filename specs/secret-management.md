@@ -31,7 +31,6 @@ underscore-separated. Examples (not exhaustive):
 - `COMMS_BEARER_TOKEN`, `COMMS_ADMIN_BEARER_TOKEN`
 - `LUCENT_BEARER_TOKEN`, `LUCENT_URL_SELF`
 - `HIVE_TOOLS_TOKEN`, `HIVE_TOOLS_URL`
-- `PLANKA_EMAIL`, `PLANKA_PASSWORD`, `PLANKA_URL`
 - `X_BEARER_TOKEN`, `COINGECKO_API_KEY` (stateless tools)
 
 ## Rules
