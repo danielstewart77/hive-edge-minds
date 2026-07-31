@@ -377,6 +377,11 @@ def rotate_pty_session(
                  session_id)
         return False
 
+    if not model:
+        log.warning("Refusing to rotate session %s: no model to carry over",
+                    session_id)
+        return False
+
     cmd = _seeded_pane_command(
         _rotation_argv(model, mcp_config, new_claude_sid), system_prompt, new_claude_sid
     )

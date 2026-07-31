@@ -94,6 +94,31 @@ construction. Codex additionally reports its own thread id, which hive-comms
 stores separately as `harness_sid` and returns on every spawn and terminal
 attach; the session's identity remains the gateway's id.
 
+### runtime.yaml is read every boot, and written over HTTP
+
+`minds/<name>/runtime.yaml` is the durable truth about a mind; the broker's
+`minds` row is a cache of it. `mind_server` re-registers from the file on
+every start (`runtime_config.registration_payload` → `POST /broker/minds`,
+an upsert on `mind_id`), which is what makes the file authoritative rather
+than an install-time artifact. Registration failure is logged, never fatal.
+
+`GET /runtime` reports the allowlisted configuration; `PATCH /runtime` sets
+`default_model` by rewriting that one line in place (line substitution, not
+a YAML round-trip — a dump would strip the comments). The write is guarded
+by `MIND_ADMIN_TOKEN`, falling back to `COMMS_ADMIN_BEARER_TOKEN`; neither
+configured means the route refuses with 503 rather than opening. The hive
+console uses these two routes for every mind — a container in the stack, a
+bare-metal mind here, or a mind on another machine — writing the file first
+and the broker row second, so a restart can't undo the edit.
+
+The model itself is never defaulted. A spawn or an `attach-pty` that arrives
+without one is refused: comms resolves it per session from the broker row,
+and a mind quietly substituting a house favourite is how a wrong model goes
+unnoticed for weeks. A rotation carries the conversation's own model
+forward — the pty handle remembers what its pane started on — so editing a
+mind's default never moves a live conversation. That default is for the next
+conversation.
+
 ### Browser terminal (tmux-backed)
 
 `mind_server.py` exposes `WS /sessions/{id}/attach-pty`, bridging raw bytes

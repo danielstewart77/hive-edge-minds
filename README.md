@@ -157,6 +157,21 @@ soul_file: souls/atlas.md
 write to the hive's memory carries; the name is a display label and is never
 written there.
 
+The file is read on every start, not just at install. `mind_server` registers
+these values with the hive's broker each time it boots (`POST /broker/minds`,
+an upsert on `mind_id`), so the broker's registry is a cache of the file
+rather than a second place to keep the truth — a rebuilt broker database, a
+mind moved to a new address, or a row edited out of band all converge on what
+the file says.
+
+It is also writable at runtime. `GET /runtime` reports the configuration and
+`PATCH /runtime` sets `default_model`, guarded by `MIND_ADMIN_TOKEN` (or the
+gateway's `COMMS_ADMIN_BEARER_TOKEN`, which the console already holds). That
+is how the hive console configures a mind: it writes the file first, then
+refreshes the broker row, so the edit survives the next restart. A new model
+takes effect on the next session the gateway creates; conversations already
+running keep the model they started on, and so do their rotations.
+
 ## Surfaces
 
 - **Telegram** — the primary conversational surface. Runs in-process;

@@ -15,6 +15,7 @@ import importlib
 import json
 import logging
 import os
+import secrets
 import signal
 import struct
 import subprocess
@@ -26,6 +27,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import runtime_config
 from hive_logging import configure_logging, install_fastapi_logging, log_event, log_if_slow
 
 log = configure_logging("mind-server")
@@ -158,9 +160,65 @@ async def _fetch_secrets_on_startup():
         log.debug("Could not connect to NS for secrets (NS may not be ready yet)")
 
 
+async def _register_with_broker():
+    """Publish this mind's runtime.yaml to the broker's registry.
+
+    Every boot, not just the install. `register_mind` upserts on `mind_id`,
+    so this is the reconciliation step that makes the file authoritative:
+    a broker row edited out of band, a rebuilt broker database, or a mind
+    moved to a new address all converge on what the file says. The console
+    writes the file before it writes the row, so a config edit survives the
+    restart that follows it.
+
+    Never fatal. A mind that can't reach comms still serves its own
+    sessions, and the next boot re-registers.
+    """
+    import aiohttp
+
+    comms_url = os.environ.get("COMMS_URL", "").rstrip("/")
+    token = os.environ.get("COMMS_ADMIN_BEARER_TOKEN", "")
+    if not comms_url or not token:
+        log.debug("No COMMS_URL/admin token — skipping broker self-registration")
+        return
+    try:
+        payload = runtime_config.registration_payload(MIND_NAME)
+    except ValueError as exc:
+        log_event(
+            log, "mind.register.skipped", level=logging.WARNING,
+            mind_id=MIND_ID, error=str(exc),
+        )
+        return
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{comms_url}/broker/minds",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status >= 400:
+                    log_event(
+                        log, "mind.register.failed", level=logging.WARNING,
+                        mind_id=MIND_ID, status=resp.status,
+                    )
+                    return
+    except Exception as exc:
+        log_event(
+            log, "mind.register.failed", level=logging.WARNING,
+            mind_id=MIND_ID, error_type=type(exc).__name__,
+        )
+        return
+    log_event(
+        log, "mind.registered", mind_id=MIND_ID, mind_name=payload["name"],
+        model=payload["model"], harness=payload["harness"],
+        gateway_url=payload["gateway_url"],
+    )
+
+
 @app.on_event("startup")
 async def startup_secrets():
     await _fetch_secrets_on_startup()
+    await _register_with_broker()
     # Terminals outlive their sockets, so something has to collect the ones
     # nobody comes back to.
     asyncio.ensure_future(_reap_idle_ptys())
@@ -169,6 +227,62 @@ async def startup_secrets():
 @app.get("/health")
 async def health():
     return {"mind_id": MIND_ID, "status": "ok", "sessions": len(_sessions)}
+
+
+def _authorize_admin(request: Request) -> JSONResponse | None:
+    """Guard the config-write route. None means the caller may proceed."""
+    expected = runtime_config.admin_token()
+    if not expected:
+        return JSONResponse(
+            {"error": "no admin token configured on this mind"}, status_code=503
+        )
+    header = request.headers.get("Authorization", "")
+    presented = header[7:] if header.startswith("Bearer ") else ""
+    if not secrets.compare_digest(presented, expected):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return None
+
+
+@app.get("/runtime")
+async def get_runtime():
+    """This mind's runtime configuration, as the console renders it."""
+    try:
+        return {"configuration": runtime_config.public_runtime(MIND_NAME)}
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.patch("/runtime")
+async def patch_runtime(request: Request):
+    """Set this mind's default model, durably.
+
+    The console pushes here rather than reaching into a bind-mounted file,
+    so a mind on another host configures exactly like one in this stack.
+    Sessions already running keep the model they spawned with; the next one
+    the gateway creates uses this.
+    """
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    model = str(body.get("default_model") or "").strip()
+    if not model:
+        return JSONResponse({"error": "default_model required"}, status_code=400)
+    try:
+        configuration = runtime_config.update_default_model(MIND_NAME, model)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"error": f"could not write runtime.yaml: {exc}"}, status_code=500)
+    log_event(log, "mind.runtime.updated", mind_id=MIND_ID, default_model=model)
+    return {
+        "saved": True,
+        "configuration": {
+            k: configuration[k] for k in runtime_config.PUBLIC_FIELDS if k in configuration
+        },
+    }
 
 
 @app.get("/sessions")
@@ -259,16 +373,21 @@ class _PtyHandle:
     that can be *asked* what the terminal currently looks like.
     """
 
-    __slots__ = ("session_id", "tmux_name", "claude_sid", "proc", "master_fd",
-                 "cols", "rows", "queue", "detached_at", "alive", "loop")
+    __slots__ = ("session_id", "tmux_name", "claude_sid", "model", "proc",
+                 "master_fd", "cols", "rows", "queue", "detached_at", "alive",
+                 "loop")
 
     def __init__(self, session_id: str, tmux_name: str, claude_sid: str,
-                 cols: int, rows: int):
+                 cols: int, rows: int, model: str = ""):
         self.session_id = session_id
         self.tmux_name = tmux_name
         # The session's conversation id, minted by the gateway and handed
         # down. The mind records it for logging; it never chooses it.
         self.claude_sid = claude_sid
+        # The model this terminal's harness process was started on. A
+        # rotation replaces the conversation, never the model — so when one
+        # arrives without an explicit model, this is the answer.
+        self.model = model
         self.cols, self.rows = _clamp_winsize(cols, rows)
         self.proc = None                 # the attached tmux client, if any
         self.master_fd: int | None = None
@@ -409,7 +528,7 @@ def _open_pty_session(
         _detach_client(handle)
     else:
         handle = _PtyHandle(session_id, impl.tmux_session_name(session_id),
-                            resume_sid or "", cols, rows)
+                            resume_sid or "", cols, rows, model=model)
         _ptys[session_id] = handle
 
     registry, config_obj, mcp_config = _load_registry_and_mcp_config()
@@ -443,7 +562,7 @@ async def attach_pty(
     websocket: WebSocket,
     session_id: str,
     resume_sid: str | None = None,
-    model: str = "sonnet",
+    model: str = "",
     cols: int = 80,
     rows: int = 24,
     client_ref: str | None = None,
@@ -484,6 +603,14 @@ async def attach_pty(
     if not (resume_sid or "").strip():
         log.warning("attach-pty for session %s carried no conversation id", session_id)
         await websocket.close(code=1008, reason="no conversation id for this session")
+        return
+
+    # Same rule as the stream-json spawn: the model comes from the session
+    # the gateway resolved, or the attach fails loudly. A default here spawns
+    # a terminal on a model the session never agreed to.
+    if not (model or "").strip():
+        log.warning("attach-pty for session %s carried no model", session_id)
+        await websocket.close(code=1008, reason="no model for this session")
         return
 
     # hive-comms has no chat-id-like concept for a browser tile — Telegram/
@@ -827,7 +954,15 @@ async def create_session(request: Request):
     session_id = (body.get("session_id") or "").strip()
     if not session_id:
         return JSONResponse({"error": "session_id required"}, status_code=400)
-    model = body.get("model", "sonnet")
+    # No default. A spawn that arrives without a model has already lost the
+    # one the gateway resolved from the mind's runtime.yaml, and quietly
+    # substituting a house favourite is how that goes unnoticed for weeks.
+    model = str(body.get("model") or "").strip()
+    if not model:
+        return JSONResponse(
+            {"error": "model required — the gateway resolves it per session"},
+            status_code=400,
+        )
     resume_sid = (body.get("resume_sid") or "").strip()
     harness_sid = (body.get("harness_sid") or "").strip() or None
     if not resume_sid:
@@ -1273,7 +1408,12 @@ async def rotate_pty(session_id: str, request: Request):
             impl.rotate_pty_session,
             session_id=session_id,
             new_claude_sid=new_claude_sid,
-            model=body.get("model") or "",
+            # A rotation turns over the conversation, never the model. Absent
+            # an explicit one the pane keeps what it started on, rather than
+            # falling back to this mind's current default — which would
+            # silently switch a live terminal's model the moment someone
+            # edited that default in the console.
+            model=body.get("model") or handle.model,
             system_prompt=body.get("system_prompt") or "",
             mcp_config=mcp_config,
             registry=registry,
