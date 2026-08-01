@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import pty_notice
 import runtime_config
+import skills_sync
 from hive_logging import configure_logging, install_fastapi_logging, log_event, log_if_slow
 
 log = configure_logging("mind-server")
@@ -284,6 +285,103 @@ async def patch_runtime(request: Request):
             k: configuration[k] for k in runtime_config.PUBLIC_FIELDS if k in configuration
         },
     }
+
+
+def _harness() -> str:
+    """This mind's harness, from the file that is authoritative about it."""
+    return str(runtime_config.load_runtime(MIND_NAME).get("harness") or "")
+
+
+def _skill_failure(exc: Exception) -> JSONResponse:
+    """One mapping for every skills failure, so the console reads one shape."""
+    if isinstance(exc, skills_sync.SkillUnavailable):
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    if isinstance(exc, skills_sync.SkillError):
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    if isinstance(exc, OSError):
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    # A malformed runtime.yaml reaches here as a bare ValueError, and a bare
+    # 500 with FastAPI's own body tells the console nothing.
+    return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/skills")
+async def get_skills(request: Request):
+    """Every skill this mind knows, repo side and installed side together.
+
+    The console cannot see either directory — a mind on another machine has
+    no bind mount to offer — so the mind reports both and the console just
+    renders the pair.
+
+    Guarded like the writes: this returns the full text of every skill the
+    mind runs, and the port is reachable from anywhere on the LAN.
+    """
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        harness = _harness()
+        return {
+            "harness": skills_sync.harness_directory(harness),
+            "skills": [pair.as_dict() for pair in skills_sync.list_skills(harness)],
+        }
+    except (ValueError, OSError) as exc:
+        return _skill_failure(exc)
+
+
+@app.get("/skills/{name}/diff")
+async def get_skill_diff(request: Request, name: str):
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        return {"name": name, "diff": skills_sync.diff_skill(_harness(), name)}
+    except (ValueError, OSError) as exc:
+        return _skill_failure(exc)
+
+
+@app.post("/skills/{name}/install")
+async def post_skill_install(request: Request, name: str):
+    """Copy the repo's version onto this mind — apply and revert alike."""
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        # Off the event loop: this loop also carries the Telegram bot and
+        # every pty heartbeat, and a directory copy is not instant.
+        pair = await asyncio.to_thread(skills_sync.install_skill, _harness(), name)
+    except (ValueError, OSError) as exc:
+        return _skill_failure(exc)
+    log_event(log, "mind.skill.installed", mind_id=MIND_ID, skill=name)
+    return {"saved": True, "skill": pair.as_dict()}
+
+
+@app.post("/skills/{name}/write-back")
+async def post_skill_write_back(request: Request, name: str):
+    """Copy this mind's version into its repo checkout, uncommitted."""
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        pair = await asyncio.to_thread(skills_sync.write_back_skill, _harness(), name)
+    except (ValueError, OSError) as exc:
+        return _skill_failure(exc)
+    log_event(log, "mind.skill.written_back", mind_id=MIND_ID, skill=name)
+    return {"saved": True, "skill": pair.as_dict()}
+
+
+@app.delete("/skills/{name}")
+async def delete_skill(request: Request, name: str):
+    """Remove this mind's copy. The repo keeps whatever it had."""
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        await asyncio.to_thread(skills_sync.remove_skill, _harness(), name)
+    except (ValueError, OSError) as exc:
+        return _skill_failure(exc)
+    log_event(log, "mind.skill.removed", mind_id=MIND_ID, skill=name)
+    return {"removed": True, "name": name}
 
 
 @app.get("/sessions")

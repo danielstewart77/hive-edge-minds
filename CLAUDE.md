@@ -225,6 +225,55 @@ is no split-file equivalent of `CLAUDE.local.md` at the repo root; a codex
 mind's per-install notes go in `$CODEX_HOME/AGENTS.md`, which codex loads
 alongside the repo file.
 
+### Skill sync
+
+A skill exists twice: `specs/skills/<harness>/` is the tracked source that
+travels with a clone, split into `claude/` and `codex/` subdirectories
+because Codex honours a subset of Claude's frontmatter — the files could be
+shared, but writing them separately keeps each one honest about what its
+harness actually reads. The harness reads a different directory entirely
+(`$CLAUDE_CONFIG_DIR/skills` or `$CODEX_HOME/skills`), and that installed
+copy is the one that runs. Nothing keeps the two in step, so a mind drifts
+from the repo the moment anyone edits a skill in place — a feature, since
+that is how a mind gets a skill tuned to its own job.
+
+`skills_sync.py` is the mind's own view of both sides, since only the mind's
+own filesystem can see both. `mind_server.py` exposes it as `GET /skills`
+(one row per skill, reporting `same` / `differs` / `not_installed` /
+`local_only` / `unreadable`), `GET /skills/{name}/diff` (unified diff, repo
+against installed), `POST /skills/{name}/install` (copy repo onto mind —
+apply and revert are the same operation), `POST /skills/{name}/write-back`
+(copy mind onto repo; nothing is committed, the write lands in a working
+tree still needing review and push), and `DELETE /skills/{name}` (remove the
+mind's copy only). Same shape as `runtime.yaml`'s registration: a container,
+a bare-metal mind, and a mind on another machine are one code path because
+the mind reports its own state rather than a bind mount reaching in.
+
+Every route is admin-guarded, reads included: the listing returns the full
+text of every skill the mind runs, on a port reachable across the LAN.
+
+State is a hash of the whole skill directory, not of `SKILL.md`. A skill is
+a directory — references, scripts and templates travel with the markdown,
+and a copy moves all of it — so comparing only the markdown would call a
+skill synced while its scripts had drifted, and the console offers no action
+on a synced row. For the same reason `unreadable` is its own state rather
+than folding into "absent": the remedy offered for absence is to overwrite
+the directory, and doing that to a skill that is merely unreadable destroys
+it. A directory the harness cannot list raises rather than returning empty,
+because "this mind has no skills" is a sentence the console will otherwise
+state as fact.
+
+Copies preserve symlinks and refuse a tree past `MAX_SKILL_BYTES`.
+Dereferencing turns a skill carrying a virtualenv into hundreds of megabytes
+of materialised interpreter, which a `venv/` gitignore then hides from `git
+status` entirely. Staging is a unique temporary directory inside the target,
+so two writers sharing one skills directory cannot delete each other's
+staging mid-copy and each report success over a truncated tree.
+
+What the harness does with a newly-written skill is the harness's business.
+This machinery copies a directory into the one the harness reads; it makes
+no claim about when that skill becomes loadable.
+
 ## Identity convention
 
 | Variable | Purpose |
