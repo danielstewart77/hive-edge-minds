@@ -11,7 +11,7 @@ Harvest what this session learned, then terminate it. The gateway marks the sess
 1. Harvest. Review the whole conversation and extract every durable fact in three categories: preferences (how the user wants things done), current configuration (settings and facts about systems as they now are), and future configuration (planned or intended changes not yet made). Pipe each fact separately through the remember pipeline:
 
 ```bash
-cat <<'__REMEMBER_INPUT__' | bash ~/.claude/scripts/remember.sh
+cat <<'__REMEMBER_INPUT__' | bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/remember/remember.sh"
 <one fact, verbatim>
 __REMEMBER_INPUT__
 ```
@@ -21,7 +21,6 @@ Skip trivia. An empty category is fine — save nothing rather than padding.
 2. Schedule the kill, detached, so this turn's reply is delivered before the process dies:
 
 ```bash
-set -a; source /opt/hive-edge-minds/.env; set +a
 SID=$(curl -s -H "Authorization: Bearer $COMMS_BEARER_TOKEN" "$COMMS_URL/sessions" | \
   jq -r --arg c "$CLAUDE_CODE_SESSION_ID" '.[] | select(.claude_sid==$c) | .id' | head -1)
 [ -n "$SID" ] && nohup bash -c "sleep 8; curl -s -X DELETE -H \"Authorization: Bearer $COMMS_BEARER_TOKEN\" \"$COMMS_URL/sessions/$SID\"" >/dev/null 2>&1 &
