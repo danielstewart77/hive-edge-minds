@@ -332,6 +332,29 @@ def pty_session_alive(session_id: str) -> bool:
     return _tmux("has-session", "-t", f"={tmux_session_name(session_id)}").returncode == 0
 
 
+def refresh_pty_client(session_id: str) -> bool:
+    """Redraw every attached client of this session's pane, in full.
+
+    tmux paints incrementally, so a scroll leaves most cells to the
+    emulator; where that goes wrong nothing later repairs it, because tmux
+    believes those cells are already correct. `refresh-client` repaints the
+    lot from tmux's own model, which is the copy that stays clean.
+
+    Targeting is by client tty rather than by session — `refresh-client`
+    takes a client, and a session may have none attached, which is not a
+    failure, just nothing to do.
+    """
+    name = tmux_session_name(session_id)
+    listed = _tmux("list-clients", "-t", f"={name}", "-F", "#{client_tty}")
+    if listed.returncode != 0:
+        return False
+    painted = False
+    for tty in listed.stdout.split():
+        if _tmux("refresh-client", "-t", tty).returncode == 0:
+            painted = True
+    return painted
+
+
 def show_pty_notice(session_id: str, text: str, *, hold: bool = False) -> bool:
     """Draw a notice over this session's terminal. False if there isn't one.
 
