@@ -212,6 +212,41 @@ echo "Stamped .env (MIND_NAME, MIND_ID, MIND_SERVER_PORT, HIVE_PROJECT_DIR)"
 [ -f config.yaml ] || cp config.yaml.example config.yaml
 
 # ---------------------------------------------------------------------------
+# 2b. Native skills
+# ---------------------------------------------------------------------------
+# The repo carries the skills a mind cannot be a mind without. The harness
+# reads a different directory entirely, so without this step a fresh clone
+# starts with none of them and the operator has no way to know: a mind with
+# no /remember does not announce that it has no /remember, it just quietly
+# stops remembering.
+#
+# Only skills the mind does not already have are copied. An install that has
+# tuned a skill for its own job keeps it — the console's skill sync is where
+# you compare the two and decide, and clobbering that here would make setup.sh
+# a thing you cannot re-run.
+case "${HARNESS:-claude}" in
+    codex*) SKILL_SRC="specs/skills/codex"; SKILL_DST="${CODEX_HOME:-$HOME/.codex}/skills" ;;
+    *)      SKILL_SRC="specs/skills/claude"; SKILL_DST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" ;;
+esac
+
+if [ -d "$SKILL_SRC" ]; then
+    mkdir -p "$SKILL_DST"
+    installed=0 kept=0
+    for skill in "$SKILL_SRC"/*/; do
+        [ -d "$skill" ] || continue
+        name="$(basename "$skill")"
+        if [ -e "$SKILL_DST/$name" ]; then
+            kept=$((kept + 1))
+            continue
+        fi
+        cp -a "$skill" "$SKILL_DST/$name"
+        installed=$((installed + 1))
+    done
+    echo "Skills: installed $installed into $SKILL_DST, left $kept already present"
+    echo "  (compare and sync the rest from the mind's page in the hive console)"
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Installer
 # ---------------------------------------------------------------------------
 mkdir -p deploy
