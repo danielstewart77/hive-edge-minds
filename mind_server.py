@@ -224,6 +224,7 @@ async def startup_secrets():
     # Terminals outlive their sockets, so something has to collect the ones
     # nobody comes back to.
     asyncio.ensure_future(_reap_idle_ptys())
+    _start_pty_repaint_sweep()
 
 
 @app.get("/health")
@@ -402,6 +403,41 @@ _PTY_MIN_ROWS, _PTY_MAX_ROWS = 5, 200
 # locking a phone, or losing wifi does not destroy an in-flight turn.
 _PTY_IDLE_TIMEOUT_S = float(os.environ.get("PTY_IDLE_TIMEOUT_SECONDS", "3600"))
 _PTY_REAP_INTERVAL_S = 60.0
+
+# A tmux client repaints only the cells tmux believes changed. Shifting the
+# pane up a line is a scroll-region shortcut plus one new bottom row, and
+# everything else is left to the emulator to move; where the emulator gets
+# that wrong, the stale characters survive every later partial paint because
+# tmux has no reason to touch those cells again. tmux's own model stays
+# clean, so asking it to redraw the whole client clears them — which is why
+# resizing the browser window has always fixed this by hand.
+#
+# Off unless a mind asks for it. This treats the symptom on a timer rather
+# than fixing whatever makes the emulator diverge, so it is opted into per
+# install and not inherited by every mind sharing this file.
+_PTY_REPAINT_ENABLED = (
+    os.environ.get("PTY_REPAINT_SWEEP", "").strip().lower() in {"1", "true", "yes", "on"}
+)
+def _repaint_interval_seconds() -> float:
+    """The sweep's period, defaulting rather than refusing to boot.
+
+    Parsed at import, which is before the switch above is consulted, so a
+    typo in this one optional variable would otherwise take down a mind
+    that never asked for the sweep at all.
+    """
+    raw = os.environ.get("PTY_REPAINT_INTERVAL_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else 0.5
+    except ValueError:
+        log.warning("PTY_REPAINT_INTERVAL_SECONDS=%r is not a number — using 0.5s", raw)
+        return 0.5
+    if value <= 0:
+        log.warning("PTY_REPAINT_INTERVAL_SECONDS=%r is not positive — using 0.5s", raw)
+        return 0.5
+    return value
+
+
+_PTY_REPAINT_INTERVAL_S = _repaint_interval_seconds()
 
 # Queue sentinels for the per-attachment output pump.
 _PTY_EOF = object()       # the claude process exited
@@ -606,6 +642,62 @@ async def _reap_idle_ptys() -> None:
                 log.info("Reaping terminal for session %s — unattached for %.0fs",
                          session_id, now - handle.detached_at)
                 _teardown_pty(session_id)
+
+
+def _repaint_attached_ptys() -> int:
+    """Force a full tmux redraw of every terminal a browser tile is watching.
+
+    `handle.queue` is the attachment — the output pump sets it on connect
+    and clears it on disconnect — so it already answers "is anyone looking
+    at this", and an unwatched session is skipped rather than tracked
+    separately. Returns how many were repainted, for the caller's logging.
+    """
+    painted = 0
+    refresh = getattr(impl, "refresh_pty_client", None)
+    if refresh is None:
+        return 0
+    for session_id, handle in list(_ptys.items()):
+        if handle.queue is None:
+            continue
+        try:
+            if refresh(session_id):
+                painted += 1
+        except Exception:
+            # A terminal that has gone away is the reaper's problem, not
+            # this sweep's. Losing one repaint costs half a second of stale
+            # cells; letting it raise costs every repaint after it.
+            log.debug("Repaint sweep failed for session %s", session_id, exc_info=True)
+    return painted
+
+
+async def _sweep_pty_repaints() -> None:
+    """Repaint attached terminals forever, on a fixed interval.
+
+    Deliberately not debounced on output: the pane is never quiet during a
+    turn — the harness spinner repaints continuously — and a turn is exactly
+    when the pane scrolls and the damage accumulates. A quiet-period trigger
+    would wait out the whole turn and fire once it no longer mattered.
+
+    The refresh shells out to tmux, so it runs in a thread; at this interval
+    a blocking call in the loop would stutter the byte pump it exists to
+    keep clean.
+    """
+    while True:
+        await asyncio.sleep(_PTY_REPAINT_INTERVAL_S)
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _repaint_attached_ptys)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Repaint sweep pass failed", exc_info=True)
+
+
+def _start_pty_repaint_sweep():
+    """Start the repaint sweep, or nothing if this mind has not asked for it."""
+    if not _PTY_REPAINT_ENABLED:
+        return None
+    log.info("Terminal repaint sweep on, every %.2fs", _PTY_REPAINT_INTERVAL_S)
+    return asyncio.ensure_future(_sweep_pty_repaints())
 
 
 def _open_pty_session(
