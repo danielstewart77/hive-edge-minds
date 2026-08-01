@@ -274,6 +274,30 @@ What the harness does with a newly-written skill is the harness's business.
 This machinery copies a directory into the one the harness reads; it makes
 no claim about when that skill becomes loadable.
 
+### What the repo ships
+
+`specs/skills/<harness>/` carries the skills without which a mind is not a
+mind: `self-reflect` (identity from the graph), `rotate-session`,
+`end-session`, `save-session`, `remember`, `always-remember` and `memory`.
+Everything else — a host's hardware, a person's projects, one machine's
+integrations — belongs only in the installed directory and never here.
+
+A shipped skill names no mind and no person. It reads `$MIND_NAME`,
+`$MIND_ID` and the lucent and comms variables from the environment the
+service unit already provides, and says "the operator" in prose. Anything
+else is a skill exactly one install can run.
+
+There are no `{{PLACEHOLDER}}` tokens and no install-time substitution step.
+Substitution would leave every installed copy differing from its source
+forever, and the whole point of the sync is that `same` means same.
+
+A skill needing repo content — the data-class specs, a stateless tool —
+resolves it through `HIVE_PROJECT_DIR`, which `setup.sh` stamps into `.env`
+with this checkout's absolute path. A skill needing a helper script carries
+it inside its own directory (`remember/remember.sh`), which works because a
+skill is a directory and the sync copies all of it. A script in a shared
+`scripts/` folder does not travel and is how a skill arrives broken.
+
 ## Identity convention
 
 | Variable | Purpose |

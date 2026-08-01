@@ -202,7 +202,12 @@ stamp_env() { # stamp_env KEY VALUE — replace or append
 stamp_env MIND_NAME "$NAME"
 grep -q "^MIND_ID=.\+" .env || stamp_env MIND_ID "$MIND_ID"
 stamp_env MIND_SERVER_PORT "$PORT"
-echo "Stamped .env (MIND_NAME, MIND_ID, MIND_SERVER_PORT)"
+# Where this checkout lives. Repo-shipped skills carry their own scripts and
+# resolve repo content (data-class specs, tools) through this rather than a
+# path baked in at authoring time — a skill that names one install's
+# directory is a skill no other mind can run.
+stamp_env HIVE_PROJECT_DIR "$(pwd)"
+echo "Stamped .env (MIND_NAME, MIND_ID, MIND_SERVER_PORT, HIVE_PROJECT_DIR)"
 
 [ -f config.yaml ] || cp config.yaml.example config.yaml
 
