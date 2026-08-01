@@ -27,6 +27,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import pty_notice
 import runtime_config
 from hive_logging import configure_logging, install_fastapi_logging, log_event, log_if_slow
 
@@ -1378,6 +1379,52 @@ async def release_session_surface(session_id: str, surface: str):
     return {"session_id": session_id, "surface": surface, "released": released}
 
 
+async def _draw_rotation_recap(session_id: str, last_exchange: dict | None) -> bool:
+    """Replay the last exchange over a just-rotated terminal.
+
+    ``respawn-pane -k`` takes the pane's history with it, so without this the
+    tile comes back blank on a conversation that was mid-flow. Held open
+    until the user dismisses it: it is there to be read, not glimpsed.
+    """
+    if not hasattr(impl, "show_pty_notice"):
+        return False
+    text = pty_notice.render_recap(
+        last_exchange,
+        user_label=os.environ.get("OWNER_NAME", "user"),
+        assistant_label=MIND_NAME,
+    )
+    return bool(
+        await asyncio.to_thread(
+            functools.partial(impl.show_pty_notice, session_id, text, hold=True)
+        )
+    )
+
+
+@app.post("/sessions/{session_id}/pty-notice")
+async def pty_notice_route(session_id: str, request: Request):
+    """Draw a short-lived notice over this session's terminal, if it has one.
+
+    Rotation's own work runs for minutes before the pane is respawned; this
+    is how the gateway says so at the moment it starts, rather than leaving
+    the user to discover it when the screen turns over. Reports
+    ``shown: false`` when nobody has a terminal here, which is the normal
+    answer for a conversation with no tile open.
+    """
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text required"}, status_code=400)
+    if not hasattr(impl, "show_pty_notice"):
+        return {"session_id": session_id, "shown": False}
+
+    shown = await asyncio.to_thread(
+        functools.partial(
+            impl.show_pty_notice, session_id, text, hold=bool(body.get("hold")),
+        )
+    )
+    return {"session_id": session_id, "shown": bool(shown)}
+
+
 @app.post("/sessions/{session_id}/rotate-pty")
 async def rotate_pty(session_id: str, request: Request):
     """Turn a live terminal's conversation over without disturbing the tile.
@@ -1424,6 +1471,13 @@ async def rotate_pty(session_id: str, request: Request):
     )
     if not rotated:
         return {"session_id": session_id, "rotated": False}
+
+    # Drawn here rather than inside either template, so the two harnesses
+    # cannot drift on what a rotated terminal says. After the respawn, not
+    # before: the popup goes up over the successor while it starts, which is
+    # exactly the moment the pane would otherwise be blank. Screen text only
+    # — the successor learns nothing from it the carry-forward didn't carry.
+    await _draw_rotation_recap(session_id, body.get("last_exchange"))
 
     # The pty, its reader task and the attached queue all belong to a tmux
     # client that survived the swap, so the handle carries over untouched —

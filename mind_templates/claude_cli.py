@@ -17,6 +17,8 @@ import termios
 from pathlib import Path
 from typing import Any
 
+import pty_notice
+
 log = logging.getLogger(__name__)
 
 
@@ -330,6 +332,39 @@ def pty_session_alive(session_id: str) -> bool:
     return _tmux("has-session", "-t", f"={tmux_session_name(session_id)}").returncode == 0
 
 
+def show_pty_notice(session_id: str, text: str, *, hold: bool = False) -> bool:
+    """Draw a notice over this session's terminal. False if there isn't one.
+
+    A popup rather than pane output because `claude` runs on the alternate
+    screen — see :mod:`pty_notice`.
+
+    Launched and never waited on. ``display-popup -E`` does not return until
+    the popup closes, so waiting would hold the rotation's HTTP call open for
+    as long as the popup is up: the gateway's request times out, it concludes
+    the terminal is dead and skips writing the new conversation id, and the
+    session is left pointing at the conversation that was just rotated away
+    from. The notice is decoration; it does not get to decide that.
+
+    Best-effort throughout — a notice that cannot be drawn must never take a
+    rotation down with it.
+    """
+    if not text or not pty_session_alive(session_id):
+        return False
+    name = tmux_session_name(session_id)
+    notice_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", "/tmp")) / "rotation-notices"
+    try:
+        body = pty_notice.write_popup_body(notice_dir, name, text)
+        subprocess.Popen(
+            ["tmux", "-L", TMUX_SOCKET, *pty_notice.popup_args(name, body, hold=hold)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        log.exception("Could not draw the rotation notice for session %s", session_id)
+        return False
+    return True
+
+
 def kill_pty_session(session_id: str) -> bool:
     """End the terminal for good. True if there was one to end."""
     name = tmux_session_name(session_id)
@@ -364,7 +399,9 @@ def rotate_pty_session(
 
     ``system_prompt`` is the rotation carry-forward, delivered by
     ``_seeded_pane_command``. Returns False when there was no live terminal
-    to rotate.
+    to rotate. The recap popup the user sees afterwards is drawn by
+    ``mind_server``, through ``show_pty_notice``, so both harnesses show the
+    same thing.
     """
     del kwargs  # unused, kept for call-site symmetry with spawn_pty()
 
