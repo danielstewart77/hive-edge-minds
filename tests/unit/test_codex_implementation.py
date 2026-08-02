@@ -366,6 +366,26 @@ class TestSpawnPty:
         assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "--dangerously-bypass-hook-trust" in cmd
 
+    def test_a_fresh_spawn_carries_the_seed_all_the_way_into_the_pane(
+        self, monkeypatch, tmp_path
+    ):
+        """`mind_server` proves the seed reaches `spawn_pty`'s argument; this
+        proves the adapter does something with it. Codex has no
+        system-prompt flag, so the seed rides in as the positional opening
+        turn — dropping it between the two would leave a rotated
+        conversation opening bare, with nothing failing.
+        """
+        monkeypatch.setattr(impl, "CODEX_HOME", tmp_path)
+        tmux, _, _, _ = _spawned(system_prompt="<soul>carried forward</soul>")
+
+        cmd = tmux.pane_argv
+        assert cmd[:2] == ["/bin/sh", "-c"]
+        seed_file = tmp_path / "rotation-seeds" / "s1.txt"
+        assert seed_file.read_text() == "<soul>carried forward</soul>"
+        assert str(seed_file) in cmd[2]
+        # And it is not left lying around world-readable.
+        assert seed_file.stat().st_mode & 0o077 == 0
+
     def test_refuses_to_spawn_without_a_conversation_id(self):
         with pytest.raises(ValueError, match="no conversation id"):
             impl.spawn_pty(session_id="s1", model="gpt-5.4")

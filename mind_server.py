@@ -221,9 +221,9 @@ async def _register_with_broker():
 async def startup_secrets():
     await _fetch_secrets_on_startup()
     await _register_with_broker()
-    # Terminals outlive their sockets, so something has to collect the ones
-    # nobody comes back to.
-    asyncio.ensure_future(_reap_idle_ptys())
+    # Terminals outlive their sockets, so something has to collect the
+    # entries left behind by a harness that has exited.
+    asyncio.ensure_future(_reap_dead_ptys())
     _start_pty_repaint_sweep()
 
 
@@ -399,9 +399,7 @@ _PTY_CHUNK = 4096
 _PTY_MIN_COLS, _PTY_MAX_COLS = 20, 500
 _PTY_MIN_ROWS, _PTY_MAX_ROWS = 5, 200
 
-# An unattached terminal is kept alive this long so switching browser tiles,
-# locking a phone, or losing wifi does not destroy an in-flight turn.
-_PTY_IDLE_TIMEOUT_S = float(os.environ.get("PTY_IDLE_TIMEOUT_SECONDS", "3600"))
+# How often to collect registry entries for terminals whose harness exited.
 _PTY_REAP_INTERVAL_S = 60.0
 
 # A tmux client repaints only the cells tmux believes changed. Shifting the
@@ -629,19 +627,29 @@ def _teardown_pty(session_id: str) -> bool:
     return True
 
 
-async def _reap_idle_ptys() -> None:
-    """Kill terminals whose `claude` exited, or that nobody came back to."""
+async def _reap_dead_ptys() -> None:
+    """Drop the registry entry for any terminal whose harness has exited.
+
+    Only ever collects what is already gone. A live terminal is ended by an
+    explicit close and by nothing else — being unattached is the normal
+    state between tiles, not evidence of abandonment, and a conversation the
+    user simply walked away from is still theirs when they come back.
+    """
     while True:
         await asyncio.sleep(_PTY_REAP_INTERVAL_S)
-        now = time.time()
-        for session_id, handle in list(_ptys.items()):
-            if not impl.pty_session_alive(session_id):
-                _teardown_pty(session_id)
-            elif (handle.queue is None and handle.detached_at is not None
-                    and now - handle.detached_at > _PTY_IDLE_TIMEOUT_S):
-                log.info("Reaping terminal for session %s — unattached for %.0fs",
-                         session_id, now - handle.detached_at)
-                _teardown_pty(session_id)
+        # One sweep's worth of trouble must not end the sweeps. Liveness and
+        # teardown both shell out to tmux, so a momentarily unavailable
+        # binary or a failed fork raises here — and an unguarded raise ends
+        # the task for the life of the process, after which nothing is ever
+        # reaped again and the failure is invisible.
+        try:
+            for session_id in list(_ptys):
+                if not impl.pty_session_alive(session_id):
+                    _teardown_pty(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Terminal reaper sweep failed")
 
 
 def _repaint_attached_ptys() -> int:
@@ -700,10 +708,77 @@ def _start_pty_repaint_sweep():
     return asyncio.ensure_future(_sweep_pty_repaints())
 
 
+async def _fetch_carry_forward(session_id: str, claude_sid: str) -> str:
+    """The rotation seed comms is still holding for this conversation, if any.
+
+    A terminal rotation composes a carry-forward and hands it to the
+    respawned pane as a system prompt. That copy reaches no transcript and
+    dies with the process, so until the conversation's first turn lands, the
+    row in comms is the only durable record of it. Asking here is what lets a
+    pane that died before that first turn — restart, crash, tab closed and
+    never reopened — come back carrying what the rotation composed.
+
+    Empty string means nothing to apply, which is the ordinary case.
+    """
+    import aiohttp
+
+    comms_url = os.environ.get("COMMS_URL", "").rstrip("/")
+    token = os.environ.get("COMMS_ADMIN_BEARER_TOKEN", "")
+    if not comms_url or not token or not claude_sid:
+        return ""
+    async with aiohttp.ClientSession() as http:
+        async with http.get(
+            f"{comms_url}/sessions/{session_id}/carry-forward",
+            params={"claude_sid": claude_sid},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status >= 400:
+                log.warning("carry-forward lookup for session %s returned %s",
+                            session_id, resp.status)
+                return ""
+            body = await resp.json()
+    return (body or {}).get("carry_forward") or ""
+
+
+async def _open_pty_session_seeded(
+    session_id: str, model: str, resume_sid: str | None, cols: int, rows: int,
+    **kwargs,
+) -> _PtyHandle:
+    """``_open_pty_session``, first re-applying any carry-forward it is owed.
+
+    Losing the seed is bad; refusing to open the terminal is worse. The
+    transcript is the primary recovery path and needs no gateway, so an
+    unreachable comms degrades to an unseeded pane rather than a failed
+    attach.
+
+    A live terminal is not asked about at all. Its harness process is already
+    running, so a seed could only be discarded — and the round trip would sit
+    between the socket's accept and its first painted byte on every reattach,
+    which is the common case. Only a cold open can use an answer, and a cold
+    open is exactly when the wait is worth it.
+    """
+    carry_forward = ""
+    try:
+        if not impl.pty_session_alive(session_id):
+            carry_forward = await _fetch_carry_forward(session_id, resume_sid or "")
+        if carry_forward:
+            log.info("Seeding terminal for session %s with a stored "
+                     "carry-forward (%d chars)", session_id, len(carry_forward))
+    except Exception:
+        log.warning("Could not read a stored carry-forward for session %s",
+                    session_id, exc_info=True)
+        carry_forward = ""
+    return _open_pty_session(
+        session_id, model, resume_sid, cols, rows,
+        system_prompt=carry_forward, **kwargs,
+    )
+
+
 def _open_pty_session(
     session_id: str, model: str, resume_sid: str | None, cols: int, rows: int,
     client_ref: str | None = None, owner_type: str | None = None, owner_ref: str | None = None,
-    harness_sid: str | None = None,
+    harness_sid: str | None = None, system_prompt: str = "",
 ) -> _PtyHandle:
     """Attach this tile to the session's terminal, starting one if needed.
 
@@ -738,6 +813,7 @@ def _open_pty_session(
         owner_type=owner_type,
         owner_ref=owner_ref,
         harness_sid=harness_sid,
+        system_prompt=system_prompt,
     )
     handle.proc = proc
     handle.master_fd = master_fd
@@ -767,10 +843,9 @@ async def attach_pty(
     The terminal is keyed by ``session_id`` and outlives the socket: it runs
     in tmux, so attaching starts a client on the *existing* conversation and
     tmux paints the current screen into it, rather than spawning a second
-    `claude` on the same transcript. Only an explicit kill (or the idle
-    reaper) ends it — so switching tiles mid-turn no longer throws the turn
-    away, and two open tiles can never end up driving each other's
-    conversation.
+    `claude` on the same transcript. Only an explicit kill ends it — so
+    switching tiles mid-turn no longer throws the turn away, and two open
+    tiles can never end up driving each other's conversation.
 
     Independent of the non-interactive stream-json process tracked in
     `_sessions` — the caller (hive-comms) supplies `resume_sid`/`model` as
@@ -814,7 +889,7 @@ async def attach_pty(
 
     cols, rows = _clamp_winsize(cols, rows)
     try:
-        handle = _open_pty_session(
+        handle = await _open_pty_session_seeded(
             session_id, model, resume_sid, cols, rows,
             client_ref=client_ref, owner_type=owner_type, owner_ref=owner_ref,
             harness_sid=harness_sid,

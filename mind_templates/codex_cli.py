@@ -701,8 +701,35 @@ def _capped_seed(system_prompt: str) -> str:
         return system_prompt
     log.warning("Rotation seed of %d chars exceeds the %d-char exec limit — "
                 "keeping the tail", len(system_prompt), MAX_SEED_CHARS)
-    return ("[earlier context omitted: the carry-forward was too large to "
-            "pass to the harness]\n\n" + system_prompt[-MAX_SEED_CHARS:])
+    notice = ("[earlier context omitted: the carry-forward was too large to "
+              "pass to the harness]\n\n")
+    # The notice counts against the same argv entry the seed rides in, so the
+    # tail is trimmed to leave room for it rather than added on top.
+    return notice + system_prompt[-(MAX_SEED_CHARS - len(notice)):]
+
+
+SEED_STALE_AFTER_SECONDS = 3600
+
+
+def _sweep_stale_seeds(seed_dir) -> None:
+    """Delete seed files no pane ever consumed.
+
+    A seed is read and deleted by the pane's own shell, so one still sitting
+    here an hour later belongs to a pane that never started — a tmux failure
+    between the write and the spawn leaves the file behind and nothing else
+    ever collects it. Each one is a plaintext dump of the mind's soul and
+    recent memory, so they do not get to accumulate.
+    """
+    cutoff = time.time() - SEED_STALE_AFTER_SECONDS
+    try:
+        stale = [p for p in seed_dir.glob("*.txt") if p.stat().st_mtime < cutoff]
+    except OSError:
+        return
+    for path in stale:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _seeded_pane_command(
@@ -723,8 +750,10 @@ def _seeded_pane_command(
     system_prompt = _capped_seed(system_prompt)
     seed_dir = CODEX_HOME / "rotation-seeds"
     seed_dir.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_seeds(seed_dir)
     seed_file = seed_dir / f"{seed_key}.txt"
     seed_file.write_text(system_prompt)
+    seed_file.chmod(0o600)
     quoted_seed = shlex.quote(str(seed_file))
     harness = " ".join(shlex.quote(arg) for arg in argv)
     # Read then delete: the seed is one conversation's memory sitting in a
@@ -1013,7 +1042,15 @@ def spawn_pty(
     redeploy onto a fresh volume), in which case it is discarded and
     treated as fresh.
     """
-    del mind_id, kwargs, mcp_config, config_obj  # unused
+    del mind_id, mcp_config, config_obj  # unused
+    # A carry-forward comms is still holding: a rotation seeded this
+    # conversation and no turn ever landed on it, so the seed has to be
+    # applied again or the context the rotation composed is gone. Codex has
+    # no system-prompt flag, so it rides in as the opening turn — the same
+    # channel a rotation uses. Only reaches the pane when there is no live
+    # tmux session, so an ordinary reattach never re-seeds it.
+    system_prompt = kwargs.pop("system_prompt", None) or ""
+    del kwargs  # remainder unused
 
     # A rotation respawns this pane without a registry in hand, so the
     # provider routing is resolved once here and kept for the pane's life.
@@ -1069,7 +1106,9 @@ def spawn_pty(
         # let it mint its own on the user's first turn (see
         # _watch_for_new_thread for why this can't be pre-created).
         before = _existing_rollout_paths() if not thread_id else set()
-        cmd = _terminal_argv(thread_id, provider_args)
+        cmd = _seeded_pane_command(
+            _terminal_argv(thread_id, provider_args), system_prompt, session_id,
+        )
 
         args: list[str] = []
         for option in _TMUX_OPTIONS:

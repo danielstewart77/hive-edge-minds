@@ -6,8 +6,6 @@ Non-secret settings live in `config.yaml`. Copy `config.yaml.example` to get sta
 
 ```yaml
 server_port: 8420
-idle_timeout_minutes: 30
-max_sessions: 10
 default_model: sonnet
 
 providers:
@@ -40,11 +38,15 @@ scheduled_tasks:
 | Field | Default | Description |
 |---|---|---|
 | `server_port` | `8420` | Gateway HTTP port |
-| `idle_timeout_minutes` | `30` | Kill sessions idle longer than this |
-| `max_sessions` | `10` | Maximum concurrent Claude subprocesses |
-| `default_model` | `sonnet` | Model alias to use when none specified |
+| `default_model` | `sonnet` | Model alias offered as the default when none is specified |
 | `providers` | — | Provider configs (see [Providers](providers.md)) |
 | `models` | — | Map of model alias → provider name |
+
+`config.py` also parses `autopilot_guards`, but nothing reads the parsed
+value — a leftover from the retired in-repo gateway, which owned session
+lifetime before that moved to hive-comms. There is no idle timeout to
+configure: a browser terminal is never reaped for inactivity, and ends only
+when it is explicitly closed.
 
 ## Secrets
 

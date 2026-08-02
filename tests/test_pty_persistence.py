@@ -77,7 +77,8 @@ def spawned(monkeypatch, clean_registry):
 
     def _fake_spawn_pty(session_id, model, resume_sid=None, cols=80, rows=24, **kwargs):
         calls.append({"session_id": session_id, "model": model,
-                      "resume_sid": resume_sid, "cols": cols, "rows": rows})
+                      "resume_sid": resume_sid, "cols": cols, "rows": rows,
+                      "system_prompt": kwargs.get("system_prompt", "")})
         master_fd, slave_fd = pty.openpty()
         opened.append((master_fd, slave_fd))
         return _FakeProc(pid=4000 + len(calls)), master_fd
@@ -214,7 +215,7 @@ async def _run_one_reap_pass(monkeypatch) -> None:
     import asyncio
 
     monkeypatch.setattr(mind_server, "_PTY_REAP_INTERVAL_S", 0.01)
-    task = asyncio.ensure_future(mind_server._reap_idle_ptys())
+    task = asyncio.ensure_future(mind_server._reap_dead_ptys())
     await asyncio.sleep(0.05)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
@@ -236,29 +237,27 @@ async def test_reaper_ends_a_terminal_whose_claude_exited(spawned, clean_registr
 
 
 @pytest.mark.asyncio
-async def test_reaper_leaves_a_detached_terminal_inside_its_grace(spawned, clean_registry, monkeypatch):
-    # Detached is the normal state between tiles; only the idle timeout ends it.
+async def test_a_detached_terminal_outlives_any_amount_of_idleness(
+    spawned, clean_registry, monkeypatch
+):
+    """Detached is the normal state between tiles, and it has no deadline.
+
+    A terminal used to be collected after an hour unattached, which meant a
+    conversation could be destroyed by the user's absence alone — including
+    a freshly rotated one whose carry-forward had not yet reached a
+    transcript. Nothing but an explicit close ends a live terminal now, so
+    the length of the gap is not a property the reaper is allowed to read.
+    """
     handle = mind_server._open_pty_session("sess-a", "sonnet", "conv-1", 80, 24)
     mind_server._detach_client(handle)
     handle.queue = None
-    handle.detached_at = mind_server.time.time()
+    handle.detached_at = mind_server.time.time() - (365 * 24 * 60 * 60)
 
     await _run_one_reap_pass(monkeypatch)
 
     assert spawned.killed == []
     assert "sess-a" in clean_registry
-
-
-@pytest.mark.asyncio
-async def test_reaper_ends_a_terminal_nobody_came_back_to(spawned, clean_registry, monkeypatch):
-    handle = mind_server._open_pty_session("sess-a", "sonnet", "conv-1", 80, 24)
-    mind_server._detach_client(handle)
-    handle.queue = None
-    handle.detached_at = mind_server.time.time() - (mind_server._PTY_IDLE_TIMEOUT_S + 1)
-
-    await _run_one_reap_pass(monkeypatch)
-
-    assert spawned.killed == ["sess-a"]
+    assert clean_registry["sess-a"].alive
 
 
 @pytest.mark.asyncio
@@ -282,3 +281,202 @@ async def test_kill_session_still_404s_when_nothing_exists(clean_registry, monke
     result = await mind_server.kill_session("no-such-session")
 
     assert getattr(result, "status_code", None) == 404
+
+
+class TestCarryForwardOnAttach:
+    """A rotation seeds a pane with context that exists nowhere else.
+
+    The seed is a system prompt on one process and a file deleted the instant
+    that process reads it, so it reaches no transcript. Whatever kills the
+    pane before the user's first turn — a restart, a crash, a tab closed and
+    never reopened — used to take the whole carry-forward with it, and the
+    reattach resumed a conversation id with nothing behind it. comms holds
+    the seed on the session row until a turn proves the rotation took; the
+    mind asks for it as it starts the terminal.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_stored_carry_forward_is_applied_to_the_new_terminal(
+        self, spawned, clean_registry, monkeypatch
+    ):
+        async def fetch(session_id, claude_sid):
+            assert (session_id, claude_sid) == ("sess-a", "conv-rotated")
+            return "<soul>carried forward</soul>"
+
+        monkeypatch.setattr(mind_server, "_fetch_carry_forward", fetch)
+        # A cold open: tmux holds no session yet, which is the only case a
+        # stored seed can still be applied to.
+        spawned.live["session"] = False
+
+        await mind_server._open_pty_session_seeded(
+            "sess-a", "opus", "conv-rotated", 80, 24
+        )
+
+        assert spawned[0]["system_prompt"] == "<soul>carried forward</soul>"
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_with_nothing_owed_is_started_unseeded(
+        self, spawned, clean_registry, monkeypatch
+    ):
+        """The ordinary case: no rotation outstanding, or its first turn
+        already landed and the transcript carries the context by itself."""
+        async def fetch(session_id, claude_sid):
+            return ""
+
+        monkeypatch.setattr(mind_server, "_fetch_carry_forward", fetch)
+        # A cold open: tmux holds no session yet, which is the only case a
+        # stored seed can still be applied to.
+        spawned.live["session"] = False
+
+        await mind_server._open_pty_session_seeded("sess-a", "opus", "conv-1", 80, 24)
+
+        assert spawned[0]["system_prompt"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_live_terminal_is_never_asked_for_a_carry_forward(
+        self, spawned, clean_registry, monkeypatch
+    ):
+        """Reattaching to a running pane is the common case, and its harness
+        already holds its context — the answer could only be discarded. Asking
+        anyway puts a gateway round trip between the socket's accept and the
+        terminal's first painted byte, every single time.
+        """
+        asked: list = []
+
+        async def fetch(session_id, claude_sid):
+            asked.append(session_id)
+            return "<soul>should never be applied</soul>"
+
+        monkeypatch.setattr(mind_server, "_fetch_carry_forward", fetch)
+        spawned.live["session"] = True  # tmux already holds this conversation
+
+        await mind_server._open_pty_session_seeded(
+            "sess-a", "opus", "conv-1", 80, 24
+        )
+
+        assert asked == []
+
+    @pytest.mark.asyncio
+    async def test_a_comms_that_cannot_be_reached_still_opens_the_terminal(
+        self, spawned, clean_registry, monkeypatch
+    ):
+        """Losing the seed is bad; refusing to open the terminal is worse.
+
+        The transcript is the primary recovery path and needs no help from
+        comms, so an unreachable gateway degrades to an unseeded pane.
+        """
+        async def fetch(session_id, claude_sid):
+            raise OSError("comms is down")
+
+        monkeypatch.setattr(mind_server, "_fetch_carry_forward", fetch)
+        # A cold open: tmux holds no session yet, which is the only case a
+        # stored seed can still be applied to.
+        spawned.live["session"] = False
+
+        await mind_server._open_pty_session_seeded("sess-a", "opus", "conv-1", 80, 24)
+
+        assert spawned[0]["system_prompt"] == ""
+        assert "sess-a" in clean_registry
+
+
+class TestTheCarryForwardLookupItself:
+    """The client half of the contract, actually executed.
+
+    Every test above monkeypatches `_fetch_carry_forward` out, which is right
+    for them — they are about what the mind does with an answer. But it left
+    the request itself never once made: the URL, the conversation id, the
+    admin header and the unwrap were all only assertions in a docstring. A
+    mind that asked the wrong gateway, dropped the bearer, or read the wrong
+    key would have shipped green.
+    """
+
+    @staticmethod
+    async def _gateway(handler):
+        """A real HTTP server on a real port, speaking the comms route."""
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_get("/sessions/{session_id}/carry-forward", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        return runner, f"http://127.0.0.1:{port}"
+
+    @pytest.mark.asyncio
+    async def test_the_lookup_asks_the_right_question_and_unwraps_the_answer(
+        self, monkeypatch
+    ):
+        from aiohttp import web
+
+        seen = {}
+
+        async def handler(request):
+            seen["path"] = request.path
+            seen["claude_sid"] = request.query.get("claude_sid")
+            seen["auth"] = request.headers.get("Authorization")
+            return web.json_response(
+                {"session_id": "sess-a", "carry_forward": "<soul>carried</soul>"}
+            )
+
+        runner, base = await self._gateway(handler)
+        try:
+            monkeypatch.setenv("COMMS_URL", base + "/")
+            monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin-token")
+
+            got = await mind_server._fetch_carry_forward("sess-a", "conv-rotated")
+        finally:
+            await runner.cleanup()
+
+        assert got == "<soul>carried</soul>"
+        assert seen["path"] == "/sessions/sess-a/carry-forward"
+        # The conversation id is the whole point — a lookup that drops it
+        # would be answered with some other conversation's context.
+        assert seen["claude_sid"] == "conv-rotated"
+        # The route is admin-gated; without this the mind gets a 401 and
+        # silently opens every rotated terminal unseeded.
+        assert seen["auth"] == "Bearer admin-token"
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_is_read_as_nothing_owed_rather_than_raised(
+        self, monkeypatch
+    ):
+        from aiohttp import web
+
+        async def handler(request):
+            return web.json_response({"detail": "nope"}, status=401)
+
+        runner, base = await self._gateway(handler)
+        try:
+            monkeypatch.setenv("COMMS_URL", base)
+            monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "wrong-token")
+
+            assert await mind_server._fetch_carry_forward("sess-a", "conv-1") == ""
+        finally:
+            await runner.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_asked_without_a_gateway_a_token_or_a_conversation(
+        self, monkeypatch
+    ):
+        """Three ways to have no question worth asking. Each must short out
+        before the request, not after — a mind with no admin token would
+        otherwise spend five seconds per terminal open earning a 401."""
+        async def handler(request):  # pragma: no cover - must never run
+            raise AssertionError("the lookup should not have been attempted")
+
+        runner, base = await self._gateway(handler)
+        try:
+            monkeypatch.setenv("COMMS_URL", base)
+            monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin-token")
+            assert await mind_server._fetch_carry_forward("sess-a", "") == ""
+
+            monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "")
+            assert await mind_server._fetch_carry_forward("sess-a", "conv-1") == ""
+
+            monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin-token")
+            monkeypatch.setenv("COMMS_URL", "")
+            assert await mind_server._fetch_carry_forward("sess-a", "conv-1") == ""
+        finally:
+            await runner.cleanup()
