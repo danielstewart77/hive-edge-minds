@@ -162,8 +162,8 @@ async def _fetch_secrets_on_startup():
         log.debug("Could not connect to NS for secrets (NS may not be ready yet)")
 
 
-async def _register_with_broker():
-    """Publish this mind's runtime.yaml to the broker's registry.
+async def _register_with_broker() -> str:
+    """Publish this mind's runtime.yaml to the broker's registry, once.
 
     Every boot, not just the install. `register_mind` upserts on `mind_id`,
     so this is the reconciliation step that makes the file authoritative:
@@ -173,23 +173,29 @@ async def _register_with_broker():
     restart that follows it.
 
     Never fatal. A mind that can't reach comms still serves its own
-    sessions, and the next boot re-registers.
+    sessions. Returns the outcome so `_registration_loop` can decide what a
+    failure means — "registered", "retry" (unreachable or broker-side
+    error), "rejected" (the broker refused the payload or the token; trying
+    again sends the same thing), or "skipped" (not configured to register).
     """
     import aiohttp
 
     comms_url = os.environ.get("COMMS_URL", "").rstrip("/")
     token = os.environ.get("COMMS_ADMIN_BEARER_TOKEN", "")
     if not comms_url or not token:
-        log.debug("No COMMS_URL/admin token — skipping broker self-registration")
-        return
+        log.info("No COMMS_URL/admin token — skipping broker self-registration")
+        return "skipped"
     try:
         payload = runtime_config.registration_payload(MIND_NAME)
     except ValueError as exc:
+        # A file mid-write or momentarily unreadable must not end
+        # registration for the process lifetime; only absent comms
+        # configuration is a decision rather than a moment.
         log_event(
-            log, "mind.register.skipped", level=logging.WARNING,
+            log, "mind.register.failed", level=logging.WARNING,
             mind_id=MIND_ID, error=str(exc),
         )
-        return
+        return "retry"
     try:
         async with aiohttp.ClientSession() as http:
             async with http.post(
@@ -197,30 +203,80 @@ async def _register_with_broker():
                 json=payload,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=aiohttp.ClientTimeout(total=10),
+                allow_redirects=False,
             ) as resp:
-                if resp.status >= 400:
+                # Only a 2xx is a registration. aiohttp would otherwise
+                # follow a redirect, downgrade the POST to a GET against
+                # the (unauthenticated) listing route, and report the 200
+                # as success while registering nothing.
+                if resp.status >= 500:
                     log_event(
                         log, "mind.register.failed", level=logging.WARNING,
                         mind_id=MIND_ID, status=resp.status,
                     )
-                    return
+                    return "retry"
+                if not 200 <= resp.status < 300:
+                    log_event(
+                        log, "mind.register.rejected", level=logging.WARNING,
+                        mind_id=MIND_ID, status=resp.status,
+                    )
+                    return "rejected"
     except Exception as exc:
         log_event(
             log, "mind.register.failed", level=logging.WARNING,
             mind_id=MIND_ID, error_type=type(exc).__name__,
         )
-        return
+        return "retry"
     log_event(
         log, "mind.registered", mind_id=MIND_ID, mind_name=payload["name"],
         model=payload["model"], harness=payload["harness"],
         gateway_url=payload["gateway_url"],
     )
+    return "registered"
+
+
+async def _registration_loop(
+    *,
+    initial_delay: float = 1.0,
+    max_delay: float = 60.0,
+    heartbeat: float = 300.0,
+    sleep=asyncio.sleep,
+) -> None:
+    """Keep this mind registered for as long as it runs.
+
+    A bare-metal mind boots with systemd and wins the race against the
+    compose stack on every reboot; a single registration attempt against a
+    comms container that isn't up yet leaves the mind off the registry until
+    someone restarts it. Unreachable or erroring comms is retried with
+    doubling delays capped at `max_delay`; an outright rejection stops the
+    loop, because resending an unacceptable payload forever is noise, not
+    persistence.
+
+    After a success the loop keeps going as a heartbeat: re-registering
+    every `heartbeat` seconds converges a broker row that was rebuilt or
+    edited out from under the file.
+    """
+    delay = initial_delay
+    while True:
+        outcome = await _register_with_broker()
+        if outcome in ("rejected", "skipped"):
+            log_event(
+                log, "mind.register.loop_stopped", level=logging.WARNING,
+                mind_id=MIND_ID, outcome=outcome,
+            )
+            return
+        if outcome == "registered":
+            delay = initial_delay
+            await sleep(heartbeat)
+        else:
+            await sleep(delay)
+            delay = min(delay * 2, max_delay)
 
 
 @app.on_event("startup")
 async def startup_secrets():
     await _fetch_secrets_on_startup()
-    await _register_with_broker()
+    asyncio.ensure_future(_registration_loop())
     # Terminals outlive their sockets, so something has to collect the
     # entries left behind by a harness that has exited.
     asyncio.ensure_future(_reap_dead_ptys())

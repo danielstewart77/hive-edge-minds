@@ -135,7 +135,7 @@ class TestBrokerSelfRegistration:
             async def __aexit__(self, *exc):
                 return False
 
-            def post(self, url, json, headers, timeout):
+            def post(self, url, json, headers, timeout, **kwargs):
                 posted.update(url=url, payload=json, headers=headers)
                 return _Response()
 
@@ -174,7 +174,7 @@ class TestBrokerSelfRegistration:
             async def __aexit__(self, *exc):
                 return False
 
-            def post(self, url, json, headers, timeout):
+            def post(self, url, json, headers, timeout, **kwargs):
                 posted.update(payload=json)
                 return _Response()
 
@@ -212,3 +212,174 @@ class TestSpawnRequiresAModel:
         )
         assert response.status_code == 400
         assert "model" in response.json()["error"]
+
+
+class _StatusResponse:
+    def __init__(self, status):
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _session_returning(statuses):
+    """An aiohttp.ClientSession stand-in answering from a status script.
+
+    A status of None raises OSError instead — an unreachable broker. The
+    last entry repeats once the script runs out.
+    """
+    script = list(statuses)
+    last = script[-1] if script else 200
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def post(self, url, json, headers, timeout, **kwargs):
+            status = script.pop(0) if script else last
+            if status is None:
+                raise OSError("connection refused")
+            return _StatusResponse(status)
+
+    return _Session
+
+
+class TestRegistrationLoop:
+    """One test per shipped requirement; the loop is the boot-race fix."""
+
+    @pytest.fixture(autouse=True)
+    def _comms_env(self, monkeypatch):
+        monkeypatch.setenv("COMMS_URL", "http://comms:8426")
+        monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin")
+
+    async def test_registers_once_the_broker_comes_up_without_a_restart(self, server):
+        """Req 1: boot wires the loop in; attempts fail while comms is down
+        and succeed the moment it returns — waiting retry delays, not a
+        restart, in between."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        # The race fix is dead code unless startup actually schedules the
+        # loop — deleting the ensure_future line must fail this test.
+        scheduled = AsyncMock()
+        with patch.object(server, "_registration_loop", scheduled), \
+                patch.object(server, "_fetch_secrets_on_startup", AsyncMock()):
+            with TestClient(server.app):
+                pass
+        assert scheduled.called, "startup never starts the registration loop"
+
+        outcomes = []
+        sleeps = []
+        real = server._register_with_broker
+
+        async def recording_register():
+            outcome = await real()
+            outcomes.append(outcome)
+            return outcome
+
+        async def recording_sleep(seconds):
+            sleeps.append(seconds)
+            if "registered" in outcomes:
+                raise asyncio.CancelledError
+
+        with patch("aiohttp.ClientSession", _session_returning([None, None, 200])), \
+                patch.object(server, "_register_with_broker", recording_register):
+            with pytest.raises(asyncio.CancelledError):
+                await server._registration_loop(sleep=recording_sleep)
+
+        assert outcomes == ["retry", "retry", "registered"]
+        # Retry waits between the failures, heartbeat wait after the success
+        # — a loop that ignores outcomes sleeps the wrong sequence.
+        assert sleeps == [1.0, 2.0, 300.0]
+
+    async def test_retry_delays_grow_and_never_exceed_sixty_seconds(self, server):
+        """Req 2: backoff doubles per failure and caps at 60s."""
+        import asyncio
+
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) >= 9:
+                raise asyncio.CancelledError
+
+        with patch("aiohttp.ClientSession", _session_returning([None])):
+            with pytest.raises(asyncio.CancelledError):
+                await server._registration_loop(sleep=fake_sleep)
+
+        assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0]
+
+    async def test_a_rejected_registration_stops_and_is_logged_once(
+        self, server, caplog
+    ):
+        """Req 3: a 4xx means the payload or token is wrong; retrying resends it."""
+        import logging
+
+        caplog.set_level(logging.WARNING)
+        with patch("aiohttp.ClientSession", _session_returning([401])):
+            await server._registration_loop(sleep=None)
+            # returns rather than looping — a looping loop would hang here
+
+        rejected = [r for r in caplog.records if "mind.register.rejected" in r.message]
+        assert len(rejected) == 1
+
+    async def test_a_broker_server_error_is_retried(self, server):
+        """Req 4: a 5xx is the broker's problem, not the payload's."""
+        import asyncio
+
+        outcomes = []
+        real = server._register_with_broker
+
+        async def recording_register():
+            outcome = await real()
+            outcomes.append(outcome)
+            return outcome
+
+        sleeps = []
+
+        async def recording_sleep(seconds):
+            sleeps.append(seconds)
+            if "registered" in outcomes:
+                raise asyncio.CancelledError
+
+        with patch("aiohttp.ClientSession", _session_returning([503, 200])), \
+                patch.object(server, "_register_with_broker", recording_register):
+            with pytest.raises(asyncio.CancelledError):
+                await server._registration_loop(sleep=recording_sleep)
+
+        assert outcomes == ["retry", "registered"]
+        assert sleeps == [1.0, 300.0]
+
+    async def test_the_heartbeat_reregisters_after_five_minutes(self, server):
+        """Req 5: success is followed by another registration a heartbeat later."""
+        import asyncio
+
+        registrations = 0
+        sleeps = []
+        real = server._register_with_broker
+
+        async def recording_register():
+            nonlocal registrations
+            outcome = await real()
+            if outcome == "registered":
+                registrations += 1
+            return outcome
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            if registrations >= 2:
+                raise asyncio.CancelledError
+
+        with patch("aiohttp.ClientSession", _session_returning([200])), \
+                patch.object(server, "_register_with_broker", recording_register):
+            with pytest.raises(asyncio.CancelledError):
+                await server._registration_loop(sleep=fake_sleep)
+
+        assert registrations == 2
+        assert sleeps[0] == 300.0
