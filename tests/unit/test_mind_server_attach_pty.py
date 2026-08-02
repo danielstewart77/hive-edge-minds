@@ -18,6 +18,11 @@ def _mock_mind_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MIND_ID", "ada")
     monkeypatch.setenv("MIND_NAME", "ada")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    # A mind's own service environment names a real gateway, so without this
+    # the carry-forward lookup on attach reaches the operator's live comms
+    # container from a unit test.
+    monkeypatch.delenv("COMMS_URL", raising=False)
+    monkeypatch.delenv("COMMS_ADMIN_BEARER_TOKEN", raising=False)
 
 
 @pytest.fixture()

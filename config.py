@@ -41,7 +41,6 @@ class AutopilotGuards:
 class HiveMindConfig:
     # Gateway server
     server_port: int = 8420
-    idle_timeout_minutes: int = 30
     default_model: str = "sonnet"
 
     # Autopilot guard rails
@@ -73,7 +72,6 @@ class HiveMindConfig:
 
         return cls(
             server_port=_yaml_config.get("server_port", 8420),
-            idle_timeout_minutes=_yaml_config.get("idle_timeout_minutes", 30),
             default_model=_yaml_config.get("default_model", "sonnet"),
             autopilot_guards=guards,
             providers=_yaml_config.get("providers", {}),

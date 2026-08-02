@@ -2,7 +2,6 @@
 # Copy to config.yaml. Non-secret settings only — secrets stay in .env.
 
 server_port: 8421
-idle_timeout_minutes: 30
 default_model: sonnet
 
 # Autopilot guard rails

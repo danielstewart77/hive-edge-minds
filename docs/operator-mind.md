@@ -138,7 +138,6 @@ Minimum viable config:
 ```yaml
 server_port: 8431                # legacy gateway port (no longer in-process; kept for future use)
 mind_server_port: 8421
-idle_timeout_minutes: 30
 default_model: opus
 
 providers:

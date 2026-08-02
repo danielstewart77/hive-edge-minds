@@ -169,6 +169,53 @@ class TestSpawnPty:
         assert popen.call_args.kwargs["env"]["OWNER_TYPE"] == "web"
         assert popen.call_args.kwargs["env"]["OWNER_REF"] == "u1"
 
+    def test_rotation_respawns_the_pane_with_the_carry_forward(
+        self, monkeypatch, tmp_path
+    ):
+        """The whole point of a rotation is that the successor conversation
+        starts holding what the old one knew. Drop the seed here and the
+        rotation still "succeeds" — same pane, same session, same id — with
+        every minute of composed context thrown away and nothing to say so.
+        """
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        tmux = _TmuxRecorder()
+        with patch("mind_templates.claude_cli._tmux", tmux), \
+             patch("mind_templates.claude_cli.pty_session_alive", return_value=True):
+            assert implementation.rotate_pty_session(
+                session_id="s1", new_claude_sid="conv-4", model="sonnet",
+                system_prompt="<soul>the summary</soul>", client_ref="term-1",
+            ) is True
+
+        respawn = next(c for c in tmux.calls if c[0] == "respawn-pane")
+        cmd = respawn[respawn.index("--") + 1:]
+        assert cmd[:2] == ["/bin/sh", "-c"]
+        seed_file = tmp_path / "rotation-seeds" / "conv-4.txt"
+        assert seed_file.read_text() == "<soul>the summary</soul>"
+        assert str(seed_file) in cmd[2]
+
+    def test_a_fresh_spawn_carries_the_seed_all_the_way_into_the_pane(
+        self, monkeypatch, tmp_path
+    ):
+        """`mind_server` proves the seed reaches `spawn_pty`'s argument; this
+        proves the adapter does something with it. Between the two is where a
+        harness can accept a carry-forward and quietly drop it, leaving a
+        rotated conversation to open with none of the context that was
+        composed for it and every test still green.
+        """
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        tmux, _, _ = _spawned(system_prompt="<soul>carried forward</soul>")
+
+        # The seed travels in a file, never in the tmux command — so what the
+        # pane is handed is a shell that reads it back.
+        cmd = tmux.pane_argv
+        assert cmd[:2] == ["/bin/sh", "-c"]
+        assert "--append-system-prompt" in cmd[2]
+        seed_file = tmp_path / "rotation-seeds" / "conv-1.txt"
+        assert seed_file.read_text() == "<soul>carried forward</soul>"
+        assert str(seed_file) in cmd[2]
+        # And it is not left lying around world-readable.
+        assert seed_file.stat().st_mode & 0o077 == 0
+
     def test_missing_rotation_env_sets_nothing(self):
         tmux, _, _ = _spawned()
 
