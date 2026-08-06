@@ -64,6 +64,24 @@ class TestGetRuntime:
 
 
 class TestPatchRuntime:
+    def test_writes_the_provider_the_console_chose(self, client, mind_files):
+        """The route, not just the writer underneath it.
+
+        The console picks a provider and a model together, and a route that
+        accepted the provider and dropped it would leave this mind pointed at
+        an upstream that does not host its model — with the reply still saying
+        saved.
+        """
+        response = client.patch(
+            "/runtime",
+            json={"default_model": "qwen35-131k", "provider": "ollama"},
+            headers={"Authorization": "Bearer s3cret"},
+        )
+        assert response.status_code == 200
+        written = mind_files.read_text()
+        assert "provider: ollama" in written
+        assert "default_model: qwen35-131k" in written
+
     def test_writes_the_model_to_disk(self, client, mind_files):
         response = client.patch(
             "/runtime",

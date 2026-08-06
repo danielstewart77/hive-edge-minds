@@ -57,10 +57,14 @@ stream-json path (claude).
 
 There are two templates, not one per harness-and-provider pair. The provider
 is a separate axis, named in `runtime.yaml` and resolved through
-`config.yaml`'s `providers:` block: `ModelRegistry.get_provider(model)` returns
-the env overrides each spawn applies. An Ollama-backed mind is the same
-harness with a different provider, and keeps its browser terminal — which is
-why no `*_ollama` template exists to lose it.
+`config.yaml`'s `providers:` block: `ProviderRegistry.get_provider(model)`
+returns the env overrides each spawn applies. The model argument is accepted
+and ignored — the provider comes from the mind's own `runtime.yaml`, never
+from the model name, since a model named by its inference-proxy deployment
+name (`claude-opus-5`, not `opus`) carries no vendor hint a short-alias
+lookup could key on. An Ollama-backed mind is the same harness with a
+different provider, and keeps its browser terminal — which is why no
+`*_ollama` template exists to lose it.
 
 - `claude_cli` — long-lived `claude --stream-json` per session, plus
   `spawn_pty` for the browser terminal. Ollama needs nothing beyond the
@@ -103,13 +107,24 @@ an upsert on `mind_id`), which is what makes the file authoritative rather
 than an install-time artifact. Registration failure is logged, never fatal.
 
 `GET /runtime` reports the allowlisted configuration; `PATCH /runtime` sets
-`default_model` by rewriting that one line in place (line substitution, not
-a YAML round-trip — a dump would strip the comments). The write is guarded
+`default_model` and, when given, `provider` by rewriting each field's line in
+place (line substitution, not a YAML round-trip — a dump would strip the
+comments). Both fields land in one write, so a mind is never left holding a
+provider that doesn't host the model beside it. The write is guarded
 by `MIND_ADMIN_TOKEN`, falling back to `COMMS_ADMIN_BEARER_TOKEN`; neither
 configured means the route refuses with 503 rather than opening. The hive
 console uses these two routes for every mind — a container in the stack, a
 bare-metal mind here, or a mind on another machine — writing the file first
 and the broker row second, so a restart can't undo the edit.
+
+`GET /models` is the admin-guarded counterpart the console's picker reads:
+`models_api.build_catalog` relays the inference proxy's own listing for this
+mind's proxy credential, on the endpoint that identifies its harness
+(`/v1/anthropic/models` for claude, `/v1/models` for codex), so what the
+picker offers is exactly what the mind's key may address — no vendor
+mapping lives on this side of the call. An unreachable proxy yields an empty
+list rather than raising, since the console needs "nothing offered" and
+"the mind is down" to read differently.
 
 The model itself is never defaulted. A spawn or an `attach-pty` that arrives
 without one is refused: comms resolves it per session from the broker row,
