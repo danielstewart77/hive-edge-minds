@@ -138,15 +138,10 @@ Minimum viable config:
 ```yaml
 server_port: 8431                # legacy gateway port (no longer in-process; kept for future use)
 mind_server_port: 8421
-default_model: opus
+default_model: claude-opus-5
 
 providers:
   anthropic: {}
-
-models:
-  sonnet: anthropic
-  opus: anthropic
-  haiku: anthropic
 
 # Telegram bot — required when wiring the Telegram surface (§5).
 # Empty list = bot rejects every incoming message.

@@ -50,7 +50,6 @@ class HiveMindConfig:
     providers: dict = field(default_factory=dict)
 
     # Static model -> provider mappings
-    models: dict[str, str] = field(default_factory=dict)
 
     # Telegram bot
     telegram_allowed_users: list[int] = field(default_factory=list)
@@ -75,7 +74,6 @@ class HiveMindConfig:
             default_model=_yaml_config.get("default_model", "sonnet"),
             autopilot_guards=guards,
             providers=_yaml_config.get("providers", {}),
-            models=_yaml_config.get("models", {}),
             telegram_allowed_users=_yaml_config.get("telegram_allowed_users", []),
             telegram_owner_chat_id=_yaml_config.get("telegram_owner_chat_id", 0),
             discord_allowed_users=_yaml_config.get("discord_allowed_users", []),

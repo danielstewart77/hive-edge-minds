@@ -26,17 +26,11 @@ providers:
       ANTHROPIC_AUTH_TOKEN: "ollama"
       ANTHROPIC_BASE_URL: "http://<ollama-host>:11434"
     api_base: "http://<ollama-host>:11434"
-
-models:
-  sonnet: anthropic      # claude-sonnet-4-6 via Anthropic
-  opus: anthropic        # claude-opus-4-6 via Anthropic
-  haiku: anthropic       # claude-haiku-4-5 via Anthropic
-  # Ollama models are auto-discovered at startup and added here dynamically
 ```
 
 ### Per-Process Env Isolation
 
-Environment overrides are injected **per subprocess** — never globally. The gateway reads the provider config for the requested model, builds an env dict, and passes it to `subprocess.Popen`. The parent process environment is never mutated. This means:
+Environment overrides are injected **per subprocess** — never globally. A spawn reads the provider this mind declares in its own `runtime.yaml`, looks its overrides up here, builds an env dict, and passes it to `subprocess.Popen`. The model name is not consulted: which upstream serves a model is the inference proxy's business, decided per request from the model name. The parent process environment is never mutated. This means:
 
 - Anthropic and Ollama sessions can run concurrently without interfering
 - A compromised or misbehaving subprocess cannot poison the gateway's environment

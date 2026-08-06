@@ -155,7 +155,7 @@ class TestBrokerSelfRegistration:
     async def test_registers_an_edited_model_after_a_restart(self, server, monkeypatch):
         monkeypatch.setenv("COMMS_URL", "http://comms:8426")
         monkeypatch.setenv("COMMS_ADMIN_BEARER_TOKEN", "admin")
-        runtime_config.update_default_model("ada", "opus")
+        runtime_config.update_runtime_fields("ada", {"default_model": "opus"})
         posted = {}
 
         class _Response:

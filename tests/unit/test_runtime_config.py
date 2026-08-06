@@ -52,14 +52,14 @@ class TestLoad:
             runtime_config.load_runtime("atlas")
 
 
-class TestUpdateDefaultModel:
+class TestUpdateRuntimeFields:
     def test_writes_the_new_model(self, mind):
-        configuration = runtime_config.update_default_model("atlas", "opus")
+        configuration = runtime_config.update_runtime_fields("atlas", {"default_model": "opus"})
         assert configuration["default_model"] == "opus"
         assert runtime_config.load_runtime("atlas")["default_model"] == "opus"
 
     def test_preserves_comments_and_other_fields(self, mind):
-        runtime_config.update_default_model("atlas", "opus")
+        runtime_config.update_runtime_fields("atlas", {"default_model": "opus"})
         text = mind.read_text()
         assert "# The model every new session starts on." in text
         assert "soul_file: souls/atlas.md" in text
@@ -67,22 +67,33 @@ class TestUpdateDefaultModel:
 
     def test_accepts_an_ollama_tag(self, mind):
         model = "qwen3:30b-a3b-instruct-2507-q4_K_M"
-        assert runtime_config.update_default_model("atlas", model)["default_model"] == model
+        assert runtime_config.update_runtime_fields("atlas", {"default_model": model})["default_model"] == model
 
     @pytest.mark.parametrize("model", ["", "opus; rm -rf /", "opus\nname: evil"])
     def test_rejects_an_unusable_model_name(self, mind, model):
         with pytest.raises(ValueError):
-            runtime_config.update_default_model("atlas", model)
+            runtime_config.update_runtime_fields("atlas", {"default_model": model})
         assert runtime_config.load_runtime("atlas")["default_model"] == "sonnet"
 
     def test_file_without_the_field_is_left_alone(self, mind):
         mind.write_text("name: atlas\nharness: claude_cli\n")
         with pytest.raises(ValueError):
-            runtime_config.update_default_model("atlas", "opus")
+            runtime_config.update_runtime_fields("atlas", {"default_model": "opus"})
         assert "default_model" not in mind.read_text()
 
+    def test_writes_the_provider_alongside_the_model(self, mind):
+        """One write, so a mind never holds a provider that lacks its model."""
+        saved = runtime_config.update_runtime_fields(
+            "atlas", {"provider": "ollama", "default_model": "qwen35-131k"}
+        )
+        assert (saved["provider"], saved["default_model"]) == ("ollama", "qwen35-131k")
+
+    def test_refuses_a_field_outside_the_writable_set(self, mind):
+        with pytest.raises(ValueError):
+            runtime_config.update_runtime_fields("atlas", {"gateway_url": "http://x"})
+
     def test_leaves_no_temporary_files_behind(self, mind):
-        runtime_config.update_default_model("atlas", "opus")
+        runtime_config.update_runtime_fields("atlas", {"default_model": "opus"})
         assert [p.name for p in mind.parent.iterdir()] == ["runtime.yaml"]
 
 
@@ -97,7 +108,7 @@ class TestRegistrationPayload:
         }
 
     def test_tracks_an_edit(self, mind):
-        runtime_config.update_default_model("atlas", "opus")
+        runtime_config.update_runtime_fields("atlas", {"default_model": "opus"})
         assert runtime_config.registration_payload("atlas")["model"] == "opus"
 
     def test_incomplete_file_raises_rather_than_registering_a_half_mind(self, mind):

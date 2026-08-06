@@ -1,17 +1,18 @@
-"""Model → provider resolution.
+"""The provider a spawn runs against.
 
-Static aliases (sonnet/opus/haiku) map to Anthropic via ``config.models``.
-Anything else falls through to the Ollama provider if one is configured.
-``mind_server`` constructs the registry from ``config.yaml`` at session
-spawn so the subprocess inherits the provider's env overrides
-(ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, etc.).
+A mind declares its provider in its own ``runtime.yaml``; ``config.yaml``
+holds the env overrides each provider needs (``ANTHROPIC_BASE_URL``,
+``ANTHROPIC_AUTH_TOKEN``). ``mind_server`` pairs the two at spawn so the
+subprocess inherits the right upstream.
 
-The live-discovery model list (``list_models`` / ``_fetch_ollama_models``
-+ 60 s cache) lived here before Phase B7 — it was only consumed by the
-A5-deleted ``/models`` gateway endpoint. The replacement, when wired,
-will live in hive-tools so that hosts running Ollama in a container, on
-the host, or against an external instance all answer the same query
-shape.
+The provider does not come from the model name. It used to: three short
+aliases mapped to Anthropic and every other name fell through to Ollama,
+which meant that naming a model by the deployment name the inference proxy
+actually routes on — ``claude-opus-5`` rather than ``opus`` — silently
+pointed a Claude mind at the local Ollama host. Which upstream serves a model
+is the proxy's business, decided per request from the model name; all this
+side has to know is which credential and base URL to hand the harness, and
+the mind's own file is the honest answer to that.
 """
 
 from dataclasses import dataclass, field
@@ -21,22 +22,27 @@ from dataclasses import dataclass, field
 class Provider:
     name: str
     env_overrides: dict[str, str] = field(default_factory=dict)
-    api_base: str | None = None  # used by hive-tools' future /models query
+    api_base: str | None = None
 
 
-class ModelRegistry:
-    def __init__(
-        self,
-        providers: dict[str, Provider],
-        static_models: dict[str, str],
-    ):
+class ProviderRegistry:
+    """The providers declared in ``config.yaml``, and which one this mind uses."""
+
+    def __init__(self, providers: dict[str, Provider], mind_provider: str):
         self._providers = providers
-        self._static = static_models  # {"sonnet": "anthropic", ...}
+        self._mind_provider = mind_provider
 
-    def get_provider(self, model: str) -> Provider:
-        """Resolve a model name to its provider."""
-        if model in self._static:
-            return self._providers[self._static[model]]
-        if "ollama" in self._providers:
-            return self._providers["ollama"]
-        raise ValueError(f"Unknown model: {model}")
+    def get_provider(self, model: str = "") -> Provider:
+        """This mind's provider. The model name is not consulted.
+
+        Accepted and ignored so the harness call sites read the same on both
+        sides of the change; a spawn asks "what upstream am I on", never "who
+        owns this model".
+        """
+        del model
+        provider = self._providers.get(self._mind_provider)
+        if provider is None:
+            raise ValueError(
+                f"Provider {self._mind_provider!r} is not configured in config.yaml"
+            )
+        return provider

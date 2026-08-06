@@ -407,62 +407,43 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List models available to this mind: static aliases from config.yaml
-    plus the live Ollama list from hive-tools."""
+    """Every model this mind may run, grouped by the provider hosting it.
+
+    Asked of the inference proxy with this mind's own key, which is what
+    decides the answer — a deployment this mind would be refused never
+    appears. Nothing is assembled here and no alias is invented: a list that
+    named models the proxy will not serve is a list that promises a switch it
+    cannot make.
+    """
     if not await _auth_check(update):
         return
 
+    import models_api
+
+    try:
+        rows = await models_api.build_catalog(os.getenv("MIND_NAME", ""))
+    except Exception as exc:  # noqa: BLE001
+        await update.message.reply_text(f"Could not read the model list: {exc}")
+        return
+    if not rows:
+        await update.message.reply_text(
+            "No models available — this mind cannot reach its provider right now."
+        )
+        return
+
     lines: list[str] = ["*Available models*"]
-
-    static = sorted(config.models.keys())
-    if static:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row.get("provider_label") or row.get("provider") or "?", []).append(row)
+    for provider_label in sorted(grouped):
         lines.append("")
-        lines.append("*Claude (via Anthropic API):*")
-        for alias in static:
-            marker = "  ← default" if alias == config.default_model else ""
-            lines.append(f"  • `{alias}`{marker}")
-
-    ollama_configured = "ollama" in config.providers
-    if not ollama_configured:
-        lines.append("")
-        lines.append("_(No Ollama provider configured for this mind.)_")
-    else:
-        try:
-            headers = {"Authorization": f"Bearer {HIVE_TOOLS_TOKEN}"} if HIVE_TOOLS_TOKEN else {}
-            async with http.get(
-                f"{HIVE_TOOLS_URL}/ollama/models",
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    lines.append("")
-                    lines.append(f"_Ollama list unavailable (HTTP {resp.status}): {body[:120]}_")
-                else:
-                    data = await resp.json()
-        except Exception as exc:
-            lines.append("")
-            lines.append(f"_Ollama list unavailable: {exc}_")
-            data = None
-
-        if data:
-            base = data.get("ollama_base_url", "?")
-            default = data.get("default_model", "")
-            models_list = data.get("models", [])
-            lines.append("")
-            lines.append(f"*Ollama (`{base}`):*")
-            if not models_list:
-                lines.append("  _(no models pulled yet)_")
-            else:
-                for m in models_list:
-                    name = m.get("name", "?")
-                    psize = m.get("parameter_size") or ""
-                    quant = m.get("quantization") or ""
-                    family = m.get("family") or ""
-                    bits = " · ".join(b for b in (family, psize, quant) if b)
-                    marker = "  ← default" if name == default else ""
-                    suffix = f" — {bits}" if bits else ""
-                    lines.append(f"  • `{name}`{suffix}{marker}")
+        lines.append(f"*{provider_label}:*")
+        for row in grouped[provider_label]:
+            name = row["name"]
+            label = row.get("label") or name
+            marker = "  ← default" if name == config.default_model else ""
+            suffix = f" — {label}" if label != name else ""
+            lines.append(f"  • `{name}`{suffix}{marker}")
 
     lines.append("")
     lines.append("_Switch with_ `/model <name>`")

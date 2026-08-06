@@ -115,7 +115,7 @@ esac
 # A starting model the chosen provider can actually serve. Swap it in
 # runtime.yaml (and config.yaml) once the mind is up — nothing here is pinned.
 case "$PROVIDER" in
-    anthropic) DEFAULT_MODEL="sonnet" ;;
+    anthropic) DEFAULT_MODEL="claude-sonnet-5" ;;
     openai)    DEFAULT_MODEL="gpt-5.4" ;;
     ollama)    DEFAULT_MODEL="qwen3:8b" ;;
 esac

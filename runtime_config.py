@@ -75,27 +75,45 @@ def public_runtime(mind_name: str) -> dict[str, Any]:
     return {k: loaded[k] for k in PUBLIC_FIELDS if k in loaded}
 
 
-def update_default_model(mind_name: str, model: str) -> dict[str, Any]:
-    """Rewrite `default_model` in place, atomically, preserving the rest.
+#: Fields the console may write, and the pattern each value must match. A
+#: provider is a name in the proxy's providers table; a model is a deployment
+#: name from that provider's listing.
+WRITABLE_FIELDS = {
+    "default_model": _MODEL_NAME_RE,
+    "provider": re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"),
+}
 
-    A line-level substitution rather than a YAML round-trip: dumping the
-    parsed document back would strip the comments that explain each field to
-    whoever opens the file next.
+
+def update_runtime_fields(mind_name: str, fields: dict[str, str]) -> dict[str, Any]:
+    """Rewrite the given fields in place, atomically, preserving the rest.
+
+    Line-level substitution rather than a YAML round-trip: dumping the parsed
+    document back would strip the comments that explain each field to whoever
+    opens the file next. Every field lands in one write, so a mind is never
+    left holding a provider that does not host the model beside it.
     """
-    if not _MODEL_NAME_RE.fullmatch(model or ""):
-        raise ValueError("Model name contains unsupported characters")
+    if not fields:
+        raise ValueError("Nothing to write")
+    unknown = sorted(set(fields) - set(WRITABLE_FIELDS))
+    if unknown:
+        raise ValueError(f"Not a writable field: {', '.join(unknown)}")
+    for field, value in fields.items():
+        if not WRITABLE_FIELDS[field].fullmatch(value or ""):
+            raise ValueError(f"{field} contains unsupported characters")
+
     path = runtime_path(mind_name)
     load_runtime(mind_name)  # reject a malformed file before touching it
-    text = path.read_text()
-    updated, count = re.subn(
-        r"^default_model\s*:.*$",
-        f"default_model: {model}",
-        text,
-        count=1,
-        flags=re.MULTILINE,
-    )
-    if count != 1:
-        raise ValueError("Runtime configuration has no default_model field")
+    updated = path.read_text()
+    for field, value in fields.items():
+        updated, count = re.subn(
+            rf"^{field}\s*:.*$",
+            f"{field}: {value}",
+            updated,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise ValueError(f"Runtime configuration has no {field} field")
 
     fd, temporary = tempfile.mkstemp(prefix="runtime-", suffix=".yaml", dir=path.parent)
     try:

@@ -28,6 +28,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import pty_notice
+import models_api
 import runtime_config
 import skills_sync
 from hive_logging import configure_logging, install_fastapi_logging, log_event, log_if_slow
@@ -313,7 +314,7 @@ async def get_runtime():
 
 @app.patch("/runtime")
 async def patch_runtime(request: Request):
-    """Set this mind's default model, durably.
+    """Set this mind's provider and default model, durably.
 
     The console pushes here rather than reaching into a bind-mounted file,
     so a mind on another host configures exactly like one in this stack.
@@ -329,19 +330,45 @@ async def patch_runtime(request: Request):
     model = str(body.get("default_model") or "").strip()
     if not model:
         return JSONResponse({"error": "default_model required"}, status_code=400)
+    fields = {"default_model": model}
+    provider = str(body.get("provider") or "").strip()
+    if provider:
+        fields["provider"] = provider
     try:
-        configuration = runtime_config.update_default_model(MIND_NAME, model)
+        configuration = runtime_config.update_runtime_fields(MIND_NAME, fields)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except OSError as exc:
         return JSONResponse({"error": f"could not write runtime.yaml: {exc}"}, status_code=500)
-    log_event(log, "mind.runtime.updated", mind_id=MIND_ID, default_model=model)
+    log_event(
+        log, "mind.runtime.updated", mind_id=MIND_ID,
+        default_model=model, provider=provider or None,
+    )
     return {
         "saved": True,
         "configuration": {
             k: configuration[k] for k in runtime_config.PUBLIC_FIELDS if k in configuration
         },
     }
+
+
+@app.get("/models")
+async def get_models(request: Request):
+    """What this mind's own proxy key may address.
+
+    Admin-guarded like every other configuration route: the listing names this
+    mind's reachable deployments, which is a map of what its credential
+    unlocks — not something to hand out on a port that answers across the LAN.
+    """
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        return {"models": await models_api.build_catalog(MIND_NAME)}
+    except Exception as exc:  # noqa: BLE001
+        log_event(log, "mind.models.failed", level=logging.WARNING,
+                  mind_id=MIND_ID, error=str(exc))
+        return JSONResponse({"error": str(exc)}, status_code=502)
 
 
 def _harness() -> str:
@@ -1249,7 +1276,7 @@ def _load_registry_and_mcp_config() -> tuple[object | None, object | None, str]:
     try:
         from config import config as _config
         config_obj = _config
-        from models import ModelRegistry, Provider
+        from models import Provider, ProviderRegistry
         providers = {}
         for pname, pdata in _config.providers.items():
             env_overrides = pdata.get("env", {}) if isinstance(pdata, dict) else {}
@@ -1257,7 +1284,24 @@ def _load_registry_and_mcp_config() -> tuple[object | None, object | None, str]:
             providers[pname] = Provider(
                 name=pname, env_overrides=env_overrides, api_base=api_base
             )
-        registry = ModelRegistry(providers=providers, static_models=_config.models)
+        # This mind's own file names the provider; the model name never
+        # decides it. The proxy routes a request from the model name, so all
+        # a spawn needs is the credential and base URL of the upstream it is
+        # configured against. An unreadable runtime.yaml leaves the registry
+        # unbuilt rather than raising — the spawn paths already treat a
+        # missing registry as "no env overrides", which is the same answer a
+        # provider with none would give.
+        try:
+            mind_provider = str(
+                runtime_config.load_runtime(MIND_NAME).get("provider") or ""
+            )
+        except ValueError:
+            mind_provider = ""
+        registry = (
+            ProviderRegistry(providers=providers, mind_provider=mind_provider)
+            if mind_provider
+            else None
+        )
         mcp_config_path = PROJECT_DIR / ".mcp.container.json"
         if not mcp_config_path.exists():
             mcp_config_path = PROJECT_DIR / ".mcp.json"
