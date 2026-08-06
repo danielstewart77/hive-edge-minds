@@ -40,7 +40,7 @@ harness: claude_cli
 #   openai    — codex_cli only
 #   ollama    — either harness
 provider: anthropic
-default_model: sonnet
+default_model: claude-sonnet-5
 mind_server_port: 8421
 
 # Surface bots run in-process by launch_mind_server_and_bots.py. An empty

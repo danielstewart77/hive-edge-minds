@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import mind_templates.claude_cli as claude_impl  # noqa: E402
 import mind_templates.codex_cli as codex_impl  # noqa: E402
-from models import ModelRegistry, Provider  # noqa: E402
+from models import Provider, ProviderRegistry  # noqa: E402
 
 # Every function the browser terminal and the rotation path call on an
 # implementation module. The deleted *_ollama templates had none of them, so
@@ -30,8 +30,14 @@ _TERMINAL_API = (
 )
 
 
-def _registry(env=None, api_base=None):
-    return ModelRegistry(
+def _registry(env=None, api_base=None, mind_provider="ollama"):
+    """The providers config.yaml declares, and the one this mind is on.
+
+    The mind's own file names the provider; the model it happens to be running
+    never decides it. Resolving by model name is what pointed a Claude mind at
+    Ollama the moment its model was named `claude-opus-5` rather than `opus`.
+    """
+    return ProviderRegistry(
         providers={
             "anthropic": Provider(name="anthropic"),
             "openai": Provider(name="openai"),
@@ -39,7 +45,7 @@ def _registry(env=None, api_base=None):
                 name="ollama", env_overrides=env or {}, api_base=api_base
             ),
         },
-        static_models={"sonnet": "anthropic", "gpt-5.4": "openai"},
+        mind_provider=mind_provider,
     )
 
 
@@ -83,12 +89,23 @@ def test_codex_falls_back_to_api_base_with_the_openai_path():
     assert 'base_url="http://ollama-host:11434/v1"' in " ".join(args)
 
 
-@pytest.mark.parametrize("model", ["sonnet", "gpt-5.4"])
-def test_codex_emits_nothing_for_first_party_providers(model):
+@pytest.mark.parametrize("mind_provider", ["anthropic", "openai"])
+def test_codex_emits_nothing_for_first_party_providers(mind_provider):
     """A non-Ollama mind must spawn the exact argv it did before."""
-    provider = _registry().get_provider(model)
+    provider = _registry(mind_provider=mind_provider).get_provider("whatever")
     assert codex_impl._provider_args(provider, "atlas") == []
     assert codex_impl._base_cmd([]) == codex_impl._base_cmd()
+
+
+def test_a_real_deployment_name_still_resolves_this_minds_own_provider():
+    """A Claude mind on `claude-opus-5` stays on Anthropic.
+
+    The old lookup knew three short aliases and sent everything else to
+    Ollama, so migrating a mind onto the deployment name the proxy actually
+    routes on would have handed its harness the local Ollama's base URL.
+    """
+    provider = _registry(mind_provider="anthropic").get_provider("claude-opus-5")
+    assert provider.name == "anthropic"
 
 
 def test_codex_provider_args_land_in_the_spawned_command():
@@ -115,10 +132,12 @@ def test_codex_terminal_argv_carries_provider_args():
     assert 'model_provider="atlas_ollama"' in argv
 
 
-def test_unresolvable_model_does_not_kill_the_turn():
-    registry = ModelRegistry(providers={"anthropic": Provider(name="anthropic")},
-                             static_models={"sonnet": "anthropic"})
+def test_an_unconfigured_provider_does_not_kill_the_turn():
+    """A runtime.yaml naming a provider config.yaml has never heard of."""
+    registry = ProviderRegistry(
+        providers={"anthropic": Provider(name="anthropic")}, mind_provider="absent"
+    )
 
-    assert codex_impl._resolve_provider(registry, "no-such-model") is None
-    assert codex_impl._resolve_provider(None, "sonnet") is None
+    assert codex_impl._resolve_provider(registry, "claude-opus-5") is None
+    assert codex_impl._resolve_provider(None, "claude-opus-5") is None
     assert codex_impl._provider_args(None, "atlas") == []

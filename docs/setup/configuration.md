@@ -16,11 +16,6 @@ providers:
       ANTHROPIC_BASE_URL: "http://<ollama-host>:11434"
     api_base: "http://<ollama-host>:11434"
 
-models:
-  sonnet: anthropic
-  opus: anthropic
-  haiku: anthropic
-
 scheduled_tasks:
   - cron: "0 7 * * *"
     voice: true

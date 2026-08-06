@@ -176,7 +176,7 @@ def test_rejects_bad_inputs(repo):
 @pytest.mark.parametrize(
     "harness,provider,model",
     [
-        ("claude_cli", "anthropic", "sonnet"),
+        ("claude_cli", "anthropic", "claude-sonnet-5"),
         ("claude_cli", "ollama", "qwen3:8b"),
         ("codex_cli", "openai", "gpt-5.4"),
         ("codex_cli", "ollama", "qwen3:8b"),

@@ -31,11 +31,6 @@ providers:
       OPENAI_API_KEY: ""
     api_base: "http://your-ollama-host:11434"
 
-# Static model -> provider mappings (Ollama models auto-discovered)
-models:
-  sonnet: anthropic
-  opus: anthropic
-  haiku: anthropic
 
 # Telegram — user allowlist (get your ID from @userinfobot)
 telegram_allowed_users:
