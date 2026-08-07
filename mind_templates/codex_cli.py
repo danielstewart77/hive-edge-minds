@@ -46,7 +46,6 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
-import pty_notice
 
 log = logging.getLogger(__name__)
 
@@ -802,39 +801,6 @@ def refresh_pty_client(session_id: str) -> bool:
             painted = True
     return painted
 
-
-def show_pty_notice(session_id: str, text: str, *, hold: bool = False) -> bool:
-    """Draw a notice over this session's terminal. False if there isn't one.
-
-    A popup rather than pane output: codex paints over anything written
-    before its exec, and the tmux status line is off — see :mod:`pty_notice`.
-
-    Launched and never waited on. ``display-popup -E`` does not return until
-    the popup closes, so waiting would hold the rotation's HTTP call open for
-    as long as the popup is up: the gateway's request times out, it concludes
-    the terminal is dead and skips writing the new conversation id, and the
-    session is left pointing at the conversation that was just rotated away
-    from. The notice is decoration; it does not get to decide that.
-
-    Best-effort throughout — a notice that cannot be drawn never takes a
-    rotation down with it.
-    """
-    if not text or not pty_session_alive(session_id):
-        return False
-    name = tmux_session_name(session_id)
-    try:
-        body = pty_notice.write_popup_body(
-            CODEX_HOME / "rotation-notices", name, text
-        )
-        subprocess.Popen(
-            ["tmux", "-L", TMUX_SOCKET, *pty_notice.popup_args(name, body, hold=hold)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except Exception:
-        log.exception("Could not draw the rotation notice for session %s", session_id)
-        return False
-    return True
 
 
 def kill_pty_session(session_id: str) -> bool:
