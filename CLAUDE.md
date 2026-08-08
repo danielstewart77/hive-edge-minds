@@ -190,36 +190,79 @@ is the only write a pty turn ever makes.
 A rotation replaces the conversation, not the session and not the terminal.
 The session row is permanent — the tile, its label, the turn ledger and the
 `active_sessions` binding are all keyed to `sessions.id` — so what rotates
-under it is the harness conversation. Rotation normally arms a flag that
-hive-comms consumes on the conversation's next user turn, but keystrokes are
-raw bytes: the terminal never calls `send_message`, so there is no turn to
-consume it. For sessions whose `owner_ref` is `terminal`, `arm_rotation`
-rotates on the spot. It composes the carry-forward, mints a new `claude_sid`
-and calls `POST /sessions/{id}/rotate-pty` on the mind; `rotate_pty_session`
-`respawn-pane -k`s the pane onto a fresh harness process carrying that
-carry-forward, renaming nothing and killing nothing, so the attached tmux
-client — and with it the pty, the proxied socket and the browser tile — is
-never disturbed. `mind_server` repoints the pty handle's `claude_sid`, and
-hive-comms writes the same id onto the same row. The user keeps typing in
-the same pane under the same session id while the context behind it resets.
-Nothing is published and the tile is told nothing, because nothing it tracks
-changed. tmux targets are prefix-matched, so every session lookup uses the
-`=` exact-match form; without it one id can answer for another's pane.
+under it is the harness conversation. Rotation arms a flag that hive-comms
+consumes on the conversation's next user turn, but keystrokes are raw bytes:
+the terminal never calls `send_message`. What it has instead is the pane's
+own `UserPromptSubmit` hook, so a terminal rotation is split in two.
+
+`arm_rotation` *stages*: told by the hook that it is speaking for a pane, it
+composes the carry-forward, mints a `claude_sid` it does not start, stores
+both on the row and marks `rotation_armed = 2`. The pane is not touched — the
+user keeps typing in the conversation they can see. The hook reports that
+surface because it is the only party that knows: `owner_ref` cannot answer,
+since a Telegram conversation adopted into a terminal keeps its chat
+ownership while living in a pane, and arming that for a successor row would
+retire the session out from under the pane holding it. `POST /sessions/fire-rotation`,
+called by the hook on the next **typed** message, is what swaps: it hands
+`POST /sessions/{id}/rotate-pty` the stored seed with that message
+concatenated, and `rotate_pty_session` `respawn-pane -k`s the pane onto a
+fresh harness process carrying it, renaming nothing and killing nothing, so
+the attached tmux client — and with it the pty, the proxied socket and the
+browser tile — is never disturbed. `mind_server` repoints the pty handle's
+`claude_sid`, and hive-comms writes the same id onto the same row. The user
+keeps typing in the same pane under the same session id while the context
+behind it resets. tmux targets are prefix-matched, so every session lookup
+uses the `=` exact-match form; without it one id can answer for another's
+pane.
+
+The two armed values are not interchangeable. `1` is a chat surface,
+finalized by `send_message` into a successor row; `2` is a staged terminal,
+whose swap keeps the row. A staged terminal adopted by Telegram would
+otherwise reach `_finalize_rotation` and be retired for a successor —
+destroying the permanent session row, its label and its ledger binding,
+which is the outcome in-place rotation exists to prevent. So `send_message`
+tests the value rather than its truth. The reverse case is the release: only
+a successful fire clears a `2`, and only the pane's own hook can fire one, so
+adopting the conversation into Telegram — which kills that pane — would leave
+it over its threshold and unable to rotate at all. Releasing a terminal
+therefore downgrades a staged rotation to the chat value, which is the only
+turn it will get from then on.
+
+A staged rotation reaches the successor as its **opening user turn**, not as
+`--append-system-prompt`: the user's own message rides in it, and a system
+prompt submits nothing and reaches no transcript, so the pane would open at
+an empty prompt with what they typed gone. `_seeded_pane_command`'s
+`as_user_turn` picks the entry point; a fresh terminal still takes its seed
+as a system prompt, which is where standing context belongs.
 
 The carry-forward travels in a file, never in the tmux command: a composed
 prompt is tens of thousands of characters, tmux rejects a long
 `respawn-pane` with "command too long", and Linux caps one argv entry at
 `MAX_ARG_STRLEN` (128 KiB) regardless. The pane runs a one-line `sh -c` that
 reads the seed, deletes it and `exec`s the harness with it; `_capped_seed`
-trims anything past 120,000 chars to its tail. A mind reporting no live
+trims anything past 120,000 **bytes** to its tail. Bytes, because that is
+what the kernel counts: a carry-forward quoting a TUI transcript carries
+box-drawing and arrows, and a few per cent of those puts 120,000 characters
+over the limit — where exec fails inside the pane after tmux has returned 0
+and the gateway has already written the successor's id, so the rotation is
+recorded as successful on a pane that is dead. A seed that cannot be read at
+all starts the harness *unseeded* rather than on an empty prompt, for the
+same reason: an unseeded terminal is recoverable from the session row below,
+and a dead pane is not. A mind reporting no live
 terminal writes nothing at all — a fresh `claude_sid` with no process behind
 it would strand the session on a conversation that was never seeded.
 
-That file is one process's opening context and is deleted as it is read, and
-a system prompt reaches no transcript — so until the rotated conversation's
-first turn lands, nothing on disk remembers what the rotation composed.
-hive-comms therefore stores it on the session row (`carry_forward`, keyed to
-`carry_forward_sid`) at the same moment it writes the new `claude_sid`. A
+That file is one process's opening context and is deleted as it is read — so
+until the rotated conversation's first turn lands, nothing on disk remembers
+what the rotation composed. hive-comms therefore stores it on the session row
+(`carry_forward`, keyed to `carry_forward_sid`) at *stage* time, minutes
+before the pane is respawned and however long the user takes to reply. The
+row is the only thing that outlives both the composing process and a
+`skippy.service` restart in the gap. What the fire then stores is what was
+actually *delivered* — the summary with the typed message on the end, not the
+summary alone — because a tile that dies before that first turn completes
+reattaches asking for it, and handing back the summary by itself loses the
+question the user asked. A
 mind starting a terminal asks `GET /sessions/{id}/carry-forward?claude_sid=`
 and re-applies whatever it is owed. A completed turn clears the row — it is
 the only evidence the rotation took, and from then on `--resume` carries the
@@ -256,6 +299,53 @@ multi-minute background window into the new conversation's
 `send_message` writes that ledger for chat surfaces; the pty bridge can't, so
 the Stop hook POSTs each completed turn to `POST /sessions/record-turn` on
 every fire when `HIVE_SURFACE=terminal`.
+
+A staged rotation therefore spans three hook processes, none of which share
+memory and any of which the respawn can kill, so the handoff is on disk under
+`data/auto-remember/`, keyed by `claude_sid` (one host runs several panes
+under one harness config). The Stop hook writes its marker *before* the
+transcript read and the Ollama calls — those take 90 seconds to 3.5 minutes,
+and staging after them meant a user who replied promptly replied into a
+conversation that was not yet pending anything. Composition promotes the
+marker to ready; a fire that beats it waits briefly and then gives up rather
+than holding the prompt. Because the marker goes down before the work, every
+way *out* of that work — a missing `mind_id`, a failed memory write, an
+Ollama timeout — is a way to leave it saying "composing" with nothing left to
+promote it, so the composing process drops its own marker on whichever exit
+it takes. One that survived would make every later message wait on a summary
+that is never coming, for a day.
+
+The fire hook will not act on a prompt the user did not type. A finished
+background agent reports in through the same prompt pipeline and fires every
+`UserPromptSubmit` hook, so without that gate the pane rotates itself while
+nobody is there and the successor opens on notification XML. There is no
+`promptSource` on the payload to ask, so the envelope tag is the signal. Nor
+will it fire while `background_tasks` — which rides on every Stop and
+SubagentStop payload, and is snapshotted for the fire hook because
+`UserPromptSubmit` lacks it — still lists something running: `respawn-pane -k`
+kills the pane's process group and every background agent and shell in it.
+
+It never holds the prompt. `UserPromptSubmit` gates submission, so every
+second spent in this hook is a second the pane sits frozen with the message
+unsent and nothing on screen saying why — and composition runs to six
+minutes, which is not a wait, it is a hang. A message that beats the summary
+waits seconds for it and then goes through regardless, with the rotation
+still staged for the next one. Nor does the hook wait on the respawn it
+triggers: it cannot both do that and report a decision back to the process
+the respawn kills. The message goes to the harness running now; if the
+rotation lands, that answer is replaced mid-flight, and if it doesn't, the
+answer stands.
+
+The marker is cleared by the fire that succeeds, and only by that one. A
+refused or unreachable gateway leaves it staged, so the next typed turn
+retries instead of paying another six minutes for a seed the row already
+holds. Keeping it that long is safe because the successor runs under a
+*different* conversation id and reads a different marker file — a marker
+outliving the swap cannot rotate the fresh conversation away. What the
+successor's own turn could collide with is a second prompt queued behind the
+first, so a fire takes the marker under a claim: two respawns of one pane
+onto one conversation id race over a single seed file, and the loser's
+message is gone.
 
 ### Cross-surface session pickup
 

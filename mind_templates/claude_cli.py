@@ -267,7 +267,15 @@ def _rotation_argv(model: str, mcp_config: str, new_claude_sid: str) -> list[str
 # A single argv entry cannot exceed MAX_ARG_STRLEN (32 pages, 128 KiB on
 # Linux); exec fails outright above it. The seed reaches the harness as one
 # argument however it is delivered, so it is capped short of that.
-MAX_SEED_CHARS = 120_000
+#
+# The kernel counts bytes, so this does too. A carry-forward is UTF-8 and a
+# rotation summary quoting a TUI transcript carries box-drawing, arrows and
+# emoji — a few per cent of those is enough for 120,000 characters to be
+# more than 131,072 bytes. The failure lands inside the pane, where exec
+# fails with E2BIG and the process exits, while tmux has already returned 0
+# and the gateway has already written the successor's id onto the row: a
+# rotation reported as successful, on a pane that is dead.
+MAX_SEED_BYTES = 120_000
 
 
 def _capped_seed(system_prompt: str) -> str:
@@ -277,15 +285,18 @@ def _capped_seed(system_prompt: str) -> str:
     turns typed during the window last, and those are the ones the successor
     has to pick the conversation up from.
     """
-    if len(system_prompt) <= MAX_SEED_CHARS:
+    encoded = system_prompt.encode("utf-8")
+    if len(encoded) <= MAX_SEED_BYTES:
         return system_prompt
-    log.warning("Rotation seed of %d chars exceeds the %d-char exec limit — "
-                "keeping the tail", len(system_prompt), MAX_SEED_CHARS)
+    log.warning("Rotation seed of %d bytes exceeds the %d-byte exec limit — "
+                "keeping the tail", len(encoded), MAX_SEED_BYTES)
     notice = ("[earlier context omitted: the carry-forward was too large to "
               "pass to the harness]\n\n")
     # The notice counts against the same argv entry the seed rides in, so the
-    # tail is trimmed to leave room for it rather than added on top.
-    return notice + system_prompt[-(MAX_SEED_CHARS - len(notice)):]
+    # tail is trimmed to leave room for it rather than added on top. Decoded
+    # with errors="ignore" because slicing bytes can land mid-character.
+    budget = MAX_SEED_BYTES - len(notice.encode("utf-8"))
+    return notice + encoded[-budget:].decode("utf-8", errors="ignore")
 
 
 SEED_STALE_AFTER_SECONDS = 3600
@@ -313,7 +324,7 @@ def _sweep_stale_seeds(seed_dir) -> None:
 
 
 def _seeded_pane_command(
-    argv: list[str], system_prompt: str, seed_key: str
+    argv: list[str], system_prompt: str, seed_key: str, *, as_user_turn: bool = False
 ) -> list[str]:
     """Hand the pane its carry-forward without putting it in the command.
 
@@ -323,6 +334,13 @@ def _seeded_pane_command(
     the seed goes to a file and the pane reads it back through a one-line
     shell that then `exec`s the harness: the tmux command stays short
     regardless of how much context the successor is carrying.
+
+    ``as_user_turn`` decides which end of the harness the seed enters. A
+    fresh terminal takes it as `--append-system-prompt`, which is where
+    standing context belongs. A staged rotation takes it as a positional
+    prompt, because the user's own message is concatenated onto it: a system
+    prompt reaches no transcript and submits nothing, so the pane would open
+    at an empty prompt with what they typed gone.
     """
     if not system_prompt:
         return argv
@@ -338,10 +356,19 @@ def _seeded_pane_command(
     harness = " ".join(shlex.quote(arg) for arg in argv)
     # Read then delete: the seed is one process's opening context, and it is
     # the whole conversation's memory sitting in a world-readable file.
+    #
+    # An unreadable or empty seed still starts the harness, without it. The
+    # alternative is exec'ing the entry point with an empty argument, which
+    # opens the successor on nothing while tmux and the gateway both record
+    # a successful rotation. A terminal that came up unseeded is recoverable
+    # — the gateway holds the same text on the session row and hands it back
+    # on the next attach — and a pane that died is not.
+    entry = '"$seed"' if as_user_turn else '--append-system-prompt "$seed"'
     return [
         "/bin/sh", "-c",
         f'seed=$(cat {quoted_seed}); rm -f {quoted_seed}; '
-        f'exec {harness} --append-system-prompt "$seed"',
+        f'[ -n "$seed" ] && exec {harness} {entry}; '
+        f'exec {harness}',
     ]
 
 
@@ -399,6 +426,7 @@ def rotate_pty_session(
     new_claude_sid: str,
     model: str,
     system_prompt: str = "",
+    user_prompt: str = "",
     mcp_config: str = "",
     registry: Any = None,
     client_ref: str | None = None,
@@ -418,7 +446,11 @@ def rotate_pty_session(
     behind it turned over.
 
     ``system_prompt`` is the rotation carry-forward, delivered by
-    ``_seeded_pane_command``. Returns False when there was no live terminal
+    ``_seeded_pane_command``. ``user_prompt`` is that carry-forward with the
+    message the user just typed concatenated onto it, delivered the same way
+    but as the successor's opening user turn — the shape a staged rotation
+    uses, so the message lands in the transcript instead of a system prompt
+    the pane never submits. Returns False when there was no live terminal
     to rotate. The respawn takes the pane's screen and scrollback with it;
     what was on that screen is replayed by the gateway to the browser tile,
     beside the terminal rather than into it.
@@ -440,7 +472,10 @@ def rotate_pty_session(
         return False
 
     cmd = _seeded_pane_command(
-        _rotation_argv(model, mcp_config, new_claude_sid), system_prompt, new_claude_sid
+        _rotation_argv(model, mcp_config, new_claude_sid),
+        user_prompt or system_prompt,
+        new_claude_sid,
+        as_user_turn=bool(user_prompt),
     )
 
     env = os.environ.copy()
@@ -480,7 +515,9 @@ def rotate_pty_session(
         )
 
     log.info("Rotated the conversation in terminal %s onto claude_sid=%s "
-             "(seed=%d chars)", name, new_claude_sid, len(system_prompt))
+             "(seed=%d chars, as=%s)", name, new_claude_sid,
+             len(user_prompt or system_prompt),
+             "user-turn" if user_prompt else "system-prompt")
     return True
 
 

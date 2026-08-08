@@ -596,7 +596,10 @@ class TestRotatePtySession:
         assert seed_file.read_text() == "carry-forward " * 4000
         # Bare codex, no resume: rotation starts a fresh thread and the seed
         # is its opening turn.
-        assert "exec codex " in argv[-1] and argv[-1].endswith('"$seed"')
+        # An unreadable seed falls through to an unseeded codex rather than
+        # exec'ing an empty prompt, so the seeded exec is not the last clause.
+        assert 'exec codex ' in argv[-1]
+        assert 'check_for_update_on_startup=false "$seed"' in argv[-1]
         assert "resume" not in argv[-1]
 
     def test_the_new_thread_is_watched_for_under_the_same_session(self):
