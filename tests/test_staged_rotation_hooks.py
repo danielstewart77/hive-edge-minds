@@ -150,6 +150,12 @@ def test_the_rotation_is_pending_before_the_summary_is_written(tmp_path, monkeyp
 
     monkeypatch.setattr(rotation_state, "stage_marker", staged)
     monkeypatch.setattr(rotation_check, "_wait_for_quiescence", compose)
+    # The gateway pre-flight below the threshold check would otherwise decide
+    # this test's outcome from whatever comms happens to be running on the
+    # host — "term-1" is not a live pane anywhere, so a reachable gateway
+    # answers no and nothing stages. What is under test here is the ordering
+    # of staging against composition, so the pre-flight is pinned.
+    monkeypatch.setattr(rotation_check, "_comms_has_active_session", lambda *a, **k: True)
 
     with pytest.raises(SystemExit):
         rotation_check._run({
@@ -545,3 +551,227 @@ def test_a_marker_left_by_a_pane_nobody_returns_to_expires(hooks):
 
     assert state.read_marker("conv-old") is None
     assert not state._marker_path("conv-old").exists()
+
+
+# ---------------------------------------------------------------------------
+# The three ways a rotation used to be composed and then thrown away.
+#
+# On 2026-08-07/08 this pane armed 17 rotations and fired none. Each of the
+# cases below is one of the reasons, measured in rotation.log, and each fails
+# the same way: silently, positionally, and only visible as a GPU spinning
+# for minutes on a summary nobody can use.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def check_module(tmp_path, monkeypatch):
+    """``rotation_check`` with its state directory pointed at a temp tree."""
+    monkeypatch.setenv("HIVE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("HIVE_SURFACE", "terminal")
+    for name in ("rotation_state", "rotation_check"):
+        sys.modules.pop(name, None)
+    monkeypatch.syspath_prepend(str(HOOKS_DIR))
+    import rotation_check
+    import rotation_state
+    yield rotation_check, rotation_state
+    for name in ("rotation_state", "rotation_check"):
+        sys.modules.pop(name, None)
+
+
+def _detached(fn) -> dict:
+    """Run fn() the way the Stop hook runs its work: forked and setsid'd."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            os.setsid()
+            os.write(write_fd, json.dumps(fn()).encode())
+        except BaseException as exc:  # noqa: BLE001 — reported to the parent
+            os.write(write_fd, json.dumps({"error": repr(exc)}).encode())
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    with os.fdopen(read_fd) as handle:
+        raw = handle.read()
+    os.waitpid(pid, 0)
+    return json.loads(raw)
+
+
+_THRESHOLDS = {
+    "THRESHOLD_OPUS": 300000,
+    "THRESHOLD_SONNET": 100000,
+    "THRESHOLD_TOKENS": 300000,
+    "THRESHOLD_NO_1M": 140000,
+}
+
+
+def test_the_detached_hook_uses_the_spawn_model_it_captured_before_forking(
+    check_module, monkeypatch
+):
+    """A pane's threshold has to survive the hook detaching from the harness.
+
+    ``_spawned_model_arg`` finds the ``[1m]`` pin by walking the ppid chain,
+    and ``main`` forks and setsid's before any work runs — so asking again
+    down there answers "" on a real orphan, which reads as "no extended
+    window" and caps a 1M Opus pane at the 140k fallback. That is what armed
+    119 rotations the fire hook then dropped for being under *its* 300k.
+
+    The assertion is on the call *count*, not just the value: a value alone
+    still passes under lazy probing on a host where the chain happens to
+    resolve, which is exactly how this went unnoticed.
+    """
+    rotation_check, _state = check_module
+    calls = {"n": 0}
+
+    def _counted():
+        calls["n"] += 1
+        return "claude-opus-5[1m]"
+
+    monkeypatch.setattr(rotation_check, "_probe_spawned_model_arg", _counted)
+    monkeypatch.setattr(rotation_check, "_SPAWN_MODEL_ARG", None, raising=False)
+
+    rotation_check._spawned_model_arg()          # pre-fork, as main() does
+    assert calls["n"] == 1
+
+    def _in_child():
+        # Order matters: the threshold lookup is what would re-probe, so the
+        # counter has to be read *after* it. Reading it first — as a dict
+        # literal does, top to bottom — samples the count before the call
+        # that increments it, and the test then passes a full revert.
+        threshold = rotation_check._threshold_for_model(
+            _THRESHOLDS, "claude-opus-5"
+        )
+        return {"threshold": threshold, "probe_calls": calls["n"]}
+
+    got = _detached(_in_child)
+
+    assert got.get("error") is None, got
+    assert got["probe_calls"] == 1, (
+        "the detached child re-probed; on a real orphan that yields '' and "
+        "the pane arms at the 140k fallback instead of 300k"
+    )
+    assert got["threshold"] == 300000
+
+
+def test_a_pane_without_the_extended_pin_still_arms_at_the_lower_bound(
+    check_module, monkeypatch
+):
+    """The fallback is not dead code. Always answering 300000 would satisfy
+    the test above and let a genuine 200k window run to 100% of itself —
+    the failure the split threshold exists to prevent."""
+    rotation_check, _state = check_module
+    monkeypatch.setattr(
+        rotation_check, "_probe_spawned_model_arg", lambda: "claude-opus-5"
+    )
+    monkeypatch.setattr(rotation_check, "_SPAWN_MODEL_ARG", None, raising=False)
+    assert rotation_check._threshold_for_model(_THRESHOLDS, "claude-opus-5") == 140000
+
+
+def test_a_hook_that_lost_the_lock_leaves_the_running_rotation_alone(
+    check_module, monkeypatch
+):
+    """Losing the re-entrancy lock must not delete the winner's marker.
+
+    ``_run`` drops unsettled markers in a ``finally``, and ``_compose_rotation``
+    returns having staged nothing when a rotation is already in flight. The
+    loser was deleting the marker the winner was still composing for —
+    16 times in one day, each one a full Ollama run that armed a rotation the
+    fire hook could no longer see.
+    """
+    rotation_check, state = check_module
+    sid = "conv-being-composed"
+    state.stage_marker(sid, client_type="web", client_ref="term-1", forced=False)
+
+    monkeypatch.setattr(rotation_check, "_STAGED_HERE", False)   # never staged
+    rotation_check._drop_unsettled_marker(sid)
+
+    survivor = state.read_marker(sid)
+    assert survivor is not None, "the lock loser deleted the winner's marker"
+    assert survivor["state"] == state.STATE_COMPOSING
+
+
+def test_the_hook_that_staged_it_still_drops_its_own_abandoned_marker(
+    check_module, monkeypatch
+):
+    """The guard must not make every marker permanent. A composition that
+    dies partway has to clear its own, or the fire hook holds every later
+    message waiting on a summary that is never coming."""
+    rotation_check, state = check_module
+    sid = "conv-abandoned"
+    state.stage_marker(sid, client_type="web", client_ref="term-1", forced=False)
+
+    monkeypatch.setattr(rotation_check, "_STAGED_HERE", True)
+    rotation_check._drop_unsettled_marker(sid)
+
+    assert state.read_marker(sid) is None
+
+
+class _Resp:
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode()
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+_COMMS = {"COMMS_URL": "http://127.0.0.1:8426", "COMMS_BEARER": "t"}
+
+
+def test_a_pane_the_gateway_no_longer_holds_composes_nothing(
+    check_module, monkeypatch
+):
+    """``arm-rotation`` asks this after the composition; asking it first is
+    the difference between one local GET and six minutes of GPU. Measured
+    twice in one day as ``FAIL arm-rotation … "no active session"``, each
+    time against a summary that had already been paid for."""
+    rotation_check, _state = check_module
+    monkeypatch.setattr(
+        rotation_check.urllib.request, "urlopen",
+        lambda *a, **k: _Resp([{"id": "s1", "is_active": False}]),
+    )
+    assert rotation_check._comms_has_active_session(
+        _COMMS, client_type="web", client_ref="term-1"
+    ) is False
+
+
+def test_a_pane_the_gateway_still_holds_is_allowed_to_compose(
+    check_module, monkeypatch
+):
+    """The inverse, or the gate above passes by refusing everything."""
+    rotation_check, _state = check_module
+    monkeypatch.setattr(
+        rotation_check.urllib.request, "urlopen",
+        lambda *a, **k: _Resp([
+            {"id": "s1", "is_active": False},
+            {"id": "s2", "is_active": True},
+        ]),
+    )
+    assert rotation_check._comms_has_active_session(
+        _COMMS, client_type="web", client_ref="term-1"
+    ) is True
+
+
+def test_an_unreachable_gateway_does_not_strand_a_full_pane(
+    check_module, monkeypatch
+):
+    """This gate saves cost; it does not decide correctness. Refusing to
+    compose because a health check blipped would leave a pane sitting at
+    100% of its window, and ``arm-rotation`` still refuses on its own if the
+    session really is gone — so a blip costs at most one composition."""
+    rotation_check, _state = check_module
+
+    def _refused(*_a, **_k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(rotation_check.urllib.request, "urlopen", _refused)
+    assert rotation_check._comms_has_active_session(
+        _COMMS, client_type="web", client_ref="term-1"
+    ) is True
