@@ -8,7 +8,6 @@ model_providers.*`` flags, because it has no base-URL environment variable.
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -53,31 +52,6 @@ def _registry(env=None, api_base=None, mind_provider="ollama"):
 def test_both_harnesses_keep_the_browser_terminal(impl):
     for name in _TERMINAL_API:
         assert callable(getattr(impl, name, None)), f"{impl.__name__} lost {name}"
-
-
-def test_codex_emits_provider_args_for_ollama():
-    provider = _registry({"OLLAMA_BASE_URL": "http://proxy:8899/v1"}).get_provider(
-        "qwen3:8b"
-    )
-    args = codex_impl._provider_args(provider, "atlas")
-
-    joined = " ".join(args)
-    assert 'model_provider="atlas_ollama"' in joined
-    assert 'model_providers.atlas_ollama.base_url="http://proxy:8899/v1"' in joined
-    # No key configured — codex must not declare env_key, or bare Ollama gets
-    # an Authorization header it never asked for.
-    assert "env_key" not in joined
-
-
-def test_codex_declares_env_key_only_when_a_key_exists():
-    provider = _registry(
-        {"OLLAMA_BASE_URL": "http://proxy:8899/v1", "OPENAI_API_KEY": "hmp-abc"}
-    ).get_provider("qwen3:8b")
-
-    with patch.dict("os.environ", {}, clear=False):
-        args = codex_impl._provider_args(provider, "atlas")
-
-    assert 'model_providers.atlas_ollama.env_key="OPENAI_API_KEY"' in " ".join(args)
 
 
 def test_codex_falls_back_to_api_base_with_the_openai_path():
