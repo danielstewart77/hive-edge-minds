@@ -44,9 +44,15 @@ def _load(name: str, relpath: str):
 )
 def test_default_path_is_repo_local(monkeypatch, name, relpath, attr, env_var, filename):
     monkeypatch.delenv(env_var, raising=False)
+    # The tools compute the repo root with a `parents[3]` hop count; this test
+    # computes it independently from its own location. They agree only while
+    # the tool sits where the count expects, so moving it — which would
+    # silently write the db outside the checkout rather than raise — fails
+    # here. Where that root happens to be is not the point: a container
+    # install whose checkout is bind-mounted at /usr/src/app is as correct as
+    # a bare-metal one under $HOME.
     default = getattr(_load(name, relpath), attr)
     assert default == str(REPO_ROOT / "data" / filename)
-    assert not default.startswith("/usr/src/app")
 
 
 @pytest.mark.parametrize(

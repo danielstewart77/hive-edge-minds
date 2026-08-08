@@ -214,18 +214,19 @@ def _provider_args(provider: Any, mind_name: str = "MIND_NAME") -> list[str]:
     base_url = base_url.rstrip("/")
 
     provider_key = f"{mind_name}_ollama"
-    args = [
+    # Ollama is reached through the inference proxy, never as a bare daemon —
+    # the proxy owns the provider table and meters per mind, and it answers
+    # 401 without a bearer key. So the token is always declared. This used to
+    # be conditional on a key being visible in the provider block or the
+    # ambient environment, which made the emitted config depend on which
+    # machine composed it: the same mind produced different auth on a host
+    # that happened to export OPENAI_API_KEY for something else.
+    return [
         "-c", f'model_provider="{provider_key}"',
         "-c", f'model_providers.{provider_key}.name="{mind_name.capitalize()} Ollama"',
         "-c", f'model_providers.{provider_key}.base_url="{base_url}"',
+        "-c", f'model_providers.{provider_key}.env_key="OPENAI_API_KEY"',
     ]
-    if env.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY"):
-        # The "ollama" endpoint may really be a metering proxy in front of
-        # Ollama, which authenticates by bearer key. Codex only sends one when
-        # the provider declares env_key; bare Ollama needs no auth, so the
-        # declaration is gated on a key actually being present.
-        args += ["-c", f'model_providers.{provider_key}.env_key="OPENAI_API_KEY"']
-    return args
 
 
 def _base_cmd(provider_args: list[str] | None = None) -> list[str]:
