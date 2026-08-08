@@ -1780,6 +1780,10 @@ async def rotate_pty(session_id: str, request: Request):
             # edited that default in the console.
             model=body.get("model") or handle.model,
             system_prompt=body.get("system_prompt") or "",
+            # A staged rotation carries the user's own message, so its seed
+            # enters as the successor's opening user turn rather than as a
+            # system prompt the pane would never submit.
+            user_prompt=body.get("user_prompt") or "",
             mcp_config=mcp_config,
             registry=registry,
             client_ref=body.get("client_ref"),

@@ -686,7 +686,15 @@ def _terminal_argv(
 # A single argv entry cannot exceed MAX_ARG_STRLEN (32 pages, 128 KiB on
 # Linux); exec fails outright above it. The seed reaches codex as one
 # argument however it is delivered, so it is capped short of that.
-MAX_SEED_CHARS = 120_000
+#
+# The kernel counts bytes, so this does too. A carry-forward is UTF-8 and a
+# rotation summary quoting a TUI transcript carries box-drawing, arrows and
+# emoji — a few per cent of those is enough for 120,000 characters to be
+# more than 131,072 bytes. The failure lands inside the pane, where exec
+# fails with E2BIG and the process exits, while tmux has already returned 0
+# and the gateway has already written the successor's id onto the row: a
+# rotation reported as successful, on a pane that is dead.
+MAX_SEED_BYTES = 120_000
 
 
 def _capped_seed(system_prompt: str) -> str:
@@ -696,15 +704,18 @@ def _capped_seed(system_prompt: str) -> str:
     turns typed during the window last, and those are the ones the successor
     has to pick the conversation up from.
     """
-    if len(system_prompt) <= MAX_SEED_CHARS:
+    encoded = system_prompt.encode("utf-8")
+    if len(encoded) <= MAX_SEED_BYTES:
         return system_prompt
-    log.warning("Rotation seed of %d chars exceeds the %d-char exec limit — "
-                "keeping the tail", len(system_prompt), MAX_SEED_CHARS)
+    log.warning("Rotation seed of %d bytes exceeds the %d-byte exec limit — "
+                "keeping the tail", len(encoded), MAX_SEED_BYTES)
     notice = ("[earlier context omitted: the carry-forward was too large to "
               "pass to the harness]\n\n")
     # The notice counts against the same argv entry the seed rides in, so the
-    # tail is trimmed to leave room for it rather than added on top.
-    return notice + system_prompt[-(MAX_SEED_CHARS - len(notice)):]
+    # tail is trimmed to leave room for it rather than added on top. Decoded
+    # with errors="ignore" because slicing bytes can land mid-character.
+    budget = MAX_SEED_BYTES - len(notice.encode("utf-8"))
+    return notice + encoded[-budget:].decode("utf-8", errors="ignore")
 
 
 SEED_STALE_AFTER_SECONDS = 3600
@@ -757,9 +768,16 @@ def _seeded_pane_command(
     harness = " ".join(shlex.quote(arg) for arg in argv)
     # Read then delete: the seed is one conversation's memory sitting in a
     # file, and it is only ever needed once, at exec time.
+    #
+    # An unreadable or empty seed still starts codex, without it. The
+    # alternative opens the successor on an empty prompt while tmux and the
+    # gateway both record a successful rotation; an unseeded terminal is
+    # recoverable from the session row, a dead pane is not.
     return [
         "/bin/sh", "-c",
-        f'seed=$(cat {quoted_seed}); rm -f {quoted_seed}; exec {harness} "$seed"',
+        f'seed=$(cat {quoted_seed}); rm -f {quoted_seed}; '
+        f'[ -n "$seed" ] && exec {harness} "$seed"; '
+        f'exec {harness}',
     ]
 
 
@@ -895,6 +913,7 @@ def rotate_pty_session(
     new_claude_sid: str,
     model: str = "",
     system_prompt: str = "",
+    user_prompt: str = "",
     client_ref: str | None = None,
     owner_type: str | None = None,
     owner_ref: str | None = None,
@@ -940,7 +959,7 @@ def rotate_pty_session(
     pty_provider = _PTY_PROVIDER.get(session_id) or {}
     cmd = _seeded_pane_command(
         _terminal_argv(None, pty_provider.get("args")),
-        system_prompt,
+        user_prompt or system_prompt,
         session_id,
     )
 
@@ -969,7 +988,7 @@ def rotate_pty_session(
 
     _watch_for_new_thread_in_background(session_id, before)
     log.info("Rotated the conversation in terminal %s (seed=%d chars)",
-             name, len(system_prompt))
+             name, len(user_prompt or system_prompt))
     return True
 
 
