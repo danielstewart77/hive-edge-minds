@@ -28,6 +28,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import models_api
+import pty_voice
 import runtime_config
 import skills_sync
 from hive_logging import configure_logging, install_fastapi_logging, log_event, log_if_slow
@@ -281,6 +282,7 @@ async def startup_secrets():
     # entries left behind by a harness that has exited.
     asyncio.ensure_future(_reap_dead_ptys())
     _start_pty_repaint_sweep()
+    asyncio.ensure_future(_pty_voice_sweep())
 
 
 @app.get("/health")
@@ -732,6 +734,60 @@ async def _reap_dead_ptys() -> None:
             raise
         except Exception:
             log.exception("Terminal reaper sweep failed")
+
+
+_pty_voice = pty_voice.SessionVoice()
+
+
+async def _post_pty_text(session_id: str, text: str) -> None:
+    """Hand one block of a terminal's prose to the gateway for its stream."""
+    import aiohttp
+
+    comms_url = os.environ.get("COMMS_URL", "").rstrip("/")
+    token = os.environ.get("COMMS_ADMIN_BEARER_TOKEN", "")
+    if not comms_url or not token:
+        return
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{comms_url}/sessions/{session_id}/pty-text",
+                json={"text": text},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                await resp.read()
+    except Exception:
+        # Speech is not the conversation. A gateway that is down, slow or
+        # refusing costs this block of audio and nothing else, so it is
+        # logged at debug and never raised into the sweep.
+        log.debug("pty-text post failed for session %s", session_id, exc_info=True)
+
+
+async def _pty_voice_sweep() -> None:
+    """Publish each terminal's prose as the harness writes it.
+
+    Runs for every live terminal whether or not a tile is attached and
+    whether or not its speaker is on. Both of those are the browser's to
+    know: the tile only subscribes to the event stream while its speaker is
+    on, and only then does anything reach the voice server. Tracking them
+    here would mean the mind holding a copy of per-tile UI state it has no
+    way to keep current, to save a JSON post against a local gateway.
+    """
+    while True:
+        await asyncio.sleep(pty_voice.SWEEP_INTERVAL_S)
+        try:
+            _pty_voice.retain_only(list(_ptys))
+            for session_id, handle in list(_ptys.items()):
+                if not handle.alive or not handle.claude_sid:
+                    continue
+                for text in _pty_voice.poll(
+                    session_id, handle.claude_sid, PROJECT_DIR
+                ):
+                    await _post_pty_text(session_id, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Terminal voice sweep failed")
 
 
 def _repaint_attached_ptys() -> int:
