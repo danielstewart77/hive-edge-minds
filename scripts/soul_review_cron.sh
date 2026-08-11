@@ -33,6 +33,18 @@ if [ "${1:-}" = "--dry-run" ]; then
     exit 0
 fi
 
+# Checked before anything is attempted, and reported as a real line. The
+# `${COMMS_URL:?}` form below only kills the subshell it sits in, so a missing
+# variable used to log "could not open a session:" with nothing after the
+# colon and exit 0 — cron calls that success, and the daily pass can be dead
+# for months in a log nobody reads.
+for required in COMMS_URL MIND_ID COMMS_BEARER_TOKEN; do
+    if [ -z "${!required:-}" ]; then
+        echo "[$(stamp)] $required is not set; no review dispatched" >> "$LOG"
+        exit 1
+    fi
+done
+
 AUTH="Authorization: Bearer ${COMMS_BEARER_TOKEN:-}"
 
 SESSION=$(curl -sS -m 30 -X POST "${COMMS_URL:?}/sessions" \
@@ -48,7 +60,14 @@ fi
 
 RESP=$(curl -sS -m 900 -X POST "${COMMS_URL}/sessions/$SID/message" \
     -H "$AUTH" -H "Content-Type: application/json" \
-    -d "$(jq -nc --arg m "$PROMPT" '{message:$m}')" 2>&1)
+    -d "$(jq -nc --arg m "$PROMPT" '{content:$m}')" 2>&1)
 
-echo "[$(stamp)] session=$SID dispatched; reply=$(printf '%s' "$RESP" | head -c 400)" >> "$LOG"
+# A 422 or an error body is a review that did not happen. Saying "dispatched"
+# either way is how a broken daily pass looks identical to a working one.
+if printf '%s' "$RESP" | jq -e 'has("detail") or has("error")' >/dev/null 2>&1; then
+    echo "[$(stamp)] session=$SID REFUSED: $(printf '%s' "$RESP" | head -c 400)" >> "$LOG"
+    exit 1
+fi
+
+echo "[$(stamp)] session=$SID reviewed; reply=$(printf '%s' "$RESP" | head -c 400)" >> "$LOG"
 exit 0
