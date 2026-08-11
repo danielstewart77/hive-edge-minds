@@ -75,8 +75,10 @@ different provider, and keeps its browser terminal — which is why no
   `model_providers.<mind>_ollama` config block and selected with
   `model_provider` — `_provider_args` builds those `-c` flags, and the pane
   caches them because a rotation respawns it with no registry in hand.
-  `env_key` is declared only when a key is actually configured: bare Ollama
-  needs no auth, a metering proxy in front of it does.
+  Ollama is reached through the inference proxy, never as a bare daemon, and
+  the proxy answers 401 without a bearer key — so `env_key` is always
+  declared, unconditionally, rather than only when a key happens to be
+  visible in the provider block or the ambient environment.
   Codex mints its own thread ids and
   cannot adopt the gateway's conversation id; hive-comms persists that
   provider-native id as `harness_sid`, while the edge mind keeps a local
@@ -346,6 +348,40 @@ successor's own turn could collide with is a second prompt queued behind the
 first, so a fire takes the marker under a claim: two respawns of one pane
 onto one conversation id race over a single seed file, and the loser's
 message is gone.
+
+### Terminal voice (transcript tailing, not the pty bytes)
+
+The tile's speaker reads assistant events off the gateway's session event
+stream, and exactly one thing publishes those events — `send_message`, the
+chat path. A conversation hosted in a pty therefore publishes none by
+default: the pty bridge moves raw rendered bytes (ANSI, an alternate
+buffer, repaints), not the structured text a speaker could read aloud.
+
+`pty_voice.py` gives a live terminal the same voice a chat surface gets, by
+tailing the harness's own transcript instead of parsing the screen.
+`SessionVoice` keeps one `TranscriptTailer` per live terminal, swept every
+`SWEEP_INTERVAL_S` (0.5s) by `mind_server`'s `_pty_voice_sweep` background
+task, and posts each new prose block to `POST /sessions/{id}/pty-text` on
+hive-comms via `_post_pty_text` — a best-effort call, logged at debug and
+never raised, since a gateway that's down should cost one block of audio
+and nothing else. The sweep runs for every live terminal regardless of
+whether a tile is attached or its speaker is on; that state is the
+browser's to know, and tracking it here would mean holding a copy of
+per-tile UI state the mind has no way to keep current.
+
+A tailer opens at end-of-file when it first sees a conversation (so
+attaching to a session with hours of history doesn't read the past aloud),
+but re-opens from the top when the conversation id under an
+already-followed session changes — that's a rotation, and everything in
+the new conversation is new. Only `text` content blocks are read; `thinking`
+is skipped because the harness writes it empty to disk regardless, and
+`tool_use`/`tool_result` are skipped because reading a diff aloud isn't
+speech. The browser strips fenced code blocks from what it sends to the
+voice server (`terminal-routing.js`'s `speakable`) while leaving them on
+screen, and silences an unterminated fence entirely rather than speaking a
+half-written command. hive-comms gates its own chat-path publishing on
+`owner_type` so a Telegram-driven turn isn't spoken twice — once by
+`send_message`, once by the tailer reading the same transcript.
 
 ### Cross-surface session pickup
 
