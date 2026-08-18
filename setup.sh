@@ -288,16 +288,24 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: hive-edge-mind-$NAME
+    init: true
     restart: unless-stopped
     working_dir: /usr/src/app
     env_file:
       - .env
+    environment:
+      HIVE_LOG_FORMAT: json
     ports:
       - "$PORT:$PORT"
 $operator_block
 $codex_volume_line
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 $codex_volumes_block
 EOF
     echo "Wrote docker-compose.yml"
