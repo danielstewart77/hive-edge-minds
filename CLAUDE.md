@@ -453,6 +453,80 @@ What the harness does with a newly-written skill is the harness's business.
 This machinery copies a directory into the one the harness reads; it makes
 no claim about when that skill becomes loadable.
 
+### Editing what the harness reads
+
+`skills_sync` moves whole skill directories between the two sides.
+`mind_files.py` is the other half of the same page and a narrower thing:
+the files themselves, in the two directories the harness actually reads,
+listed and edited in place. `mind_server.py` exposes it as
+`GET /files/{tree}` (one row per file, with `size` and whether it can be
+opened as text), `GET /files/{tree}/content?path=` and
+`PUT /files/{tree}/content`. `tree` is `skills` or `hooks` and nothing
+else — every other path on the mind's disk is out of reach by construction
+rather than by a rule someone has to remember. Admin-guarded, reads
+included: a hooks listing names every script the mind runs per turn, and
+those scripts carry gateway URLs and bearer usage.
+
+Containment is judged on the *resolved* path, not the spelling. A skill
+legitimately carries symlinks — `_copy_skill` preserves them deliberately —
+so a lexical `..` check would admit a symlink aimed at `~/.ssh` while
+refusing an ordinary file inside a skill. The two trees are walked
+differently for the same reason they are separate: `hooks` is a flat
+directory the harness reads whole, while the skills root also holds a
+mind's own state (`.usage.json` under its lock, `.curator_state` at 0600,
+`.archived/`), so only directories holding a `SKILL.md` are descended into
+— the same population `skills_sync` reports. What a skill *installed* is
+not the skill: `venv`, `node_modules` and `site-packages` are omitted and
+**named** in the response, because a listing that quietly drops things
+teaches its reader to distrust it about absence.
+
+Containment allows two roots: the tree, and the harness's `plugins/`
+directory — a plugin skill is installed as a symlink into the latter, and
+refusing it would leave a skill the mind actually runs neither listable nor
+openable. `plugins/` rather than the whole config home, because the home
+also holds `settings.json`, and a symlink planted in a skill directory
+would otherwise turn an editor for skills into an editor for the harness's
+own tokens. A symlink resolving outside both is *named* in the response
+rather than dropped from it — "this points somewhere I will not follow"
+and "this does not exist" are different sentences, and a browser that hid
+the first could not be trusted about the second.
+
+The listing samples the head of each file to decide whether it is
+editable, tolerating a multi-byte character cut in half at that boundary:
+reading every file whole would be gigabytes inside the console's timeout,
+and a naive sniff makes editability depend on whether an em-dash happens to
+straddle offset 4096.
+
+A save is a temp file and an `os.replace`, carrying the original's mode
+across. Truncating in place would let a bash hook that is 60 seconds into a
+three-minute run keep reading from its byte offset into a file that no
+longer says what it did, and a fresh inode at 0644 is a hook that silently
+stops firing on the next turn. The staging file sits at the *tree root*,
+not beside the target: a crash between write and rename leaves it behind,
+and inside a skill directory `skills_sync` would hash it — pinning that
+skill at `differs` forever, whose only offered remedy is the one that
+discards the edit. Stale staging is swept on the next save.
+
+Reads and writes pin `encoding="utf-8", newline=""`. Universal-newline
+translation is silent in both directions: a CRLF file read and saved back
+unchanged rewrites every line, and on a `windows-task` mind a text-mode
+write turns an LF shell script into one that dies on its own shebang.
+
+Reads hand back a `revision`, and a save returns the hash of the bytes it
+just wrote rather than a re-read — a re-read hands back whatever landed
+*after* the save, which the editor would store as its own, so its next save
+would pass the check and clobber silently. A save must carry a revision — one that is
+optional on the wire is not a check at all, since the next caller to omit
+it overwrites silently — and a stale one is refused with 409. The sync table sits directly above this editor and its "Apply repo
+copy" replaces the whole directory — without the check, opening a file,
+reverting the skill, then saving the buffer silently un-reverts it, and
+two tabs do the same thing to each other.
+
+Liveness differs by tree and the console says so rather than promising one
+answer: a hook is re-exec'd per event, so an edit to one is live
+immediately; a skill's frontmatter is read when a harness process starts,
+so a conversation already running keeps the copy it loaded.
+
 ### What the repo ships
 
 `specs/skills/<harness>/` carries the skills without which a mind is not a
