@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import models_api
 import pty_voice
 import runtime_config
+import mind_files
 import skills_sync
 from hive_logging import configure_logging, install_fastapi_logging, log_event, log_if_slow
 
@@ -377,6 +378,20 @@ def _harness() -> str:
     return str(runtime_config.load_runtime(MIND_NAME).get("harness") or "")
 
 
+def _files_failure(exc: Exception) -> JSONResponse:
+    """As `_skill_failure`, except that a harness fault is not a 404.
+
+    The console maps a 404 on the listing route to "this Mind is running a
+    version without the file editor API", which is a confident and wrong
+    diagnosis for a `runtime.yaml` that has lost its `harness` key.
+    """
+    if isinstance(exc, skills_sync.SkillError) and str(exc).startswith(
+        "Unknown harness"
+    ):
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return _skill_failure(exc)
+
+
 def _skill_failure(exc: Exception) -> JSONResponse:
     """One mapping for every skills failure, so the console reads one shape."""
     if isinstance(exc, skills_sync.SkillUnavailable):
@@ -467,6 +482,85 @@ async def delete_skill(request: Request, name: str):
         return _skill_failure(exc)
     log_event(log, "mind.skill.removed", mind_id=MIND_ID, skill=name)
     return {"removed": True, "name": name}
+
+
+@app.get("/files/{tree}")
+async def get_files(request: Request, tree: str):
+    """Every file under one of this mind's two editable trees.
+
+    `skills` and `hooks` only. The console cannot see either directory —
+    a mind on another machine has no bind mount to offer — so the mind
+    reports the tree and the console renders it.
+
+    Guarded like the skills routes, and for the same reason: this names
+    every hook and skill file the mind runs, on a LAN-reachable port.
+    """
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        return mind_files.list_tree(_harness(), tree)
+    except (ValueError, OSError) as exc:
+        return _files_failure(exc)
+
+
+@app.get("/files/{tree}/content")
+async def get_file_content(request: Request, tree: str, path: str = ""):
+    """One file's text, or the reason it cannot be shown as text.
+
+    The path rides as a query parameter rather than in the route: a file
+    inside a skill is `memory/scripts/recall.sh`, and a path parameter
+    would have to be re-joined from segments to say the same thing.
+    """
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        return mind_files.read_file(_harness(), tree, path)
+    except (ValueError, OSError) as exc:
+        return _files_failure(exc)
+
+
+@app.put("/files/{tree}/content")
+async def put_file_content(request: Request, tree: str):
+    """Replace one existing file's contents. Live for the next turn."""
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    path = str(body.get("path") or "")
+    text = body.get("text")
+    if not isinstance(text, str):
+        return JSONResponse({"error": "text required"}, status_code=400)
+    # Required, not optional. A staleness check nobody has to send is not a
+    # staleness check: a curl or a refactored fetch that omits it silently
+    # overwrites whatever landed since the file was read.
+    revision = body.get("revision")
+    if not isinstance(revision, str) or not revision:
+        return JSONResponse(
+            {"error": "revision required — reread the file and send its revision"},
+            status_code=400,
+        )
+    try:
+        result = await asyncio.to_thread(
+            mind_files.write_file, _harness(), tree, path, text, revision
+        )
+    except mind_files.FileTooLarge as exc:
+        return JSONResponse({"error": str(exc)}, status_code=413)
+    except mind_files.StaleWrite as exc:
+        # 409, not 404: the file is there and the caller may retry once it
+        # has reread it. A refusal that read as "no such file" would send
+        # the console looking for the wrong problem.
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except (ValueError, OSError) as exc:
+        return _files_failure(exc)
+    log_event(log, "mind.file.saved", mind_id=MIND_ID, tree=tree, path=path)
+    return result
 
 
 @app.get("/sessions")
