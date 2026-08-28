@@ -492,3 +492,28 @@ def test_a_text_file_is_not_called_binary_by_where_the_sniff_lands(mind):
     assert client.get(
         "/files/hooks/content", params={"path": "prose_hook.sh"}, headers=_auth()
     ).json()["text"] == body
+
+
+# 12. A save body whose `text` is not a string is refused, not coerced. This
+#     route writes hooks that execute every turn; a missing field, a null or
+#     an object turning into "" or a Python repr on a 200 OK would truncate
+#     or corrupt a live executable while telling the caller it worked.
+@pytest.mark.parametrize("bad", [None, 123, {"a": 1}, ["line"], True])
+def test_a_save_whose_text_is_not_a_string_is_refused(mind, bad):
+    client, home, _ = mind
+    hook = home / "hooks" / "stop.sh"
+    original = "#!/bin/sh\necho standing\n"
+    hook.write_text(original)
+
+    opened = client.get(
+        "/files/hooks/content", params={"path": "stop.sh"}, headers=_auth()
+    ).json()
+
+    body = {"path": "stop.sh", "revision": opened["revision"]}
+    if bad is not None:
+        body["text"] = bad
+    response = client.put("/files/hooks/content", json=body, headers=_auth())
+
+    assert response.status_code == 400
+    assert "text required" in response.json()["error"]
+    assert hook.read_text() == original, "a refused save must not touch the file"
