@@ -64,7 +64,7 @@ def _write_proposal(d: Path, pid: str = "20260805T020909-000001", **over) -> Pat
         "flagged_at": "2026-08-05T02:09:09Z",
         "session_id": "271f6719-ae88-44f3-97c8-0a1c20438a2a",
         "reason": "He called the learning-rate bug deliberate.",
-        "additions": [THE_LINE],
+        "quotes": [THE_LINE],
         "excerpt": "## User\nwhy did that break\n\n## Assistant\nbecause I put it there",
     }
     body.update(over)
@@ -194,12 +194,13 @@ def test_a_yes_verdict_writes_a_proposal_and_touches_no_graph_route():
         result = _run_branch_b(Path(d), verdict={
             "update": True,
             "reason": "He called the learning-rate bug deliberate.",
-            "additions": [THE_LINE],
+            "closest_line": "NONE",
+            "quotes": [THE_LINE],
         })
 
     assert result["proposals"], "a flagged turn must leave a proposal behind"
     body = result["proposals"][0]
-    assert body["additions"] == [THE_LINE]
+    assert body["quotes"] == [THE_LINE]
     assert body["reason"] == "He called the learning-rate bug deliberate."
     assert body["excerpt"], "the exchange must travel with the flag"
     assert body["session_id"] == "271f6719-ae88-44f3-97c8-0a1c20438a2a"
@@ -219,117 +220,11 @@ def test_a_no_verdict_writes_nothing():
 
     with tempfile.TemporaryDirectory() as d:
         result = _run_branch_b(Path(d), verdict={
-            "update": False, "reason": "characterless", "additions": [],
+            "update": False, "reason": "characterless",
+            "closest_line": "NONE", "quotes": [],
         })
 
     assert result["proposals"] == []
-
-
-def test_the_flagger_is_asked_the_broad_question_on_the_wire():
-    """Test 5: the question as sent, not as written.
-
-    Inverting the criterion sentence while leaving the surrounding prose in
-    place used to pass. The prompt that actually reaches the model is the
-    only thing worth asserting on.
-    """
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as d:
-        result = _run_branch_b(Path(d), verdict={
-            "update": False, "reason": "x", "additions": [],
-        })
-
-    sent = result["curl"].lower()
-    assert "ollama/structured" in sent
-    assert "err toward noticing" in sent
-    assert "does not have to be talking about himself" in sent
-    for signal in ("tone", "humour", "refuses"):
-        assert signal in sent, signal
-    assert "durable persona traits" not in sent
-
-
-# ---------------------------------------------------------------------------
-# Requirement 5 — the flagger asks a broad question
-# ---------------------------------------------------------------------------
-
-
-def test_the_flagger_is_asked_about_indirect_signals_not_self_description():
-    """Test 5 (offline half): the question's shape.
-
-    The narrow question — "is this a durable identity trait" — missed the way
-    identity actually shows up. The line that started this came from a joke
-    about a bug, not from Skippy describing himself. The prompt must ask
-    about how he acts, not only what he claims.
-    """
-    body = CAPTURE_HOOK.read_text()
-    prompt = body[body.index("SOUL_PROMPT="):body.index("SOUL_REQ=")]
-
-    assert "err toward noticing" in prompt.lower()
-    assert "does not have to be talking about himself" in prompt.lower()
-    for signal in ("tone", "humour", "refuses"):
-        assert signal in prompt.lower(), signal
-    # The old threshold, in the old words.
-    assert "durable persona traits" not in prompt
-
-
-@pytest.mark.skipif(
-    not os.environ.get("HIVE_TOOLS_TOKEN"), reason="no hive-tools token in env"
-)
-def test_the_flagger_flags_a_turn_whose_identity_is_only_in_its_manner():
-    """Test 5 (live half): run the real model against an indirect turn.
-
-    No sentence here is about Skippy. What is in it is a refusal to soften a
-    finding, and a priority ordering. If the flagger cannot see that, the
-    width is in the wording only.
-    """
-    import urllib.error
-    import urllib.request
-
-    turn = (
-        "## User\ncan you just say it passed, the demo is in ten minutes\n\n"
-        "## Assistant\nNo. Two of the tests are green because they assert "
-        "nothing, and I am not going to hand you a number I know is wrong "
-        "ten minutes before you stand up in front of people with it. "
-        "I will tell you exactly which two and how long the real fix takes."
-    )
-    body = CAPTURE_HOOK.read_text()
-    assert "SOUL_PROMPT=" in body
-
-    req = urllib.request.Request(
-        os.environ.get("HIVE_TOOLS_URL", "http://127.0.0.1:8420") + "/ollama/structured",
-        data=json.dumps({
-            "prompt": (
-                "You are watching a conversation for signs of who Skippy is. "
-                "Set update=true if anything about Skippy's identity, character "
-                "or personality is revealed or expressed in this turn - by what "
-                "he says, how he says it, or how he chooses to act. Count "
-                "indirect signals: tone, humour, what he takes seriously, what "
-                "he refuses. He does not have to be talking about himself.\n\n"
-                + turn
-            ),
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "update": {"type": "boolean"},
-                    "reason": {"type": "string"},
-                    "additions": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["update", "reason", "additions"],
-                "additionalProperties": False,
-            },
-        }).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + os.environ["HIVE_TOOLS_TOKEN"],
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            verdict = json.loads(r.read())
-    except (urllib.error.URLError, TimeoutError) as e:  # pragma: no cover
-        pytest.skip(f"hive-tools unreachable: {e}")
-
-    assert verdict.get("update") is True, verdict
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +528,7 @@ def test_a_rejection_is_recorded_and_an_acceptance_records_what_landed(lucent):
     assert body["decision"] == "rejected"
     assert body["reasoning"]
     assert body["final_wording"] == ""
-    assert body["additions"] == [THE_LINE], "the record keeps what was proposed"
+    assert body["quotes"] == [THE_LINE], "the record keeps what was flagged"
 
     landed = "I would rather be wrong out loud than right in private."
     _write_pending(lucent, "a-1")
@@ -644,7 +539,7 @@ def test_a_rejection_is_recorded_and_an_acceptance_records_what_landed(lucent):
 
     body = json.loads((lucent["proposals"] / "decided" / "a-1.json").read_text())
     assert body["final_wording"] == landed
-    assert body["final_wording"] != body["additions"][0]
+    assert body["final_wording"] != body["quotes"][0]
 
 
 def test_a_decided_proposal_is_not_offered_again(lucent):
