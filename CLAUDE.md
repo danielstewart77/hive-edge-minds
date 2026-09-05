@@ -121,9 +121,13 @@ and the broker row second, so a restart can't undo the edit.
 
 `GET /models` is the admin-guarded counterpart the console's picker reads:
 `models_api.build_catalog` relays the inference proxy's own listing for this
-mind's proxy credential, on the endpoint that identifies its harness
-(`/v1/anthropic/models` for claude, `/v1/models` for codex), so what the
-picker offers is exactly what the mind's key may address — no vendor
+mind's proxy credential, naming its harness on the request
+(`/v1/models?harness=claude`, or `codex`) rather than implying it by which
+endpoint it asked on — a harness that speaks every wire has no endpoint that
+could identify it, and a listing route per harness is how one model ends up
+offered to one caller and invisible to another for no reason anybody can see.
+Omitting the parameter returns the union, so what the picker offers is exactly
+what the mind's key may address and its harness can actually send — no vendor
 mapping lives on this side of the call. An unreachable proxy yields an empty
 list rather than raising, since the console needs "nothing offered" and
 "the mind is down" to read differently.
