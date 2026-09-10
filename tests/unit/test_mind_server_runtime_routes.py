@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import session_auth
+
 import runtime_config
 
 
@@ -162,7 +164,12 @@ class TestBrokerSelfRegistration:
 
         assert posted["url"] == "http://comms:8426/broker/minds"
         assert posted["headers"]["Authorization"] == "Bearer admin"
-        assert posted["payload"] == {
+        # The session token rides along too — the registration is the only
+        # channel by which the gateway learns what to present back — and is
+        # asserted in ``test_per_mind_session_auth.py`` rather than pinned to
+        # a value here.
+        payload = {k: v for k, v in posted["payload"].items() if k != "session_token"}
+        assert payload == {
             "mind_id": "565e5a66-d20c-4266-872a-3268c4c894fc",
             "name": "ada",
             "gateway_url": "http://ada:8420",
@@ -227,6 +234,7 @@ class TestSpawnRequiresAModel:
         response = client.post(
             "/sessions",
             json={"session_id": "s1", "resume_sid": "c1"},
+            headers=session_auth(),
         )
         assert response.status_code == 400
         assert "model" in response.json()["error"]

@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import session_auth
+
 os.environ.setdefault("MIND_ID", "test-mind-id")
 os.environ.setdefault("MIND_NAME", "example")
 os.environ.setdefault("CLAUDE_CONFIG_DIR", tempfile.mkdtemp(prefix="release-test-"))
@@ -31,7 +33,13 @@ def client(monkeypatch, tmp_path):
             importlib.reload(mind_server)
             mind_server.impl.tmux_session_name = lambda session_id: f"example-{session_id}"
             mind_server.impl.kill_pty_session = MagicMock(return_value=True)
-            yield TestClient(mind_server.app, raise_server_exceptions=False), mind_server
+            yield TestClient(
+                mind_server.app,
+                raise_server_exceptions=False,
+                # Session routes take this mind's own credential, the way the
+                # gateway presents it.
+                headers=session_auth(),
+            ), mind_server
             mind_server._ptys.clear()
             mind_server._sessions.clear()
 

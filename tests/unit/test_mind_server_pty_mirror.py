@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import session_auth
+
 from bots import proactive
 
 
@@ -280,7 +282,10 @@ def _make_proc(written: list, assistant_text: str):
 
 class TestSendMessageMirrorsToPty:
     def test_live_turn_is_mirrored_to_an_open_terminal(self, mind_server_mod):
-        client = TestClient(mind_server_mod.app, raise_server_exceptions=False)
+        client = TestClient(
+            mind_server_mod.app, raise_server_exceptions=False,
+            headers=session_auth(),
+        )
         handle = _FakeHandle()
         mind_server_mod._ptys["sess-msg"] = handle
         written: list = []
@@ -304,7 +309,10 @@ class TestSendMessageMirrorsToPty:
 
     def test_no_open_terminal_is_unaffected(self, mind_server_mod):
         """The common case — no browser tile open — must not raise or change behavior."""
-        client = TestClient(mind_server_mod.app, raise_server_exceptions=False)
+        client = TestClient(
+            mind_server_mod.app, raise_server_exceptions=False,
+            headers=session_auth(),
+        )
         written: list = []
         mind_server_mod._sessions["sess-no-term"] = {
             "proc": _make_proc(written, "reply"),

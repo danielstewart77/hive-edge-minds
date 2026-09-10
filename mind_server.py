@@ -305,6 +305,73 @@ def _authorize_admin(request: Request) -> JSONResponse | None:
     return None
 
 
+def _presented_bearer(request) -> str:
+    """The credential on a request, from either place a client can put it.
+
+    A browser cannot set headers on a WebSocket handshake, so the subprotocol
+    is the only channel a direct attach has; the gateway's proxy uses the
+    header.
+    """
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        return header[7:]
+    for part in request.headers.get("Sec-WebSocket-Protocol", "").split(","):
+        part = part.strip()
+        if part.startswith("bearer."):
+            return part[7:]
+    return ""
+
+
+def _authorize_session(request) -> JSONResponse | None:
+    """Guard a session route. None means the caller may proceed.
+
+    Accepts this mind's session token — the gateway, which is its only real
+    caller — or the admin token, so the console or the operator can reach a
+    wedged session directly. A mind holding no token of its own serves as it
+    always did: that is what lets the fleet move one machine at a time.
+    """
+    expected = runtime_config.session_token(MIND_NAME)
+    if not expected:
+        return None
+    presented = _presented_bearer(request)
+    if secrets.compare_digest(presented, expected):
+        return None
+    admin = runtime_config.admin_token()
+    if admin and secrets.compare_digest(presented, admin):
+        return None
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+async def _refuse_session_websocket(websocket, denial: JSONResponse) -> None:
+    """Refuse a WebSocket attach with a real HTTP status.
+
+    A pre-accept `close()` presents to the gateway as HTTP 403 — which is also
+    what a mind whose build predates the terminal routes answers — so the
+    denial response is what keeps "refused your credential" from being read as
+    "has no terminal".
+    """
+    try:
+        await websocket.send_denial_response(denial)
+    except (RuntimeError, AttributeError):
+        await websocket.close(code=4401, reason="unauthorized")
+
+
+@app.middleware("http")
+async def _guard_session_routes(request: Request, call_next):
+    """Require this mind's credential on every `/sessions` HTTP route.
+
+    One middleware rather than a decorator per route: a session route added
+    later cannot ship open by being forgotten, and `DELETE /sessions/{id}`
+    matters as much as the message route. The config surface is untouched —
+    `/runtime`, `/skills`, `/files` and `/models` keep their admin guard.
+    """
+    if request.url.path.startswith("/sessions"):
+        denied = _authorize_session(request)
+        if denied is not None:
+            return denied
+    return await call_next(request)
+
+
 @app.get("/runtime")
 async def get_runtime():
     """This mind's runtime configuration, as the console renders it."""
@@ -1089,6 +1156,15 @@ async def attach_pty(
     carrying ``{"type":"resize","cols":N,"rows":M}`` retarget it live, and
     tmux redraws the pane for the new geometry.
     """
+    # The thing knocking is the gateway proxying a tile, not the browser.
+    # Either credential opens it: the session token for the proxy, the admin
+    # token so the console or the operator can attach to a wedged pane.
+    denied = _authorize_session(websocket)
+    if denied is not None:
+        log.warning("attach-pty for session %s refused", session_id)
+        await _refuse_session_websocket(websocket, denied)
+        return
+
     await websocket.accept()
 
     if not hasattr(impl, "spawn_pty"):

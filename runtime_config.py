@@ -13,8 +13,10 @@ row, so the two can't diverge across a restart.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import secrets
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,14 @@ from typing import Any
 import yaml
 
 PROJECT_DIR = Path(__file__).resolve().parent
+
+log = logging.getLogger("hive-edge.runtime")
+
+# The credential the gateway must present on every call it makes to this mind.
+# Kept beside runtime.yaml rather than inside it: runtime.yaml is what
+# `GET /runtime` serves, and a secret one allowlist edit away from being
+# published is a secret waiting to be published.
+SESSION_TOKEN_FILENAME = "session_token"
 
 # Same shape the console validates against: an alias (`opus`), an Ollama tag
 # (`qwen3:30b-a3b-instruct-2507-q4_K_M`), or a vendor id (`gpt-5.4`).
@@ -138,13 +148,77 @@ def registration_payload(mind_name: str) -> dict[str, str]:
     ]
     if missing:
         raise ValueError(f"runtime.yaml is missing: {', '.join(missing)}")
-    return {
+    payload = {
         "mind_id": str(loaded["mind_id"]).strip(),
         "name": str(loaded.get("name") or mind_name).strip(),
         "gateway_url": str(loaded["gateway_url"]).strip(),
         "model": str(loaded["default_model"]).strip(),
         "harness": str(loaded["harness"]).strip(),
     }
+    # The admin-guarded registration this mind already performs every boot is
+    # the only channel by which the gateway learns the credential. Omitted
+    # when there is none, so a boot that could not read its own token file
+    # does not erase the gateway's working copy.
+    token = session_token(mind_name)
+    if token:
+        payload["session_token"] = token
+    return payload
+
+
+def session_token_path(mind_name: str) -> Path:
+    """Where this mind keeps its own session credential."""
+    return runtime_path(mind_name).parent / SESSION_TOKEN_FILENAME
+
+
+def session_token(mind_name: str) -> str:
+    """This mind's own session credential, minted once and kept.
+
+    Minted rather than issued: a mind nobody provisioned still ends up with a
+    credential of its own, and one taken off it opens that mind and no other.
+    `MIND_SESSION_TOKEN` overrides the file for installs that inject secrets
+    rather than letting the mind write them.
+
+    Returns "" when there is none and none can be written — a read-only mind
+    directory must leave the mind serving as it did before, not brick it.
+    """
+    injected = os.environ.get("MIND_SESSION_TOKEN", "").strip()
+    if injected:
+        return injected
+
+    path = session_token_path(mind_name)
+    existing = _read_token(path)
+    if existing:
+        return existing
+
+    minted = secrets.token_urlsafe(32)
+    try:
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Another reader won the race, or left an empty file behind. Whatever
+        # is there now is this mind's token.
+        raced = _read_token(path)
+        if raced:
+            return raced
+        try:
+            path.write_text(minted + "\n")
+            path.chmod(0o600)
+        except OSError:
+            log.warning("Could not write session token at %s", path)
+            return ""
+        return minted
+    except OSError:
+        log.warning("Could not create session token at %s", path)
+        return ""
+    with os.fdopen(handle, "w") as stream:
+        stream.write(minted + "\n")
+    return minted
+
+
+def _read_token(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
 
 
 def admin_token() -> str:
