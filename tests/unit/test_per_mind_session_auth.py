@@ -36,6 +36,9 @@ def mind_dir(tmp_path, monkeypatch):
     (directory / "runtime.yaml").write_text(RUNTIME)
     monkeypatch.setattr(runtime_config, "PROJECT_DIR", tmp_path)
     monkeypatch.delenv("MIND_SESSION_TOKEN", raising=False)
+    # The token is cached per process, so a test inheriting the previous
+    # test's value would never touch the file it means to be asserting on.
+    runtime_config._token_cache.clear()
     return directory
 
 
@@ -68,12 +71,69 @@ class TestMintingTheToken:
         monkeypatch.setenv("MIND_SESSION_TOKEN", "from-the-env")
         assert runtime_config.session_token("ada") == "from-the-env"
 
-    def test_an_unwritable_directory_yields_no_token_rather_than_raising(
+    def test_the_token_is_read_once_per_process(self, mind_dir):
+        """The guard asks on every request; the file is read on the first."""
+        token = runtime_config.session_token("ada")
+        (mind_dir / "session_token").unlink()
+        assert runtime_config.session_token("ada") == token
+
+    def test_an_unwritable_directory_refuses_rather_than_serving_open(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setattr(runtime_config, "PROJECT_DIR", tmp_path / "nowhere")
         monkeypatch.delenv("MIND_SESSION_TOKEN", raising=False)
-        assert runtime_config.session_token("ada") == ""
+        runtime_config._token_cache.clear()
+        with pytest.raises(runtime_config.SessionTokenUnavailable):
+            runtime_config.session_token("ada")
+
+    def test_an_unreadable_file_is_not_treated_as_an_absent_one(
+        self, mind_dir, monkeypatch
+    ):
+        """Folding the two together is how a mind serves every session route
+        open because a migration chowned its own directory."""
+        runtime_config.session_token("ada")
+        (mind_dir / "session_token").chmod(0o000)
+        runtime_config._token_cache.clear()
+        try:
+            with pytest.raises(runtime_config.SessionTokenUnavailable):
+                runtime_config.session_token("ada")
+        finally:
+            (mind_dir / "session_token").chmod(0o600)
+
+    def test_a_file_holding_non_utf8_bytes_is_refused_not_crashed_through(
+        self, mind_dir
+    ):
+        (mind_dir / "session_token").write_bytes(b"\xff\xfe not text")
+        runtime_config._token_cache.clear()
+        with pytest.raises(runtime_config.SessionTokenUnavailable):
+            runtime_config.session_token("ada")
+
+    def test_an_empty_file_left_by_a_lost_race_is_refused_not_overwritten(
+        self, mind_dir, monkeypatch
+    ):
+        """`O_EXCL` creates the file before its winner writes into it. Minting
+        a second token here would clobber a credential another process is
+        already enforcing."""
+        monkeypatch.setattr(runtime_config, "_RACE_READS", 2)
+        monkeypatch.setattr(runtime_config, "_RACE_PAUSE_S", 0)
+        path = mind_dir / "session_token"
+        path.touch(mode=0o600)
+        with pytest.raises(runtime_config.SessionTokenUnavailable):
+            runtime_config.session_token("ada")
+        assert path.read_text() == "", "the empty file was overwritten"
+
+    def test_a_token_written_mid_race_is_adopted(self, mind_dir, monkeypatch):
+        path = mind_dir / "session_token"
+        path.touch(mode=0o600)
+        reads = {"n": 0}
+
+        def _late_writer(_pause):
+            reads["n"] += 1
+            if reads["n"] == 2:
+                path.write_text("the-winner-s-token\n")
+
+        monkeypatch.setattr(runtime_config.time, "sleep", _late_writer)
+        assert runtime_config.session_token("ada") == "the-winner-s-token"
 
 
 class TestTheTokenIsNotServed:
@@ -147,13 +207,37 @@ class TestTheSessionGuard:
         headers = {"Sec-WebSocket-Protocol": f"bearer.{token}"}
         assert server._authorize_session(_request(headers)) is None
 
-    def test_a_mind_holding_no_token_serves_as_it_always_did(self, server):
-        """The rollout: a mind that cannot write one is reachable, not dark."""
-        with patch.object(runtime_config, "session_token", return_value=""):
-            assert server._authorize_session(_request()) is None
-            assert server._authorize_session(
-                _request({"Authorization": "Bearer anything-at-all"})
-            ) is None
+    def test_a_bare_subprotocol_credential_is_admitted(self, server, token):
+        """The other minds in the hive accept the bare form; a console that
+        works against one must work against all of them."""
+        headers = {"Sec-WebSocket-Protocol": token}
+        assert server._authorize_session(_request(headers)) is None
+
+    def test_a_mind_that_cannot_read_its_own_token_refuses_rather_than_opens(
+        self, server
+    ):
+        """Serving open here would answer every caller on the LAN while the
+        gateway went on presenting a token nobody checked."""
+        with patch.object(
+            runtime_config,
+            "session_token",
+            side_effect=runtime_config.SessionTokenUnavailable("chmod 000"),
+        ):
+            denied = server._authorize_session(_request())
+            assert denied is not None
+            assert denied.status_code == 503
+
+    def test_a_non_ascii_credential_is_refused_rather_than_raising(
+        self, server, token
+    ):
+        """On `str`, compare_digest raises TypeError — a 500 where a 401
+        belongs, and on the WS handshake the gateway reads that as
+        \"this mind has no terminal route\"."""
+        denied = server._authorize_session(
+            _request({"Authorization": "Bearer \u00fc\u00e9"})
+        )
+        assert denied is not None
+        assert denied.status_code == 401
 
 
 class TestTheGuardOnRealRoutes:
@@ -173,6 +257,16 @@ class TestTheGuardOnRealRoutes:
         self, client, token, method, path
     ):
         assert getattr(client, method)(path).status_code == 401
+
+    def test_a_host_header_cannot_move_a_route_out_of_the_guard_s_view(
+        self, client, token
+    ):
+        """Starlette builds `request.url` from the Host header, so a Host
+        carrying a \"/\" or \"#\" used to hide the path from the guard while
+        the router still matched it."""
+        for host in ("mind.test/", "mind.test#", "mind.test?x"):
+            response = client.get("/sessions", headers={"Host": host})
+            assert response.status_code == 401, host
 
     def test_the_listing_answers_the_mind_s_own_token(self, client, token):
         response = client.get(

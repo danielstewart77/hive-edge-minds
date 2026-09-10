@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -165,6 +166,26 @@ def registration_payload(mind_name: str) -> dict[str, str]:
     return payload
 
 
+class SessionTokenUnavailable(ValueError):
+    """This mind cannot establish the credential its session routes require.
+
+    A `ValueError` so the boot registration loop treats it as a retryable
+    payload problem rather than a crash: the mind is still reachable, it just
+    refuses every session call until whatever is wrong with its own directory
+    is fixed.
+    """
+
+
+# How long to wait for the process that won the create race to finish writing.
+_RACE_READS = 20
+_RACE_PAUSE_S = 0.05
+
+# One read per process, not one per request. The middleware asks on every
+# `/sessions` call, and the broker only learns a token at boot anyway, so a
+# value that changed under a running mind could not be published to anyone.
+_token_cache: dict[str, str] = {}
+
+
 def session_token_path(mind_name: str) -> Path:
     """Where this mind keeps its own session credential."""
     return runtime_path(mind_name).parent / SESSION_TOKEN_FILENAME
@@ -178,47 +199,81 @@ def session_token(mind_name: str) -> str:
     `MIND_SESSION_TOKEN` overrides the file for installs that inject secrets
     rather than letting the mind write them.
 
-    Returns "" when there is none and none can be written — a read-only mind
-    directory must leave the mind serving as it did before, not brick it.
+    Raises `SessionTokenUnavailable` when no credential can be established.
+    It never returns "" for that case: a mind that cannot read its own token
+    would otherwise serve its session routes — `attach-pty` among them — open
+    to the LAN, while the gateway went on presenting a credential nobody
+    checked and every surface stayed green.
     """
     injected = os.environ.get("MIND_SESSION_TOKEN", "").strip()
     if injected:
         return injected
 
-    path = session_token_path(mind_name)
+    cached = _token_cache.get(mind_name)
+    if cached:
+        return cached
+
+    token = _mint_or_read_token(session_token_path(mind_name))
+    _token_cache[mind_name] = token
+    return token
+
+
+def _mint_or_read_token(path: Path) -> str:
     existing = _read_token(path)
     if existing:
         return existing
 
-    minted = secrets.token_urlsafe(32)
     try:
         handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        # Another reader won the race, or left an empty file behind. Whatever
-        # is there now is this mind's token.
-        raced = _read_token(path)
-        if raced:
-            return raced
-        try:
-            path.write_text(minted + "\n")
-            path.chmod(0o600)
-        except OSError:
-            log.warning("Could not write session token at %s", path)
-            return ""
-        return minted
-    except OSError:
-        log.warning("Could not create session token at %s", path)
-        return ""
+        # Created between the read above and here. `O_EXCL` makes the file
+        # before its winner writes into it, so an empty file means that write
+        # is still in flight — and minting a second token here would clobber a
+        # credential another process is already enforcing, leaving it
+        # authenticating against something that exists nowhere.
+        for _ in range(_RACE_READS):
+            time.sleep(_RACE_PAUSE_S)
+            raced = _read_token(path)
+            if raced:
+                return raced
+        raise SessionTokenUnavailable(f"{path} exists but holds no credential")
+    except OSError as exc:
+        raise SessionTokenUnavailable(f"cannot write {path}: {exc}") from exc
+
+    minted = secrets.token_urlsafe(32)
     with os.fdopen(handle, "w") as stream:
         stream.write(minted + "\n")
     return minted
 
 
 def _read_token(path: Path) -> str:
+    """The credential on disk, or "" when the file is not there at all.
+
+    A file that exists and cannot be read is not an absent one. Folding the
+    two together is how a mind serves every session route open because a
+    migration chowned its own directory — so only genuine absence returns "".
+    """
     try:
-        return path.read_text().strip()
-    except OSError:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
         return ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SessionTokenUnavailable(f"cannot read {path}: {exc}") from exc
+
+
+def tokens_match(presented: str, expected: str) -> bool:
+    """Constant-time compare of two credentials, on bytes.
+
+    `compare_digest` raises `TypeError` on a `str` holding anything outside
+    ASCII, and the presented value is a raw client-supplied header — so on
+    `str` a single stray byte is a 500 instead of a clean 401, and on the
+    WebSocket handshake the gateway reads that 500 as "this mind has no
+    terminal route" and sends the operator off to rebuild an image.
+    """
+    return secrets.compare_digest(
+        presented.encode("utf-8", "surrogateescape"),
+        expected.encode("utf-8", "surrogateescape"),
+    )
 
 
 def admin_token() -> str:

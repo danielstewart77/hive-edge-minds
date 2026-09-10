@@ -250,9 +250,16 @@ async def _registration_loop(
     compose stack on every reboot; a single registration attempt against a
     comms container that isn't up yet leaves the mind off the registry until
     someone restarts it. Unreachable or erroring comms is retried with
-    doubling delays capped at `max_delay`; an outright rejection stops the
-    loop, because resending an unacceptable payload forever is noise, not
-    persistence.
+    doubling delays capped at `max_delay`. A rejection — comms refusing the
+    payload or the admin bearer — retries at the slow heartbeat cadence rather
+    than stopping: this registration is the only channel by which the gateway
+    learns the credential the mind now demands back, so a loop that gives up
+    leaves a mind that refuses every call the gateway makes, until somebody
+    restarts it. Retrying once every `heartbeat` is not noise, it is the only
+    thing that heals a comms bearer rotated while the mind was up.
+
+    `skipped` does stop it: no `COMMS_URL` or no admin token configured is not
+    a condition retrying can change.
 
     After a success the loop keeps going as a heartbeat: re-registering
     every `heartbeat` seconds converges a broker row that was rebuilt or
@@ -261,12 +268,21 @@ async def _registration_loop(
     delay = initial_delay
     while True:
         outcome = await _register_with_broker()
-        if outcome in ("rejected", "skipped"):
+        if outcome == "skipped":
             log_event(
                 log, "mind.register.loop_stopped", level=logging.WARNING,
                 mind_id=MIND_ID, outcome=outcome,
             )
             return
+        if outcome == "rejected":
+            # The gateway cannot learn this mind's credential, so it cannot
+            # call this mind at all. Keep saying so, slowly.
+            log_event(
+                log, "mind.register.rejected", level=logging.ERROR,
+                mind_id=MIND_ID,
+            )
+            await sleep(heartbeat)
+            continue
         if outcome == "registered":
             delay = initial_delay
             await sleep(heartbeat)
@@ -300,26 +316,36 @@ def _authorize_admin(request: Request) -> JSONResponse | None:
         )
     header = request.headers.get("Authorization", "")
     presented = header[7:] if header.startswith("Bearer ") else ""
-    if not secrets.compare_digest(presented, expected):
+    if not runtime_config.tokens_match(presented, expected):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return None
 
 
-def _presented_bearer(request) -> str:
-    """The credential on a request, from either place a client can put it.
+def _offered_protocols(request) -> list[str]:
+    """The subprotocols a WebSocket client offered, in order."""
+    return [
+        token.strip()
+        for token in request.headers.get("Sec-WebSocket-Protocol", "").split(",")
+        if token.strip()
+    ]
+
+
+def _presented_bearers(request) -> list[str]:
+    """Every credential a caller offered, header and subprotocol alike.
 
     A browser cannot set headers on a WebSocket handshake, so the subprotocol
     is the only channel a direct attach has; the gateway's proxy uses the
-    header.
+    header. Both the bare token and a `bearer.`-prefixed one count, because
+    the other minds in the hive accept the bare form and a console that works
+    against one mind must work against all of them.
     """
+    offered = _offered_protocols(request)
     header = request.headers.get("Authorization", "")
     if header.startswith("Bearer "):
-        return header[7:]
-    for part in request.headers.get("Sec-WebSocket-Protocol", "").split(","):
-        part = part.strip()
-        if part.startswith("bearer."):
-            return part[7:]
-    return ""
+        offered.insert(0, header[7:].strip())
+    return [
+        token[7:] if token.startswith("bearer.") else token for token in offered
+    ]
 
 
 def _authorize_session(request) -> JSONResponse | None:
@@ -327,18 +353,30 @@ def _authorize_session(request) -> JSONResponse | None:
 
     Accepts this mind's session token — the gateway, which is its only real
     caller — or the admin token, so the console or the operator can reach a
-    wedged session directly. A mind holding no token of its own serves as it
-    always did: that is what lets the fleet move one machine at a time.
+    wedged session directly.
+
+    A mind that cannot establish a credential of its own refuses with 503
+    rather than serving open. The transitional state the rollout needs is
+    supplied by minds still running code that has no notion of a credential,
+    not by a mind that has one and cannot read it: that one would answer every
+    caller on the LAN while the gateway went on presenting a token nobody
+    checked, and every surface would look healthy.
     """
-    expected = runtime_config.session_token(MIND_NAME)
-    if not expected:
-        return None
-    presented = _presented_bearer(request)
-    if secrets.compare_digest(presented, expected):
-        return None
+    try:
+        expected = runtime_config.session_token(MIND_NAME)
+    except runtime_config.SessionTokenUnavailable as exc:
+        log.error("Refusing session requests — %s", exc)
+        return JSONResponse(
+            {"error": f"this mind cannot establish its session credential: {exc}"},
+            status_code=503,
+        )
+    presented = _presented_bearers(request)
     admin = runtime_config.admin_token()
-    if admin and secrets.compare_digest(presented, admin):
-        return None
+    accepted = [expected] + ([admin] if admin else [])
+    for token in presented:
+        for candidate in accepted:
+            if runtime_config.tokens_match(token, candidate):
+                return None
     return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
@@ -365,7 +403,13 @@ async def _guard_session_routes(request: Request, call_next):
     matters as much as the message route. The config surface is untouched —
     `/runtime`, `/skills`, `/files` and `/models` keep their admin guard.
     """
-    if request.url.path.startswith("/sessions"):
+    # `scope["path"]` and not `request.url.path`: Starlette builds that URL
+    # from the *Host header* plus the path and re-splits it, so a Host value
+    # carrying a "/" or a "#" moves the route out of `.path` while the router
+    # — which reads the scope — still matches it and runs the handler. One
+    # character in a header the client controls, and every session route on
+    # this mind answers unauthenticated.
+    if request.scope.get("path", "").startswith("/sessions"):
         denied = _authorize_session(request)
         if denied is not None:
             return denied
@@ -1165,7 +1209,12 @@ async def attach_pty(
         await _refuse_session_websocket(websocket, denied)
         return
 
-    await websocket.accept()
+    # Echo the subprotocol back when one was offered. A browser that offers
+    # subprotocols and gets a response carrying none fails the handshake in
+    # both Chrome and Firefox — so without this, the one channel a direct
+    # browser attach has for its credential cannot be used.
+    offered = _offered_protocols(websocket)
+    await websocket.accept(subprotocol=offered[0] if offered else None)
 
     if not hasattr(impl, "spawn_pty"):
         await websocket.close(code=1011, reason=f"attach-pty not supported by mind {MIND_NAME}")
