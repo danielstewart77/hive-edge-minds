@@ -176,9 +176,11 @@ class SessionTokenUnavailable(ValueError):
     """
 
 
-# How long to wait for the process that won the create race to finish writing.
-_RACE_READS = 20
-_RACE_PAUSE_S = 0.05
+# How long an empty token file can plausibly be mid-write. Past this the
+# process that created it is gone and the file is reclaimed, rather than
+# stalling every later request on a write that will never land.
+_RACE_WINDOW_S = 1.0
+_RACE_PAUSE_S = 0.02
 
 # One read per process, not one per request. The middleware asks on every
 # `/sessions` call, and the broker only learns a token at boot anyway, so a
@@ -226,17 +228,7 @@ def _mint_or_read_token(path: Path) -> str:
     try:
         handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        # Created between the read above and here. `O_EXCL` makes the file
-        # before its winner writes into it, so an empty file means that write
-        # is still in flight — and minting a second token here would clobber a
-        # credential another process is already enforcing, leaving it
-        # authenticating against something that exists nowhere.
-        for _ in range(_RACE_READS):
-            time.sleep(_RACE_PAUSE_S)
-            raced = _read_token(path)
-            if raced:
-                return raced
-        raise SessionTokenUnavailable(f"{path} exists but holds no credential")
+        return _adopt_or_reclaim(path)
     except OSError as exc:
         raise SessionTokenUnavailable(f"cannot write {path}: {exc}") from exc
 
@@ -244,6 +236,48 @@ def _mint_or_read_token(path: Path) -> str:
     with os.fdopen(handle, "w") as stream:
         stream.write(minted + "\n")
     return minted
+
+
+def _adopt_or_reclaim(path: Path) -> str:
+    """Resolve an empty token file: someone mid-write, or someone who died.
+
+    `O_EXCL` creates the file before its winner writes into it, so an empty
+    file can mean a write still in flight — and minting a second token over
+    that would leave the winner enforcing a credential that exists nowhere.
+    It can equally mean a process that was killed in the microseconds between
+    the create and the write, which leaves a zero-byte file that no amount of
+    waiting will fill.
+
+    The file's own age separates them, and it always resolves: inside the
+    window this waits in short hops, and the moment the file is older than the
+    window the mint that made it is gone and the file is reclaimed. So the cost
+    is bounded by the window once — never the old behaviour, which was a full
+    second of the event loop (shared here with the surface bots and the pty
+    pumps) on *every* request, forever, for a file only `rm` could fix.
+    """
+    while True:
+        adopted = _read_token(path)
+        if adopted:
+            return adopted
+        try:
+            age = time.time() - path.stat().st_mtime
+        except OSError as exc:
+            raise SessionTokenUnavailable(f"cannot stat {path}: {exc}") from exc
+        if age > _RACE_WINDOW_S:
+            # Nobody is coming. Reclaim it in place, keeping the inode so a
+            # concurrent reader holding it open sees the token rather than a
+            # file that vanished under them.
+            minted = secrets.token_urlsafe(32)
+            try:
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(minted + "\n")
+                os.chmod(path, 0o600)
+            except OSError as exc:
+                raise SessionTokenUnavailable(
+                    f"cannot reclaim empty {path}: {exc}"
+                ) from exc
+            return minted
+        time.sleep(_RACE_PAUSE_S)
 
 
 def _read_token(path: Path) -> str:

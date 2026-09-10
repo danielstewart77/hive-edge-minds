@@ -183,9 +183,20 @@ async def _register_with_broker() -> str:
     import aiohttp
 
     comms_url = os.environ.get("COMMS_URL", "").rstrip("/")
+    # `COMMS_ADMIN_BEARER_TOKEN` specifically, and not the guard's
+    # `admin_token()`: this bearer authenticates *to comms*, which knows
+    # nothing about a local `MIND_ADMIN_TOKEN`. An install holding only the
+    # local one cannot register, and since registration is now the only channel
+    # by which the gateway learns this mind's credential, that mind is
+    # unreachable — which is why the line below is an error rather than the
+    # note it used to be.
     token = os.environ.get("COMMS_ADMIN_BEARER_TOKEN", "")
     if not comms_url or not token:
-        log.info("No COMMS_URL/admin token — skipping broker self-registration")
+        log.error(
+            "No COMMS_URL/admin token: skipping broker self-registration, so "
+            "the gateway will never learn this mind's session credential and "
+            "every call it makes here will be refused"
+        )
         return "skipped"
     try:
         payload = runtime_config.registration_payload(MIND_NAME)
@@ -348,6 +359,24 @@ def _presented_bearers(request) -> list[str]:
     ]
 
 
+def _negotiated_protocol(request) -> str | None:
+    """Which subprotocol to echo back, preferring one that is not a secret.
+
+    The handshake needs *a* protocol echoed or a browser that offered any will
+    fail it outright. But whatever is echoed lands in the response headers and
+    in the reverse proxy's logs, so a client offering
+    `["bearer.<token>", "hive.terminal"]` gets the second one back and its
+    credential stays on the request side. A client offering only its
+    credential still gets that echoed — a usable terminal beats a tidy log —
+    which is why the gateway's proxy uses the header instead.
+    """
+    offered = _offered_protocols(request)
+    for protocol in offered:
+        if not protocol.startswith("bearer."):
+            return protocol
+    return offered[0] if offered else None
+
+
 def _authorize_session(request) -> JSONResponse | None:
     """Guard a session route. None means the caller may proceed.
 
@@ -377,6 +406,15 @@ def _authorize_session(request) -> JSONResponse | None:
         for candidate in accepted:
             if runtime_config.tokens_match(token, candidate):
                 return None
+    # Logged here, because the guard is the outermost middleware and its
+    # refusal never reaches the request logger below it. Without this line a
+    # mind whose broker row holds a stale token refuses every call the gateway
+    # makes and `journalctl -u skippy.service` shows nothing at all — the
+    # evidence lives only on the gateway's side of the wire.
+    log.warning(
+        "Refused a session request with no valid credential (%s offered)",
+        len(presented),
+    )
     return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
@@ -1213,8 +1251,7 @@ async def attach_pty(
     # subprotocols and gets a response carrying none fails the handshake in
     # both Chrome and Firefox — so without this, the one channel a direct
     # browser attach has for its credential cannot be used.
-    offered = _offered_protocols(websocket)
-    await websocket.accept(subprotocol=offered[0] if offered else None)
+    await websocket.accept(subprotocol=_negotiated_protocol(websocket))
 
     if not hasattr(impl, "spawn_pty"):
         await websocket.close(code=1011, reason=f"attach-pty not supported by mind {MIND_NAME}")

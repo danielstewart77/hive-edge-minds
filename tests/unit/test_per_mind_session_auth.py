@@ -8,6 +8,7 @@ on every boot — so a token taken off this host opens this host and no other.
 
 import importlib
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -108,21 +109,12 @@ class TestMintingTheToken:
         with pytest.raises(runtime_config.SessionTokenUnavailable):
             runtime_config.session_token("ada")
 
-    def test_an_empty_file_left_by_a_lost_race_is_refused_not_overwritten(
+    def test_a_token_written_mid_race_is_adopted_not_overwritten(
         self, mind_dir, monkeypatch
     ):
         """`O_EXCL` creates the file before its winner writes into it. Minting
-        a second token here would clobber a credential another process is
-        already enforcing."""
-        monkeypatch.setattr(runtime_config, "_RACE_READS", 2)
-        monkeypatch.setattr(runtime_config, "_RACE_PAUSE_S", 0)
-        path = mind_dir / "session_token"
-        path.touch(mode=0o600)
-        with pytest.raises(runtime_config.SessionTokenUnavailable):
-            runtime_config.session_token("ada")
-        assert path.read_text() == "", "the empty file was overwritten"
-
-    def test_a_token_written_mid_race_is_adopted(self, mind_dir, monkeypatch):
+        a second token over that would leave the winner enforcing a credential
+        that exists nowhere."""
         path = mind_dir / "session_token"
         path.touch(mode=0o600)
         reads = {"n": 0}
@@ -134,6 +126,58 @@ class TestMintingTheToken:
 
         monkeypatch.setattr(runtime_config.time, "sleep", _late_writer)
         assert runtime_config.session_token("ada") == "the-winner-s-token"
+
+    def test_an_abandoned_empty_file_is_reclaimed_rather_than_waited_on(
+        self, mind_dir
+    ):
+        """A mint killed between the create and the write leaves a zero-byte
+        file no amount of waiting will fill. Waiting anyway cost a second of
+        the event loop — shared with the surface bots and the pty pumps — on
+        every request, forever, for something only `rm` could fix."""
+        import os as _os
+
+        path = mind_dir / "session_token"
+        path.touch(mode=0o600)
+        stale = time.time() - 60
+        _os.utime(path, (stale, stale))
+
+        token = runtime_config.session_token("ada")
+        assert token
+        assert path.read_text().strip() == token
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_reclaiming_does_not_stall_the_event_loop(self, mind_dir):
+        """The whole point: no blocking sleep on the path a request takes."""
+        import os as _os
+
+        path = mind_dir / "session_token"
+        path.touch(mode=0o600)
+        stale = time.time() - 60
+        _os.utime(path, (stale, stale))
+
+        started = time.monotonic()
+        runtime_config.session_token("ada")
+        assert time.monotonic() - started < 0.1
+
+    def test_a_fresh_empty_file_is_given_its_window_and_then_reclaimed(
+        self, mind_dir, monkeypatch
+    ):
+        """An empty file that is genuinely new might be a race in flight, so it
+        gets the window. Nothing arrives, so it is reclaimed — bounded, and
+        never a wait that repeats on every later request."""
+        monkeypatch.setattr(runtime_config, "_RACE_WINDOW_S", 0.05)
+        monkeypatch.setattr(runtime_config, "_RACE_PAUSE_S", 0.01)
+        path = mind_dir / "session_token"
+        path.touch(mode=0o600)
+
+        started = time.monotonic()
+        token = runtime_config.session_token("ada")
+        waited = time.monotonic() - started
+
+        assert token
+        assert path.read_text().strip() == token
+        assert waited >= 0.05, "a file that might be mid-write was not waited on"
+        assert waited < 1.0
 
 
 class TestTheTokenIsNotServed:
@@ -201,6 +245,23 @@ class TestTheSessionGuard:
     def test_the_admin_token_also_opens_a_session_route(self, server, token):
         headers = {"Authorization": "Bearer the-admin-token"}
         assert server._authorize_session(_request(headers)) is None
+
+    def test_a_non_credential_subprotocol_is_the_one_echoed_back(self, server):
+        """Whatever is echoed lands in the response headers and the proxy's
+        logs, so a client offering its credential alongside a plain protocol
+        gets the plain one back."""
+        request = _request({"Sec-WebSocket-Protocol": "bearer.sekrit, hive.terminal"})
+        assert server._negotiated_protocol(request) == "hive.terminal"
+
+    def test_a_client_offering_only_its_credential_still_gets_a_handshake(
+        self, server
+    ):
+        """A usable terminal beats a tidy log."""
+        request = _request({"Sec-WebSocket-Protocol": "bearer.sekrit"})
+        assert server._negotiated_protocol(request) == "bearer.sekrit"
+
+    def test_a_client_offering_nothing_negotiates_nothing(self, server):
+        assert server._negotiated_protocol(_request()) is None
 
     def test_a_subprotocol_credential_is_admitted(self, server, token):
         """A browser attaching directly cannot set a header."""

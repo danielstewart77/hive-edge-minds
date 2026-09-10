@@ -119,6 +119,17 @@ chat turn must not carry the thing that owns the machine. It is still
 *accepted*, so the console or the operator can reach a wedged session or
 attach to a wedged pane directly.
 
+**What "its own" does and does not cover.** The session token is per mind, so
+one lifted off a kid's Windows box authenticates to that box alone. The
+*accepted set* is wider, because the guard also takes the admin token — which
+is a deliberate choice (the console and the operator need a way into a wedged
+pane) and which on this hive resolves to `COMMS_ADMIN_BEARER_TOKEN`, a value
+every mind already holds in its own environment. So a compromised mind can
+still reach another mind's session surface using a credential it had before
+this change; what it can no longer do is reach one with nothing at all. Setting
+a distinct `MIND_ADMIN_TOKEN` per mind closes that too, and is the next thing
+worth doing if the boys' boxes ever stop being trusted.
+
 One middleware guards every `/sessions` HTTP route rather than a decorator per
 route, so a session route added later cannot ship open by being forgotten, and
 `DELETE /sessions/{id}` matters as much as the message route. It reads
