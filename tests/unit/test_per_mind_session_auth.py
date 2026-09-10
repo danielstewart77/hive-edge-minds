@@ -96,8 +96,14 @@ class TestMintingTheToken:
         (mind_dir / "session_token").chmod(0o000)
         runtime_config._token_cache.clear()
         try:
-            with pytest.raises(runtime_config.SessionTokenUnavailable):
+            # The message, not just the raise: an unreadable file is also
+            # unwritable, so a build that folded unreadable into absent would
+            # still raise — from the reclaim path, a second later, having first
+            # decided the file was abandoned and tried to mint over a
+            # credential sitting right there.
+            with pytest.raises(runtime_config.SessionTokenUnavailable) as refused:
                 runtime_config.session_token("ada")
+            assert "cannot read" in str(refused.value)
         finally:
             (mind_dir / "session_token").chmod(0o600)
 
@@ -137,7 +143,10 @@ class TestMintingTheToken:
         import os as _os
 
         path = mind_dir / "session_token"
-        path.touch(mode=0o600)
+        # Created wide, the way an older build or a loose umask would leave it.
+        # Asserting 0600 against a file the test itself made 0600 asserts the
+        # fixture, since writing to an existing file preserves its mode.
+        path.touch(mode=0o644)
         stale = time.time() - 60
         _os.utime(path, (stale, stale))
 
@@ -352,16 +361,18 @@ class TestTheGuardOnRealRoutes:
         this proves is that the credential is not what stops it."""
         from starlette.testclient import WebSocketDenialResponse
 
-        try:
+        with pytest.raises(Exception) as stopped:
             with client.websocket_connect(
                 "/sessions/abc/attach-pty?resume_sid=conv-1&model=sonnet",
                 headers={"Authorization": f"Bearer {token}"},
-            ):
-                pass
-        except WebSocketDenialResponse as refused:  # pragma: no cover
-            pytest.fail(f"the mind's own token was refused: {refused.status_code}")
-        except Exception:
-            pass  # accepted, then failed further in on the stubbed harness
+            ) as socket:
+                socket.receive_bytes()
+        # Narrow: a bare `except Exception: pass` here passes even against a
+        # guard that refuses every caller, which is the opposite of the claim
+        # in this test's name.
+        assert not isinstance(stopped.value, WebSocketDenialResponse), (
+            "the mind's own token was refused by the guard"
+        )
 
 
 # ---------------------------------------------------------------------------
