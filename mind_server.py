@@ -183,9 +183,20 @@ async def _register_with_broker() -> str:
     import aiohttp
 
     comms_url = os.environ.get("COMMS_URL", "").rstrip("/")
+    # `COMMS_ADMIN_BEARER_TOKEN` specifically, and not the guard's
+    # `admin_token()`: this bearer authenticates *to comms*, which knows
+    # nothing about a local `MIND_ADMIN_TOKEN`. An install holding only the
+    # local one cannot register, and since registration is now the only channel
+    # by which the gateway learns this mind's credential, that mind is
+    # unreachable — which is why the line below is an error rather than the
+    # note it used to be.
     token = os.environ.get("COMMS_ADMIN_BEARER_TOKEN", "")
     if not comms_url or not token:
-        log.info("No COMMS_URL/admin token — skipping broker self-registration")
+        log.error(
+            "No COMMS_URL/admin token: skipping broker self-registration, so "
+            "the gateway will never learn this mind's session credential and "
+            "every call it makes here will be refused"
+        )
         return "skipped"
     try:
         payload = runtime_config.registration_payload(MIND_NAME)
@@ -250,9 +261,16 @@ async def _registration_loop(
     compose stack on every reboot; a single registration attempt against a
     comms container that isn't up yet leaves the mind off the registry until
     someone restarts it. Unreachable or erroring comms is retried with
-    doubling delays capped at `max_delay`; an outright rejection stops the
-    loop, because resending an unacceptable payload forever is noise, not
-    persistence.
+    doubling delays capped at `max_delay`. A rejection — comms refusing the
+    payload or the admin bearer — retries at the slow heartbeat cadence rather
+    than stopping: this registration is the only channel by which the gateway
+    learns the credential the mind now demands back, so a loop that gives up
+    leaves a mind that refuses every call the gateway makes, until somebody
+    restarts it. Retrying once every `heartbeat` is not noise, it is the only
+    thing that heals a comms bearer rotated while the mind was up.
+
+    `skipped` does stop it: no `COMMS_URL` or no admin token configured is not
+    a condition retrying can change.
 
     After a success the loop keeps going as a heartbeat: re-registering
     every `heartbeat` seconds converges a broker row that was rebuilt or
@@ -261,12 +279,21 @@ async def _registration_loop(
     delay = initial_delay
     while True:
         outcome = await _register_with_broker()
-        if outcome in ("rejected", "skipped"):
+        if outcome == "skipped":
             log_event(
                 log, "mind.register.loop_stopped", level=logging.WARNING,
                 mind_id=MIND_ID, outcome=outcome,
             )
             return
+        if outcome == "rejected":
+            # The gateway cannot learn this mind's credential, so it cannot
+            # call this mind at all. Keep saying so, slowly.
+            log_event(
+                log, "mind.register.rejected", level=logging.ERROR,
+                mind_id=MIND_ID,
+            )
+            await sleep(heartbeat)
+            continue
         if outcome == "registered":
             delay = initial_delay
             await sleep(heartbeat)
@@ -300,9 +327,131 @@ def _authorize_admin(request: Request) -> JSONResponse | None:
         )
     header = request.headers.get("Authorization", "")
     presented = header[7:] if header.startswith("Bearer ") else ""
-    if not secrets.compare_digest(presented, expected):
+    if not runtime_config.tokens_match(presented, expected):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     return None
+
+
+def _offered_protocols(request) -> list[str]:
+    """The subprotocols a WebSocket client offered, in order."""
+    return [
+        token.strip()
+        for token in request.headers.get("Sec-WebSocket-Protocol", "").split(",")
+        if token.strip()
+    ]
+
+
+def _presented_bearers(request) -> list[str]:
+    """Every credential a caller offered, header and subprotocol alike.
+
+    A browser cannot set headers on a WebSocket handshake, so the subprotocol
+    is the only channel a direct attach has; the gateway's proxy uses the
+    header. Both the bare token and a `bearer.`-prefixed one count, because
+    the other minds in the hive accept the bare form and a console that works
+    against one mind must work against all of them.
+    """
+    offered = _offered_protocols(request)
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        offered.insert(0, header[7:].strip())
+    return [
+        token[7:] if token.startswith("bearer.") else token for token in offered
+    ]
+
+
+def _negotiated_protocol(request) -> str | None:
+    """Which subprotocol to echo back, preferring one that is not a secret.
+
+    The handshake needs *a* protocol echoed or a browser that offered any will
+    fail it outright. But whatever is echoed lands in the response headers and
+    in the reverse proxy's logs, so a client offering
+    `["bearer.<token>", "hive.terminal"]` gets the second one back and its
+    credential stays on the request side. A client offering only its
+    credential still gets that echoed — a usable terminal beats a tidy log —
+    which is why the gateway's proxy uses the header instead.
+    """
+    offered = _offered_protocols(request)
+    for protocol in offered:
+        if not protocol.startswith("bearer."):
+            return protocol
+    return offered[0] if offered else None
+
+
+def _authorize_session(request) -> JSONResponse | None:
+    """Guard a session route. None means the caller may proceed.
+
+    Accepts this mind's session token — the gateway, which is its only real
+    caller — or the admin token, so the console or the operator can reach a
+    wedged session directly.
+
+    A mind that cannot establish a credential of its own refuses with 503
+    rather than serving open. The transitional state the rollout needs is
+    supplied by minds still running code that has no notion of a credential,
+    not by a mind that has one and cannot read it: that one would answer every
+    caller on the LAN while the gateway went on presenting a token nobody
+    checked, and every surface would look healthy.
+    """
+    try:
+        expected = runtime_config.session_token(MIND_NAME)
+    except runtime_config.SessionTokenUnavailable as exc:
+        log.error("Refusing session requests — %s", exc)
+        return JSONResponse(
+            {"error": f"this mind cannot establish its session credential: {exc}"},
+            status_code=503,
+        )
+    presented = _presented_bearers(request)
+    admin = runtime_config.admin_token()
+    accepted = [expected] + ([admin] if admin else [])
+    for token in presented:
+        for candidate in accepted:
+            if runtime_config.tokens_match(token, candidate):
+                return None
+    # Logged here, because the guard is the outermost middleware and its
+    # refusal never reaches the request logger below it. Without this line a
+    # mind whose broker row holds a stale token refuses every call the gateway
+    # makes and `journalctl -u skippy.service` shows nothing at all — the
+    # evidence lives only on the gateway's side of the wire.
+    log.warning(
+        "Refused a session request with no valid credential (%s offered)",
+        len(presented),
+    )
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+async def _refuse_session_websocket(websocket, denial: JSONResponse) -> None:
+    """Refuse a WebSocket attach with a real HTTP status.
+
+    A pre-accept `close()` presents to the gateway as HTTP 403 — which is also
+    what a mind whose build predates the terminal routes answers — so the
+    denial response is what keeps "refused your credential" from being read as
+    "has no terminal".
+    """
+    try:
+        await websocket.send_denial_response(denial)
+    except (RuntimeError, AttributeError):
+        await websocket.close(code=4401, reason="unauthorized")
+
+
+@app.middleware("http")
+async def _guard_session_routes(request: Request, call_next):
+    """Require this mind's credential on every `/sessions` HTTP route.
+
+    One middleware rather than a decorator per route: a session route added
+    later cannot ship open by being forgotten, and `DELETE /sessions/{id}`
+    matters as much as the message route. The config surface is untouched —
+    `/runtime`, `/skills`, `/files` and `/models` keep their admin guard.
+    """
+    # `scope["path"]` and not `request.url.path`: Starlette builds that URL
+    # from the *Host header* plus the path and re-splits it, so a Host value
+    # carrying a "/" or a "#" moves the route out of `.path` while the router
+    # — which reads the scope — still matches it and runs the handler. One
+    # character in a header the client controls, and every session route on
+    # this mind answers unauthenticated.
+    if request.scope.get("path", "").startswith("/sessions"):
+        denied = _authorize_session(request)
+        if denied is not None:
+            return denied
+    return await call_next(request)
 
 
 @app.get("/runtime")
@@ -1089,7 +1238,20 @@ async def attach_pty(
     carrying ``{"type":"resize","cols":N,"rows":M}`` retarget it live, and
     tmux redraws the pane for the new geometry.
     """
-    await websocket.accept()
+    # The thing knocking is the gateway proxying a tile, not the browser.
+    # Either credential opens it: the session token for the proxy, the admin
+    # token so the console or the operator can attach to a wedged pane.
+    denied = _authorize_session(websocket)
+    if denied is not None:
+        log.warning("attach-pty for session %s refused", session_id)
+        await _refuse_session_websocket(websocket, denied)
+        return
+
+    # Echo the subprotocol back when one was offered. A browser that offers
+    # subprotocols and gets a response carrying none fails the handshake in
+    # both Chrome and Firefox — so without this, the one channel a direct
+    # browser attach has for its credential cannot be used.
+    await websocket.accept(subprotocol=_negotiated_protocol(websocket))
 
     if not hasattr(impl, "spawn_pty"):
         await websocket.close(code=1011, reason=f"attach-pty not supported by mind {MIND_NAME}")

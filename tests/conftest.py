@@ -20,3 +20,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 os.environ["COMMS_URL"] = "http://127.0.0.1:9"
 os.environ["COMMS_ADMIN_BEARER_TOKEN"] = "test-token-never-valid"
 os.environ["COMMS_BEARER_TOKEN"] = "test-token-never-valid"
+
+# A mind guards its session routes with a credential it mints beside its
+# runtime.yaml. Naming one here keeps the suite from writing a real secret
+# into a mind's own directory, and gives the tests that drive those routes a
+# value to present.
+os.environ["MIND_SESSION_TOKEN"] = "test-mind-session-token"
+
+
+def session_auth() -> dict:
+    """What the gateway presents on this mind's session routes."""
+    return {"Authorization": f"Bearer {os.environ['MIND_SESSION_TOKEN']}"}

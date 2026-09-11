@@ -100,6 +100,75 @@ construction. Codex additionally reports its own thread id, which hive-comms
 stores separately as `harness_sid` and returns on every spawn and terminal
 attach; the session's identity remains the gateway's id.
 
+### The gateway authenticates itself to this mind
+
+Every call hive-comms makes to this mind's session surface carries a
+credential this mind can check, and the credential is this mind's own: one
+taken off this host opens this host and nothing else in the hive. The mind
+mints it on first use into `minds/<name>/session_token` at 0600, keeps it
+across restarts, and publishes it only in `registration_payload` — the
+admin-guarded upsert it already performs on every boot. `MIND_SESSION_TOKEN`
+overrides the file for installs that inject secrets rather than letting the
+mind write them. The gateway looks the token up per call from the broker row
+and never hands it to anyone: it is stripped from every mind listing, since
+those answer to the service token every surface bot holds.
+
+The admin token is deliberately not the credential on this path. It unlocks
+`PATCH /runtime`, the skills write-back and the file editor, and a routine
+chat turn must not carry the thing that owns the machine. It is still
+*accepted*, so the console or the operator can reach a wedged session or
+attach to a wedged pane directly.
+
+**What "its own" does and does not cover.** The session token is per mind, so
+one lifted off a kid's Windows box authenticates to that box alone. The
+*accepted set* is wider, because the guard also takes the admin token — which
+is a deliberate choice (the console and the operator need a way into a wedged
+pane) and which on this hive resolves to `COMMS_ADMIN_BEARER_TOKEN`, a value
+every mind already holds in its own environment. So a compromised mind can
+still reach another mind's session surface using a credential it had before
+this change; what it can no longer do is reach one with nothing at all. Setting
+a distinct `MIND_ADMIN_TOKEN` per mind closes that too, and is the next thing
+worth doing if the boys' boxes ever stop being trusted.
+
+One middleware guards every `/sessions` HTTP route rather than a decorator per
+route, so a session route added later cannot ship open by being forgotten, and
+`DELETE /sessions/{id}` matters as much as the message route. It reads
+`scope["path"]`, not `request.url.path`: Starlette builds that URL from the
+*Host header* and re-splits it, so a Host carrying a `/` or a `#` moves the
+route out of `.path` while the router — which reads the scope — still matches
+it. Credentials compare as **bytes**, because `compare_digest` raises
+`TypeError` on a `str` holding anything outside ASCII, and on the WebSocket
+handshake that 500 reaches the gateway as "this mind has no terminal route".
+
+The terminal attach is checked before the socket is accepted and refuses with
+a real **401** through the ASGI denial-response extension. A pre-accept
+`close()` presents as HTTP 403, which is also what a mind with no pty route
+answers — so the gateway would read a refused credential as a missing route
+and send the operator off to rebuild an image. It closes the tile on **4416**
+for the same reason, distinct from 4415. A browser attaching directly has only
+the subprotocol to carry a credential, so the handshake echoes the offered
+subprotocol back: a browser that offers one and gets a response carrying none
+fails the handshake outright.
+
+**A mind that cannot establish its credential refuses with 503 rather than
+serving open.** An unreadable token file is not an absent one — folding the two
+together is how a mind serves every session route, `attach-pty` among them,
+open to the LAN while the gateway goes on presenting a token nobody checks and
+every surface stays green. The transitional state the rollout needs comes from
+minds still running code with no notion of a credential, which is what makes
+deploying the code to a mind the act that flips it, one machine at a time.
+A rejected registration therefore retries at the slow heartbeat cadence
+instead of stopping: that registration is the only channel by which the
+gateway learns what the mind now demands back.
+
+A refusal is reported as a refusal on every path. A 401 or 503 from a mind is
+never folded into the shape that means something else — a mind that is down, a
+mind with nothing to release, a mind holding no live terminal, a mind offering
+no models — because three of those are remedies applied to the wrong machine.
+A refused release in particular aborts a cross-surface adoption rather than
+retargeting ownership over a harness that is still running, which would put two
+processes on one transcript.
+
 ### runtime.yaml is read every boot, and written over HTTP
 
 `minds/<name>/runtime.yaml` is the durable truth about a mind; the broker's

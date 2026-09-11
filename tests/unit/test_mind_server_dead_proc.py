@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import session_auth
+
 
 @pytest.fixture()
 def _mock_mind_env(monkeypatch, tmp_path):
@@ -31,7 +33,13 @@ def client(_mock_mind_env):
             importlib.reload(mind_server)
             # Force CLI path: impl must not have a `send` attribute
             mind_server.impl = MagicMock(spec=[])
-            yield TestClient(mind_server.app, raise_server_exceptions=False), mind_server
+            yield TestClient(
+                mind_server.app,
+                raise_server_exceptions=False,
+                # Session routes take this mind's own credential, the way the
+                # gateway presents it.
+                headers=session_auth(),
+            ), mind_server
 
 
 def _dead_proc(returncode: int = -15):

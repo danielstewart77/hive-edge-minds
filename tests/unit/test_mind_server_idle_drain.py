@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import session_auth
+
 from bots import proactive
 
 
@@ -183,7 +185,10 @@ async def test_drain_exits_on_eof(mind_server_mod):
 class TestKillCancelsDrain:
     def test_kill_session_cancels_drain_task(self, mind_server_mod):
         """Killing a session cancels its idle-drain task (no orphan)."""
-        client = TestClient(mind_server_mod.app, raise_server_exceptions=False)
+        client = TestClient(
+            mind_server_mod.app, raise_server_exceptions=False,
+            headers=session_auth(),
+        )
 
         async def _never():
             await asyncio.Event().wait()
