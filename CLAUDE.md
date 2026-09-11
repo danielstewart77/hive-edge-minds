@@ -209,6 +209,27 @@ forward — the pty handle remembers what its pane started on — so editing a
 mind's default never moves a live conversation. That default is for the next
 conversation.
 
+### A mind reports its own machine
+
+`GET /host` (`mind_server.py`, backed by `host_metrics.py`) is the
+admin-guarded route the console's dashboard reads for GPU, memory and disk:
+a container in the stack, a bare-metal mind here, and a mind on a Windows
+box across the LAN are one code path because each mind reports its own host
+rather than a bind mount reaching in. Readings are keyed to a **host
+identity** (`boot_id`) the console collapses two minds on when they share
+one machine — this workstation runs Skippy bare metal and Mordecai in a
+container, and the container's `boot_id` matches the host's verbatim, which
+is what makes the collapse correct rather than a name-matching guess. A disk
+figure read from inside a container is about the image, not the host, and is
+reported as such rather than omitted or presented as the host's own. "No
+GPU" is reported as one of three distinct states — no device, no probe tool,
+or a probe that failed — so a driver that fell over does not read as a
+machine that never had a card. The collector never raises: a reading is a
+set of states, and "could not tell" is one of them, so a machine merely
+lacking a file does not take the whole route down for every mind behind it.
+The GPU probe runs with a hard timeout off the event loop, since a wedged
+`nvidia-smi` must not stall every session the mind is serving.
+
 ### Browser terminal (tmux-backed)
 
 `mind_server.py` exposes `WS /sessions/{id}/attach-pty`, bridging raw bytes

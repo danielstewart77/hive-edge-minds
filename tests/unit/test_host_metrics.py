@@ -204,3 +204,96 @@ def test_the_reading_always_carries_every_section():
     reading = host_metrics.collect(now=1.0)
 
     assert {"host", "gpu", "memory", "disk", "observed_at"} <= set(reading)
+
+
+class TestTheAbsentCaseAsTheDriverActuallyReportsIt:
+    def test_a_machine_with_no_card_says_absent_despite_a_non_zero_exit(self):
+        """Real `nvidia-smi` on a GPU-less box with drivers installed exits
+        non-zero and says so in words. Taking the exit code at face value
+        puts "GPU probe failed" on a machine that is working correctly, and
+        buries the real failures in the same bucket."""
+        state = host_metrics.gpu_state(run=lambda: ("No devices were found", 6))
+
+        assert state["status"] == "absent"
+
+    def test_output_that_does_not_parse_is_a_failed_query_not_an_absent_gpu(self):
+        """Saying "no GPU in this machine" about a box full of them, because
+        one column arrived in a format this code has not seen, is the
+        confident kind of wrong."""
+        state = host_metrics.gpu_state(run=lambda: ("NVIDIA X, [N/A], [N/A], [N/A]", 0))
+
+        assert state["status"] == "query_failed"
+
+    def test_a_genuinely_empty_answer_is_absent(self):
+        assert host_metrics.gpu_state(run=lambda: ("   \n", 0))["status"] == "absent"
+
+
+class TestTheProbeCannotHangTheMind:
+    def test_the_probe_is_given_a_deadline(self):
+        """`GET /host` is served by the same process serving this mind's
+        conversations. A wedged driver with no ceiling holds them all."""
+        seen = {}
+
+        class _Done:
+            returncode = 0
+            stdout = NVIDIA_CSV
+            stderr = ""
+
+        def _run(args, **kwargs):
+            seen.update(kwargs)
+            return _Done()
+
+        import subprocess
+
+        original = subprocess.run
+        subprocess.run = _run
+        try:
+            host_metrics._run_nvidia_smi()
+        finally:
+            subprocess.run = original
+
+        assert seen["timeout"] == host_metrics.GPU_TIMEOUT_SECONDS
+
+    def test_a_probe_that_times_out_reports_rather_than_raising(self):
+        import subprocess
+
+        def _run(args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=1)
+
+        original = subprocess.run
+        subprocess.run = _run
+        try:
+            output, code = host_metrics._run_nvidia_smi()
+        finally:
+            subprocess.run = original
+
+        assert code != 0
+        assert "timed out" in output
+
+
+class TestTheDiskDefaultsToTheHostWhenItCanSeeIt:
+    def test_a_container_with_the_host_root_mounted_measures_that_mount(self):
+        """Defaulting to `/` inside a container measures the image layer
+        while still claiming to reflect the host — a 4 GB disk drawn for a
+        machine holding 4 TB, which is the failure this module exists to
+        prevent."""
+        asked = []
+
+        def _usage(path):
+            asked.append(path)
+            return (1, 1, 0)
+
+        host_metrics.disk_state(usage=_usage, host_root_mounted=True)
+
+        assert asked == ["/host"]
+
+    def test_a_host_without_that_mount_measures_its_own_root(self):
+        asked = []
+
+        def _usage(path):
+            asked.append(path)
+            return (1, 1, 0)
+
+        host_metrics.disk_state(usage=_usage, host_root_mounted=False)
+
+        assert asked and asked[0] not in ("/host",)

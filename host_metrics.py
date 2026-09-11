@@ -129,11 +129,28 @@ def gpu_state(run: Optional[Callable[[], tuple[str, int]]] = None) -> dict:
         return {"status": "query_failed", "devices": [], "error": str(exc)}
 
     if code != 0:
+        # A GPU-less machine with the driver tools installed is the common
+        # case here, and real `nvidia-smi` reports it with a *non-zero* exit
+        # and this message. Reading that as a failed probe puts "GPU probe
+        # failed" in front of somebody whose machine is working exactly as
+        # it should, and buries the genuine failures among those.
+        if "no devices were found" in output.lower():
+            return {"status": "absent", "devices": []}
         return {"status": "query_failed", "devices": [], "error": output.strip()}
     devices = parse_gpu(output)
-    if not devices:
-        return {"status": "absent", "devices": []}
-    return {"status": "reporting", "devices": devices}
+    if devices:
+        return {"status": "reporting", "devices": devices}
+    if output.strip():
+        # It answered, and none of it parsed. That is not a machine without a
+        # card — it is output this code does not understand, and saying "no
+        # GPU in this machine" about a box full of them is the confident kind
+        # of wrong.
+        return {
+            "status": "query_failed",
+            "devices": [],
+            "error": f"unreadable output: {output.strip()[:200]}",
+        }
+    return {"status": "absent", "devices": []}
 
 
 # --------------------------------------------------------------------------
