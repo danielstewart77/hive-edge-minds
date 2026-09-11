@@ -35,6 +35,13 @@ log = logging.getLogger("hive-mind.pty-voice")
 # terminal, so it is not free either.
 SWEEP_INTERVAL_S = 0.5
 
+# One block's ceiling, in bytes. A tool result can be a whole file, and a
+# column that flushed four hundred blocks of history to show one `cat` is
+# worse than one that says the read was long. Bytes rather than characters
+# because that is what a transport counts, and a transcript quoting a TUI
+# carries box-drawing and arrows at three bytes each.
+MAX_BLOCK_BYTES = 120_000
+
 # A single read's ceiling. A turn that emits a very large block should not
 # be able to pull an unbounded string into memory on one tick; the remainder
 # is picked up on the next.
@@ -54,35 +61,123 @@ def transcript_path(claude_sid: str, project_dir: Path) -> Path:
     return config_dir / "projects" / slug / f"{claude_sid}.jsonl"
 
 
-def prose_blocks(line: str) -> list[str]:
-    """The assistant prose in one transcript line, and nothing else.
+def cap_block(text: str) -> dict:
+    """One block's text, trimmed to something a column can hold.
 
-    Returns text blocks only. A ``thinking`` block is skipped because it is
-    empty on disk; ``tool_use`` and its ``tool_result`` are skipped because
-    reading a file path and a diff aloud is not speech. Both fall out of
-    selecting on the block type rather than needing a filter of their own —
-    which is the whole reason this reads the transcript instead of the
-    screen, where prose and a tool call are the same pixels.
+    The tail is kept rather than the head: the end of a command's output is
+    where the error is. A trim is reported rather than done silently,
+    because a reader who cannot tell truncation from a short result will
+    read the wrong conclusion off the screen.
+    """
+    raw = (text or "").encode("utf-8", "replace")
+    if len(raw) <= MAX_BLOCK_BYTES:
+        return {"text": text or "", "trimmed": False}
+    kept = raw[-MAX_BLOCK_BYTES:].decode("utf-8", "replace")
+    return {"text": kept, "trimmed": True}
+
+
+def _rendered(value) -> str:
+    """A tool's input or result as one string, whatever shape it arrived in.
+
+    Inputs are dicts, results are sometimes a string and sometimes a list of
+    blocks. The dashboard shows the whole thing either way, so the rendering
+    happens once here rather than in every reader.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(item.get("text") or json.dumps(item, default=str))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def activity_blocks(line: str) -> list[dict]:
+    """Everything one transcript entry did, typed and attributed.
+
+    Where ``TranscriptTailer.poll`` answers "what should be spoken", this
+    answers "what happened" — prose, thinking, the tool call
+    with its whole input, the result with its whole body, and the user's own
+    submission, which is the only evidence a terminal turn has started
+    before it has produced anything.
+
+    Sub-mind work arrives in this same file marked ``isSidechain`` with an
+    ``agentId``. It is reported rather than dropped, and carries that id, so
+    a column can show whose work it was instead of blending a delegate's
+    tool calls into the mind's own.
     """
     try:
         entry = json.loads(line)
     except (ValueError, TypeError):
         return []
-    if not isinstance(entry, dict) or entry.get("type") != "assistant":
+    if not isinstance(entry, dict):
         return []
+    kind = entry.get("type")
+    if kind not in ("assistant", "user"):
+        return []
+    agent = entry.get("agentId") if entry.get("isSidechain") else None
     content = (entry.get("message") or {}).get("content")
     if isinstance(content, str):
-        return [content] if content.strip() else []
+        content = [{"type": "text", "text": content}]
     if not isinstance(content, list):
         return []
-    out = []
+
+    out: list[dict] = []
     for block in content:
-        if not isinstance(block, dict) or block.get("type") != "text":
+        if not isinstance(block, dict):
             continue
-        text = block.get("text") or ""
-        if text.strip():
-            out.append(text)
+        block_type = block.get("type")
+        name = None
+        dispatch_prompt = None
+        if block_type == "tool_use":
+            name = block.get("name")
+            rendered = _rendered(block.get("input"))
+            # The prompt handed to a sub-mind is the instruction itself, not
+            # a parameter of one, so it is lifted out whole rather than left
+            # inside a rendered argument blob a reader has to dig through.
+            if name in _DISPATCH_TOOLS:
+                raw_input = block.get("input")
+                if isinstance(raw_input, dict):
+                    dispatch_prompt = raw_input.get("prompt")
+            reported = "tool_use"
+        elif block_type == "tool_result":
+            rendered = _rendered(block.get("content"))
+            reported = "tool_result"
+        elif block_type == "thinking":
+            rendered = block.get("thinking") or ""
+            reported = "thinking"
+        elif block_type == "text":
+            rendered = block.get("text") or ""
+            reported = "user" if kind == "user" else "text"
+        else:
+            continue
+        if reported in ("text", "user", "thinking") and not rendered.strip():
+            continue
+        capped = cap_block(rendered)
+        out.append(
+            {
+                "kind": reported,
+                "text": capped["text"],
+                "trimmed": capped["trimmed"],
+                "name": name,
+                "agent": agent,
+                "dispatch_prompt": dispatch_prompt,
+            }
+        )
     return out
+
+
+#: Tools whose input *is* a dispatch to another mind.
+_DISPATCH_TOOLS = frozenset({"Agent", "Task"})
 
 
 class TranscriptTailer:
@@ -114,7 +209,28 @@ class TranscriptTailer:
             self._offset = 0
 
     def poll(self) -> list[str]:
-        """Prose written since the last call."""
+        """Prose written since the last call.
+
+        One of the two readers over ``poll_lines``, and they share an
+        offset: whichever is called consumes what it read. A caller wanting
+        both takes ``poll_blocks`` and filters, which the sweep does.
+        """
+        return [
+            block["text"]
+            for line in self.poll_lines()
+            for block in activity_blocks(line)
+            if block["kind"] == "text"
+        ]
+
+    def poll_blocks(self) -> list[dict]:
+        """Everything written since the last call, typed and attributed."""
+        out: list[dict] = []
+        for line in self.poll_lines():
+            out.extend(activity_blocks(line))
+        return out
+
+    def poll_lines(self) -> list[str]:
+        """Whole transcript lines written since the last call."""
         try:
             size = self.path.stat().st_size
         except OSError:
@@ -141,11 +257,7 @@ class TranscriptTailer:
         data = self._pending + chunk
         lines = data.split("\n")
         self._pending = lines.pop()          # partial line, or "" after a newline
-        out: list[str] = []
-        for line in lines:
-            if line.strip():
-                out.extend(prose_blocks(line))
-        return out
+        return [line for line in lines if line.strip()]
 
 
 class SessionVoice:
@@ -161,6 +273,22 @@ class SessionVoice:
         self._tailers: dict[str, tuple[str, TranscriptTailer]] = {}
 
     def poll(self, session_id: str, claude_sid: str, project_dir: Path) -> list[str]:
+        """This terminal's new prose. See ``poll_blocks`` for everything."""
+        return [
+            block["text"]
+            for block in self.poll_blocks(session_id, claude_sid, project_dir)
+            if block["kind"] == "text"
+        ]
+
+    def poll_blocks(
+        self, session_id: str, claude_sid: str, project_dir: Path
+    ) -> list[dict]:
+        """Everything this terminal has done since the last sweep.
+
+        One read feeding both consumers. The speaker and the dashboard want
+        different subsets of the same entries, and two tailers over one file
+        would double the IO to arrive at the same lines.
+        """
         if not session_id or not claude_sid:
             return []
         known = self._tailers.get(session_id)
@@ -178,8 +306,8 @@ class SessionVoice:
                 transcript_path(claude_sid, project_dir), from_start=rotated
             )
             self._tailers[session_id] = (claude_sid, tailer)
-            return tailer.poll()
-        return known[1].poll()
+            return tailer.poll_blocks()
+        return known[1].poll_blocks()
 
     def forget(self, session_id: str) -> None:
         self._tailers.pop(session_id, None)
