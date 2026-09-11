@@ -27,6 +27,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import host_metrics
 import models_api
 import pty_voice
 import runtime_config
@@ -520,6 +521,29 @@ async def get_models(request: Request):
         log_event(log, "mind.models.failed", level=logging.WARNING,
                   mind_id=MIND_ID, error=str(exc))
         return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+@app.get("/host")
+async def get_host(request: Request):
+    """This machine's GPU, memory and disk, as this mind can see them.
+
+    Only the mind can answer: a container in the stack, a bare-metal mind
+    here and a mind on a Windows box across the LAN are one code path
+    because each reports its own host. The console collapses two minds
+    sharing a machine on the `host_id` in the reply.
+
+    Admin-guarded like every other configuration route. The reply names the
+    hostname, the disk layout and every GPU installed, on a port that
+    answers across the LAN — an inventory of the family's machines is not
+    something to hand out unauthenticated.
+    """
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    # `collect` shells out to nvidia-smi, so it runs off the event loop:
+    # blocking here would stall every session this mind is serving for as
+    # long as a wedged driver takes to answer.
+    return await asyncio.to_thread(host_metrics.collect)
 
 
 def _harness() -> str:
