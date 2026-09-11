@@ -1080,12 +1080,19 @@ async def _pty_voice_sweep() -> None:
                 )
                 if not blocks:
                     continue
-                await _post_pty_activity(session_id, blocks)
+                # Speech first, and never behind the dashboard. Both posts
+                # carry a 10s timeout, so a gateway that hangs rather than
+                # refuses would otherwise delay every spoken sentence by up
+                # to ten seconds per sweep to serve a page nobody may have
+                # open.
                 for block in blocks:
-                    # Prose only, exactly as before. The speaker's diet is
-                    # not widened by the dashboard learning to see more.
-                    if block["kind"] == "text":
+                    # Prose only, exactly as before — the speaker's diet is
+                    # not widened by the dashboard learning to see more. And
+                    # only this mind's own: a delegate's report read aloud in
+                    # the mind's voice is a second speaker nobody announced.
+                    if block["kind"] == "text" and block["agent"] is None:
                         await _post_pty_text(session_id, block["text"])
+                await _post_pty_activity(session_id, blocks)
         except asyncio.CancelledError:
             raise
         except Exception:
