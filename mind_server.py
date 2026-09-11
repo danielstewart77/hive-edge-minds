@@ -1030,6 +1030,34 @@ async def _post_pty_text(session_id: str, text: str) -> None:
         log.debug("pty-text post failed for session %s", session_id, exc_info=True)
 
 
+async def _post_pty_activity(session_id: str, blocks: list) -> None:
+    """Hand one sweep's worth of a terminal's work to the gateway's feed.
+
+    Separate from ``_post_pty_text`` on purpose, and not a widening of it:
+    that route is what the tile's speaker reads, so a tool call posted there
+    would be read aloud. This one reaches the dashboard and nothing else.
+    """
+    import aiohttp
+
+    comms_url = os.environ.get("COMMS_URL", "").rstrip("/")
+    token = os.environ.get("COMMS_ADMIN_BEARER_TOKEN", "")
+    if not comms_url or not token or not blocks:
+        return
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(
+                f"{comms_url}/sessions/{session_id}/pty-activity",
+                json={"blocks": blocks},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                await resp.read()
+    except Exception:
+        # A view of the conversation, never the conversation. A gateway that
+        # is down costs this sweep's worth of dashboard and nothing else.
+        log.debug("pty-activity post failed for session %s", session_id, exc_info=True)
+
+
 async def _pty_voice_sweep() -> None:
     """Publish each terminal's prose as the harness writes it.
 
@@ -1047,10 +1075,24 @@ async def _pty_voice_sweep() -> None:
             for session_id, handle in list(_ptys.items()):
                 if not handle.alive or not handle.claude_sid:
                     continue
-                for text in _pty_voice.poll(
+                blocks = _pty_voice.poll_blocks(
                     session_id, handle.claude_sid, PROJECT_DIR
-                ):
-                    await _post_pty_text(session_id, text)
+                )
+                if not blocks:
+                    continue
+                # Speech first, and never behind the dashboard. Both posts
+                # carry a 10s timeout, so a gateway that hangs rather than
+                # refuses would otherwise delay every spoken sentence by up
+                # to ten seconds per sweep to serve a page nobody may have
+                # open.
+                for block in blocks:
+                    # Prose only, exactly as before — the speaker's diet is
+                    # not widened by the dashboard learning to see more. And
+                    # only this mind's own: a delegate's report read aloud in
+                    # the mind's voice is a second speaker nobody announced.
+                    if block["kind"] == "text" and block["agent"] is None:
+                        await _post_pty_text(session_id, block["text"])
+                await _post_pty_activity(session_id, blocks)
         except asyncio.CancelledError:
             raise
         except Exception:

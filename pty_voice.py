@@ -35,6 +35,13 @@ log = logging.getLogger("hive-mind.pty-voice")
 # terminal, so it is not free either.
 SWEEP_INTERVAL_S = 0.5
 
+# One block's ceiling, in bytes. A tool result can be a whole file, and a
+# column that flushed four hundred blocks of history to show one `cat` is
+# worse than one that says the read was long. Bytes rather than characters
+# because that is what a transport counts, and a transcript quoting a TUI
+# carries box-drawing and arrows at three bytes each.
+MAX_BLOCK_BYTES = 120_000
+
 # A single read's ceiling. A turn that emits a very large block should not
 # be able to pull an unbounded string into memory on one tick; the remainder
 # is picked up on the next.
@@ -54,35 +61,164 @@ def transcript_path(claude_sid: str, project_dir: Path) -> Path:
     return config_dir / "projects" / slug / f"{claude_sid}.jsonl"
 
 
-def prose_blocks(line: str) -> list[str]:
-    """The assistant prose in one transcript line, and nothing else.
+def cap_block(text: str) -> dict:
+    """One block's text, trimmed to something a column can hold.
 
-    Returns text blocks only. A ``thinking`` block is skipped because it is
-    empty on disk; ``tool_use`` and its ``tool_result`` are skipped because
-    reading a file path and a diff aloud is not speech. Both fall out of
-    selecting on the block type rather than needing a filter of their own —
-    which is the whole reason this reads the transcript instead of the
-    screen, where prose and a tool call are the same pixels.
+    The tail is kept rather than the head: the end of a command's output is
+    where the error is. A trim is reported rather than done silently,
+    because a reader who cannot tell truncation from a short result will
+    read the wrong conclusion off the screen.
+    """
+    raw = (text or "").encode("utf-8", "replace")
+    if len(raw) <= MAX_BLOCK_BYTES:
+        return {"text": text or "", "trimmed": False}
+    kept = raw[-MAX_BLOCK_BYTES:].decode("utf-8", "replace")
+    return {"text": kept, "trimmed": True}
+
+
+def _rendered(value) -> str:
+    """A tool's input or result as one string, whatever shape it arrived in.
+
+    Inputs are dicts, results are sometimes a string and sometimes a list of
+    blocks. The dashboard shows the whole thing either way, so the rendering
+    happens once here rather than in every reader.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                # An MCP server is the one writer here the harness does not
+                # control, and `text` holding a dict or a number is its to
+                # invent. `join` would raise on it, and a raise in this
+                # function costs the whole sweep's batch — the column *and*
+                # the speaker go silent for that turn.
+                parts.append(text if isinstance(text, str) else json.dumps(item, default=str))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def activity_blocks(line: str) -> list[dict]:
+    """Everything one transcript entry did, typed and attributed.
+
+    Where ``TranscriptTailer.poll`` answers "what should be spoken", this
+    answers "what happened" — prose, thinking, the tool call
+    with its whole input, the result with its whole body, and the user's own
+    submission, which is the only evidence a terminal turn has started
+    before it has produced anything.
+
+    Sub-mind work arrives in this same file marked ``isSidechain`` with an
+    ``agentId``. It is reported rather than dropped, and carries that id, so
+    a column can show whose work it was instead of blending a delegate's
+    tool calls into the mind's own.
     """
     try:
         entry = json.loads(line)
     except (ValueError, TypeError):
         return []
-    if not isinstance(entry, dict) or entry.get("type") != "assistant":
+    if not isinstance(entry, dict):
         return []
-    content = (entry.get("message") or {}).get("content")
+    kind = entry.get("type")
+    if kind not in ("assistant", "user"):
+        return []
+    agent = entry.get("agentId") if entry.get("isSidechain") else None
+    if not isinstance(agent, str):
+        agent = None
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
     if isinstance(content, str):
-        return [content] if content.strip() else []
+        content = [{"type": "text", "text": content}]
     if not isinstance(content, list):
         return []
-    out = []
+
+    out: list[dict] = []
     for block in content:
-        if not isinstance(block, dict) or block.get("type") != "text":
+        if not isinstance(block, dict):
             continue
-        text = block.get("text") or ""
-        if text.strip():
-            out.append(text)
+        block_type = block.get("type")
+        name = None
+        if block_type == "tool_use":
+            raw_name = block.get("name")
+            name = raw_name if isinstance(raw_name, str) else None
+            rendered = _rendered(block.get("input"))
+            reported = "tool_use"
+        elif block_type == "tool_result":
+            rendered = _rendered(block.get("content"))
+            reported = "tool_result"
+        elif block_type == "thinking":
+            rendered = block.get("thinking")
+            reported = "thinking"
+        elif block_type == "text":
+            rendered = block.get("text")
+            reported = "user" if kind == "user" else "text"
+        else:
+            continue
+        # Every one of these fields is written by something upstream — the
+        # harness, or an MCP server answering a tool call. A non-string here
+        # used to reach `.strip()` and take the sweep's whole batch with it.
+        if not isinstance(rendered, str):
+            rendered = _rendered(rendered)
+        if reported in ("text", "user", "thinking") and not rendered.strip():
+            continue
+        capped = cap_block(rendered)
+        out.append(
+            {
+                "kind": reported,
+                "text": capped["text"],
+                "trimmed": capped["trimmed"],
+                "name": name,
+                "agent": agent,
+            }
+        )
     return out
+
+
+def subagent_transcripts(claude_sid: str, project_dir: Path) -> list[Path]:
+    """Every sub-mind transcript this conversation has opened.
+
+    The parent file holds none of their work. The harness gives each
+    delegate its own `<sid>/subagents/agent-<id>.jsonl` and writes only the
+    dispatching `tool_use` and the final `tool_result` into the parent — so
+    tailing the parent alone shows a delegation as one block at the start
+    and one at the end, with the minutes between it blank.
+
+    A conversation that has delegated nothing has no such directory, and
+    that is the ordinary case rather than a fault.
+    """
+    parent = transcript_path(claude_sid, project_dir)
+    folder = parent.with_suffix("") / "subagents"
+    try:
+        return sorted(folder.glob("agent-*.jsonl"))
+    except OSError:
+        return []
+
+
+def agent_label(transcript: Path) -> str:
+    """What to call the sub-mind that wrote this file.
+
+    The harness drops an `agent-<id>.meta.json` beside each one naming the
+    job it was spawned for. "refute-edges" tells a reader what the work was;
+    "a19ca8c72d907ffca" is a handle and nothing more — which is what is left
+    when no meta file exists, since a blank attribution is worse than an
+    ugly one.
+    """
+    stem = transcript.stem
+    fallback = stem[len("agent-"):] if stem.startswith("agent-") else stem
+    try:
+        meta = json.loads(transcript.with_suffix(".meta.json").read_text())
+    except (OSError, ValueError):
+        return fallback
+    label = meta.get("agentType") if isinstance(meta, dict) else None
+    return label if isinstance(label, str) and label else fallback
 
 
 class TranscriptTailer:
@@ -114,7 +250,38 @@ class TranscriptTailer:
             self._offset = 0
 
     def poll(self) -> list[str]:
-        """Prose written since the last call."""
+        """Prose written since the last call.
+
+        One of the two readers over ``poll_lines``, and they share an
+        offset: whichever is called consumes what it read. A caller wanting
+        both takes ``poll_blocks`` and filters, which the sweep does.
+        """
+        return [
+            block["text"]
+            for line in self.poll_lines()
+            for block in activity_blocks(line)
+            if block["kind"] == "text"
+        ]
+
+    def poll_blocks(self) -> list[dict]:
+        """Everything written since the last call, typed and attributed.
+
+        One unreadable line costs that line. The offset has already moved
+        past the whole batch by the time anything is parsed, so a raise here
+        would drop every other block in it permanently — and those blocks
+        feed the speaker as well as the dashboard, so the tile would go mute
+        for the same turn.
+        """
+        out: list[dict] = []
+        for line in self.poll_lines():
+            try:
+                out.extend(activity_blocks(line))
+            except Exception:
+                log.debug("unreadable transcript line in %s", self.path, exc_info=True)
+        return out
+
+    def poll_lines(self) -> list[str]:
+        """Whole transcript lines written since the last call."""
         try:
             size = self.path.stat().st_size
         except OSError:
@@ -141,11 +308,7 @@ class TranscriptTailer:
         data = self._pending + chunk
         lines = data.split("\n")
         self._pending = lines.pop()          # partial line, or "" after a newline
-        out: list[str] = []
-        for line in lines:
-            if line.strip():
-                out.extend(prose_blocks(line))
-        return out
+        return [line for line in lines if line.strip()]
 
 
 class SessionVoice:
@@ -159,8 +322,30 @@ class SessionVoice:
 
     def __init__(self):
         self._tailers: dict[str, tuple[str, TranscriptTailer]] = {}
+        #: Per session, one tailer per sub-mind transcript it has opened.
+        self._delegates: dict[str, dict[str, tuple[str, TranscriptTailer]]] = {}
 
     def poll(self, session_id: str, claude_sid: str, project_dir: Path) -> list[str]:
+        """This terminal's new prose. See ``poll_blocks`` for everything."""
+        return [
+            block["text"]
+            for block in self.poll_blocks(session_id, claude_sid, project_dir)
+            if block["kind"] == "text"
+        ]
+
+    def poll_blocks(
+        self, session_id: str, claude_sid: str, project_dir: Path
+    ) -> list[dict]:
+        """Everything this terminal has done since the last sweep.
+
+        One read feeding both consumers. The speaker and the dashboard want
+        different subsets of the same entries, and two tailers over one file
+        would double the IO to arrive at the same lines.
+
+        A delegating conversation is several files, not one: the parent, and
+        one per sub-mind. New delegates appear mid-turn, so the set is
+        re-read each sweep rather than fixed when the conversation opened.
+        """
         if not session_id or not claude_sid:
             return []
         known = self._tailers.get(session_id)
@@ -178,14 +363,38 @@ class SessionVoice:
                 transcript_path(claude_sid, project_dir), from_start=rotated
             )
             self._tailers[session_id] = (claude_sid, tailer)
-            return tailer.poll()
-        return known[1].poll()
+            self._delegates.pop(session_id, None)
+            out = tailer.poll_blocks()
+        else:
+            out = known[1].poll_blocks()
+
+        delegates = self._delegates.setdefault(session_id, {})
+        for path in subagent_transcripts(claude_sid, project_dir):
+            key = str(path)
+            follower = delegates.get(key)
+            if follower is None:
+                # From the top. A delegate's file exists because it was just
+                # spawned, so there is no history to replay — and opening at
+                # the end would lose whatever it wrote in the half second
+                # before this sweep noticed it.
+                follower = (agent_label(path), TranscriptTailer(path, from_start=True))
+                delegates[key] = follower
+            label, tail = follower
+            for block in tail.poll_blocks():
+                # The file says which delegate wrote it; the meta file says
+                # what it was for. A block that arrived unattributed would be
+                # rendered as the mind's own work.
+                block["agent"] = label
+                out.append(block)
+        return out
 
     def forget(self, session_id: str) -> None:
         self._tailers.pop(session_id, None)
+        self._delegates.pop(session_id, None)
 
     def retain_only(self, session_ids) -> None:
         """Drop tailers for terminals that are gone."""
         live = set(session_ids)
         for sid in [s for s in self._tailers if s not in live]:
             self._tailers.pop(sid, None)
+            self._delegates.pop(sid, None)
