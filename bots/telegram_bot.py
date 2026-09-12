@@ -19,6 +19,7 @@ from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -28,6 +29,7 @@ from telegram.ext import (
 from config import config
 from bots.bot_utils import get_lock, get_queue, time_ago
 from bots.gateway_client import GatewayClient
+from bots import labels_client, session_picker
 from bots.skills import get_skills
 from hive_logging import configure_logging, log_event
 
@@ -238,39 +240,6 @@ def _format_queue_batch(messages: list[str]) -> str:
     )
 
 
-def _format_sessions(sessions: list[dict]) -> str:
-    """The session picker, including sessions another surface is holding.
-
-    A conversation started in the browser terminal is listed here with the
-    surface it currently lives on, because switching to it moves it: the
-    terminal's process ends and the conversation carries on in this chat
-    with its whole history intact. That's the point \u2014 you started it at the
-    desk and you're not at the desk any more.
-    """
-    if not sessions:
-        return "No sessions found."
-    lines = ["Your Sessions:\n"]
-    for i, s in enumerate(sessions, 1):
-        status_icon = {"running": "\U0001f7e2", "idle": "\U0001f4a4", "closed": "\U0001f534"}.get(
-            s["status"], "\u2753"
-        )
-        autopilot = " \U0001f916" if s.get("autopilot") else ""
-        short_id = s["id"][:8]
-        summary = s.get("summary", "Untitled")
-        last = s.get("last_active", 0)
-        ago = time_ago(last) if last else "?"
-        where = f" \u2014 on {s.get('surface') or 'another surface'}" if s.get("adoptable") else ""
-        lines.append(
-            f"{i}. {status_icon}{autopilot} {short_id} \u2014 \"{summary}\" "
-            f"[{s.get('model', '?')}] ({ago}){where}"
-        )
-    if any(s.get("adoptable") for s in sessions):
-        lines.append("\nSessions marked with a surface are running elsewhere \u2014 "
-                     "/switch moves one here.")
-    lines.append("\n/switch <number> \u00b7 /new to start \u00b7 /kill <number> to kill")
-    return "\n".join(lines)
-
-
 def _format_status(data: dict) -> str:
     return (
         f"Server port: {data.get('server_port')}\n"
@@ -305,8 +274,6 @@ async def _handle_server_command(content: str, user_id: int, chat_id: int) -> st
         user_id=user_id, client_ref=chat_id,
     )
 
-    if cmd == "/sessions":
-        return _format_sessions(result)
     if cmd == "/status":
         return _format_status(result)
     if cmd == "/new":
@@ -363,10 +330,97 @@ async def _auth_check(update: Update) -> bool:
 # Command handlers
 # ---------------------------------------------------------------------------
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The picker: one tappable button per conversation.
+
+    The old numbered list made the reader resolve a position into a
+    conversation, which only works if nothing has moved since it was printed.
+    On a phone the message sits in scrollback for days. Buttons carry the id.
+    """
     if not await _auth_check(update):
         return
-    msg = await _handle_server_command("/sessions", update.effective_user.id, update.effective_chat.id)
-    await _reply_chunked(update, msg)
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    result = await gateway.server_command(user_id, chat_id, "/sessions")
+    if isinstance(result, dict) and "error" in result:
+        await _reply_chunked(update, f"Error: {result['error']}")
+        return
+    sessions = result if isinstance(result, list) else []
+    labels = await labels_client.fetch_labels()
+    await update.message.reply_text(
+        "Your conversations:" if sessions else "No conversations yet.",
+        reply_markup=session_picker.build_session_keyboard(sessions, labels),
+    )
+
+
+async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A tapped button. Every path answers the callback before it returns.
+
+    Telegram spins a progress ring on the button until the query is answered,
+    and an unanswered one never times out visibly — it just stays spinning,
+    which reads as the bot having died rather than as anything going wrong.
+    So the answer comes first and the work happens after it.
+    """
+    query = update.callback_query
+    if not _is_allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    await query.answer()
+
+    action, target = session_picker.decode(query.data or "")
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    log_event(
+        log, "surface.button.tapped", surface="telegram", command=action,
+        user_id=user_id, client_ref=chat_id,
+    )
+
+    if action == session_picker.CB_NEW:
+        msg = await _handle_server_command("/new", user_id, chat_id)
+    elif action == session_picker.CB_SWITCH and target:
+        # The id travels whole, so the gateway resolves it against what exists
+        # now rather than against the order this message was drawn in. A
+        # conversation killed or swept away since then is reported as gone —
+        # the one thing a tap must never do is land on a different one.
+        msg = await _handle_server_command(f"/switch {target}", user_id, chat_id)
+    elif action == session_picker.CB_SUSPEND and target:
+        result = await gateway.suspend_session(target)
+        msg = (f"Error: {result['error']}" if isinstance(result, dict) and "error" in result
+               else "Suspended. It keeps its history \u2014 tap it in /sessions to resume.")
+    else:
+        msg = "That button no longer means anything \u2014 send /sessions for a fresh list."
+
+    await query.message.reply_text(msg)
+
+
+async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rename the conversation this chat is holding.
+
+    A bare `/rename` is refused rather than passed through: the terminal's
+    label route deletes the row when name and colour are both blank, so an
+    empty name would silently erase a name set at the tile.
+    """
+    if not await _auth_check(update):
+        return
+    if not labels_client.configured():
+        await update.message.reply_text(
+            "Renaming isn't wired up on this mind \u2014 TERMINAL_URL and "
+            "TERMINAL_LABELS_TOKEN aren't set."
+        )
+        return
+    session_id = await gateway.ensure_session(
+        update.effective_user.id, update.effective_chat.id
+    )
+    labels = await labels_client.fetch_labels()
+    body = session_picker.rename_body(
+        " ".join(context.args) if context.args else "", labels.get(session_id)
+    )
+    if body is None:
+        await update.message.reply_text("Usage: /rename <name>")
+        return
+    if await labels_client.put_label(session_id, body):
+        await update.message.reply_text(f"Renamed to \"{body['name']}\".")
+    else:
+        await update.message.reply_text("Couldn't reach the label store \u2014 name unchanged.")
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -930,6 +984,8 @@ def _build_application(token: str):
     app.add_error_handler(_on_error)
 
     app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("rename", cmd_rename))
+    app.add_handler(CallbackQueryHandler(on_session_button))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("status", cmd_status))
