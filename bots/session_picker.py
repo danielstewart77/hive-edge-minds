@@ -150,6 +150,21 @@ def button_text(session: dict, labels: dict) -> str:
     return f"{status}{dot} {caption}{where} \u00b7 {short} \u00b7 {age}"
 
 
+def visible_sessions(sessions: list[dict] | None) -> list[dict]:
+    """The conversations the picker draws: everything not asleep.
+
+    A suspended conversation has no process behind it and is not what anyone
+    is looking for when they open the picker — on this host they outnumber the
+    live ones better than two to one, and the live ones are what the picker
+    exists to get back to. They are still resumable by id through `/switch`;
+    what they no longer do is fill the keyboard.
+    """
+    return [
+        s for s in (sessions or [])
+        if str(s.get("status") or "").lower() != "suspended"
+    ]
+
+
 def build_session_rows(
     sessions: list[dict], labels: dict | None = None, limit: int = MAX_PICKER_ROWS
 ) -> list[list[InlineKeyboardButton]]:

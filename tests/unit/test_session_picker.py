@@ -152,6 +152,51 @@ def test_a_bare_rename_sends_nothing_rather_than_erasing_the_label():
 
 
 # ---------------------------------------------------------------------------
+# Requirement — the picker lists live conversations only; a suspended one is
+# not drawn and is not counted.
+# ---------------------------------------------------------------------------
+def test_a_suspended_conversation_is_not_in_the_picker():
+    """Breaks if the filter is dropped, or if it starts eating idle rows —
+    idle is a live conversation between turns, not a sleeping one."""
+    sessions = [
+        {"id": "11111111-aaaa", "summary": "Taxes", "status": "running"},
+        {"id": "22222222-bbbb", "summary": "Roof", "status": "suspended"},
+        {"id": "33333333-cccc", "summary": "Laptop", "status": "idle"},
+        {"id": "44444444-dddd", "summary": "Shouty", "status": "SUSPENDED"},
+    ]
+
+    assert [s["id"] for s in picker.visible_sessions(sessions)] == [
+        "11111111-aaaa", "33333333-cccc",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_sessions_command_neither_draws_nor_counts_a_suspended_one(monkeypatch):
+    """The renderer's own test cannot see this: the command is what fetches
+    the list and writes the count. Breaks if the filter lands after the
+    count, which would report a total the keyboard does not show."""
+    sessions = [
+        {"id": f"{i:08d}-xxxx", "summary": str(i), "status": "suspended", "last_active": 0}
+        for i in range(20)
+    ] + [
+        {"id": "99999999-live", "summary": "awake", "status": "running", "last_active": 0},
+    ]
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder)
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
+    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
+
+    await bot.cmd_sessions(update, ctx)
+
+    payloads = [b.callback_data for row in recorder.markup.inline_keyboard for b in row]
+    assert payloads == ["sw:99999999-live", picker.CB_NEW]
+    # 21 is the unfiltered total. A header naming it means the count was
+    # taken before the filter and describes a list the keyboard does not show.
+    assert "21" not in recorder.text, f"a suspended conversation was counted: {recorder.text!r}"
+
+
+# ---------------------------------------------------------------------------
 # Requirement 4 — /suspend puts a conversation to sleep: the chat's own when
 # given nothing, the named one when given an id.
 # ---------------------------------------------------------------------------
@@ -277,7 +322,7 @@ async def test_the_sessions_command_sends_a_keyboard_not_a_list(monkeypatch):
     own tests cannot see: they never run the command."""
     sessions = [
         {"id": "11111111-aaaa", "summary": "Taxes", "status": "running", "last_active": 0},
-        {"id": "22222222-bbbb", "summary": "Roof", "status": "suspended", "last_active": 0},
+        {"id": "22222222-bbbb", "summary": "Roof", "status": "idle", "last_active": 0},
     ]
     recorder = _Recorder()
     update, ctx = _chat_update(recorder)
