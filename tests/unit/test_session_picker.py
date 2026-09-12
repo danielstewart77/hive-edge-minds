@@ -98,7 +98,10 @@ def tapped(monkeypatch):
         # the real handler's.
         monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
         monkeypatch.setattr(bot, "_handle_server_command", fake_command)
-        monkeypatch.setattr(bot, "gateway", MagicMock(suspend_session=fake_suspend))
+        monkeypatch.setattr(bot, "gateway", MagicMock(
+            suspend_session=fake_suspend,
+            find_active_session=AsyncMock(return_value=None),
+        ))
         return query, commands, suspended, update
     return _tap
 
@@ -330,7 +333,8 @@ async def test_a_bare_rename_command_writes_nothing_at_all(monkeypatch):
                         AsyncMock(return_value={"sess-1": {"name": "Roof", "color": "#3481cc"}}))
     monkeypatch.setattr(bot.labels_client, "put_label",
                         AsyncMock(side_effect=lambda sid, body: writes.append((sid, body)) or True))
-    monkeypatch.setattr(bot, "gateway", MagicMock(ensure_session=AsyncMock(return_value="sess-1")))
+    monkeypatch.setattr(bot, "gateway",
+                        MagicMock(find_active_session=AsyncMock(return_value="sess-1")))
 
     recorder = _Recorder()
     update, ctx = _chat_update(recorder, args=[])
@@ -354,7 +358,8 @@ async def test_a_rename_refuses_when_the_current_label_cannot_be_read(monkeypatc
     monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value=None))
     monkeypatch.setattr(bot.labels_client, "put_label",
                         AsyncMock(side_effect=lambda sid, body: writes.append((sid, body)) or True))
-    monkeypatch.setattr(bot, "gateway", MagicMock(ensure_session=AsyncMock(return_value="sess-1")))
+    monkeypatch.setattr(bot, "gateway",
+                        MagicMock(find_active_session=AsyncMock(return_value="sess-1")))
 
     recorder = _Recorder()
     update, ctx = _chat_update(recorder, args=["New", "roof"])
@@ -386,3 +391,78 @@ async def test_a_tap_from_anyone_but_the_owner_does_nothing(tapped, monkeypatch)
 
     assert commands == []
     assert suspended == []
+
+
+# ===========================================================================
+# From the edge review: three failures that are invisible from where the
+# operator stands.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_rename_never_creates_the_conversation_it_is_naming(monkeypatch):
+    """`ensure_session` creates when it finds nothing — minting a conversation,
+    binding the chat to it and spawning a harness. A rename against a suspended
+    conversation therefore started an empty one, named that, and said it worked.
+
+    Breaks if the lookup ever creates again.
+    """
+    created = []
+    writes = []
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot.labels_client, "configured", lambda: True)
+    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
+    monkeypatch.setattr(bot.labels_client, "put_label",
+                        AsyncMock(side_effect=lambda sid, body: writes.append(sid) or True))
+    monkeypatch.setattr(bot, "gateway", MagicMock(
+        find_active_session=AsyncMock(return_value=None),
+        ensure_session=AsyncMock(side_effect=lambda u, c: created.append(c) or "brand-new"),
+    ))
+
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=["weekend", "notes"])
+    await bot.cmd_rename(update, ctx)
+
+    assert created == [], "/rename started a conversation"
+    assert writes == [], "/rename labelled a conversation it had just created"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_suspend_body_is_reported_as_an_error(tapped):
+    """comms raises through its own handlers as {"error": ...}, but a body
+    FastAPI rejects comes back as {"detail": ...}. Reading only the first
+    reported a 422 as a successful suspend.
+
+    Breaks if the handler goes back to checking one key.
+    """
+    query, _c, _s, update = tapped(picker.encode(picker.CB_SUSPEND, "33333333-cccc"))
+    update.callback_query.message.reply_text = AsyncMock()
+
+    async def fastapi_rejection(session_id):
+        return {"detail": [{"loc": ["path", "session_id"], "msg": "value is not valid"}]}
+
+    bot.gateway.suspend_session = fastapi_rejection
+    await bot.on_session_button(update, None)
+
+    sent = update.callback_query.message.reply_text.await_args.args[0]
+    assert sent.startswith("Error:"), f"a rejected suspend reported as {sent!r}"
+
+
+def test_one_unsendable_row_does_not_take_the_whole_picker_with_it():
+    """Telegram rejects an oversized callback_data on the entire sendMessage,
+    so one bad row means no buttons at all and `/sessions` replies with
+    nothing. Breaks if the per-row limit is dropped.
+    """
+    sessions = [
+        {"id": "11111111-aaaa", "summary": "fine", "status": "running"},
+        {"id": "x" * 200, "summary": "far too long", "status": "running"},
+        {"id": "22222222-bbbb", "summary": "also fine", "status": "running"},
+    ]
+
+    payloads = [
+        b.callback_data for row in picker.build_session_rows(sessions, {}) for b in row
+    ]
+
+    assert "sw:11111111-aaaa" in payloads
+    assert "sw:22222222-bbbb" in payloads
+    assert all(
+        len(p.encode("utf-8")) <= picker.CALLBACK_DATA_LIMIT for p in payloads
+    )

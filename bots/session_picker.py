@@ -32,6 +32,12 @@ CB_NEW = "new"
 # on the separator and a payload with no second field is not a target.
 CB_SEP = ":"
 
+# Telegram rejects an oversized `callback_data` on the whole sendMessage, so
+# a single over-long row takes every other button with it and `/sessions`
+# answers with nothing. A row that cannot fit is dropped instead: one
+# conversation missing from the picker beats no picker.
+CALLBACK_DATA_LIMIT = 64
+
 
 def encode(action: str, session_id: str = "") -> str:
     """The payload a button carries. Ids travel whole, never as positions."""
@@ -161,6 +167,11 @@ def build_session_rows(
     for session in (sessions or [])[:limit]:
         session_id = str(session.get("id") or "")
         if not session_id:
+            continue
+        if any(
+            len(encode(action, session_id).encode("utf-8")) > CALLBACK_DATA_LIMIT
+            for action in (CB_SWITCH, CB_SUSPEND)
+        ):
             continue
         rows.append([
             InlineKeyboardButton(

@@ -371,21 +371,42 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     So the answer comes first and the work happens after it.
     """
     query = update.callback_query
-    if not _is_allowed_user(update.effective_user.id):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not _is_allowed_user(user_id):
+        # Every typed command logs its rejection; a tap is the one surface
+        # where an unauthorised attempt used to leave no record at all.
+        log_event(
+            log, "surface.auth.rejected", level=logging.WARNING, surface="telegram",
+            user_id=user_id, client_ref=chat_id,
+        )
         await query.answer("Not authorized.", show_alert=True)
         return
-    await query.answer()
+    # A tap redelivered across a restart can be too old to answer, and the 400
+    # that comes back used to abort the handler before the action ever ran —
+    # the spinner is cosmetic, the action is not.
+    try:
+        await query.answer()
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            log, "surface.button.answer.failed", level=logging.WARNING,
+            surface="telegram", user_id=user_id, client_ref=chat_id, error=str(exc),
+        )
 
     action, target = session_picker.decode(query.data or "")
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
     log_event(
         log, "surface.button.tapped", surface="telegram", command=action,
         user_id=user_id, client_ref=chat_id,
     )
 
+    # Serialised against this chat's other work. Two taps on one row raced
+    # each other into `activate_session`, which takes no lock of its own, and
+    # landed two harness processes on a single transcript; a tap during a
+    # streaming turn cut the answer off mid-sentence and it was presented as
+    # complete. The button made both a one-finger operation.
     try:
-        msg = await _run_session_button(action, target, user_id, chat_id)
+        async with get_lock(chat_id):
+            msg = await _run_session_button(action, target, user_id, chat_id)
     except Exception as exc:  # noqa: BLE001
         # The spinner was cleared by `query.answer()` above, so an exception
         # escaping here leaves the tap looking like it did nothing at all. The
@@ -403,7 +424,14 @@ async def _run_session_button(action: str, target: str, user_id: int, chat_id: i
     """What a tapped button actually does. Separated so the handler's failure
     path is one place rather than one per branch."""
     if action == session_picker.CB_NEW:
-        return await _handle_server_command("/new", user_id, chat_id)
+        # comms' /new closes the conversation this chat is holding before it
+        # creates one, and closed is permanent — it never appears in a picker
+        # again. One tap, no confirmation, so the reply has to say it.
+        had_one = await gateway.find_active_session(user_id, chat_id)
+        msg = await _handle_server_command("/new", user_id, chat_id)
+        if had_one:
+            msg += "\nThe conversation you were in was ended."
+        return msg
     if action == session_picker.CB_SWITCH and target:
         # The id travels whole, so the gateway resolves it against what exists
         # now rather than against the order this message was drawn in. A
@@ -411,9 +439,22 @@ async def _run_session_button(action: str, target: str, user_id: int, chat_id: i
         # the one thing a tap must never do is land on a different one.
         return await _handle_server_command(f"/switch {target}", user_id, chat_id)
     if action == session_picker.CB_SUSPEND and target:
+        active = await gateway.find_active_session(user_id, chat_id)
         result = await gateway.suspend_session(target)
-        if isinstance(result, dict) and "error" in result:
-            return f"Error: {result['error']}"
+        # comms raises through its own handlers as {"error": ...}, but a body
+        # FastAPI rejects comes back as {"detail": ...}. Reading only the first
+        # reported a 422 as a successful suspend.
+        if isinstance(result, dict):
+            problem = result.get("error") or result.get("detail")
+            if problem:
+                return f"Error: {problem}"
+        if target == active:
+            # "It keeps its history" is true of the row and false of this chat:
+            # suspending the conversation you are in clears the active binding,
+            # so the next thing typed starts a fresh one with no history.
+            return ("Suspended. That was the conversation this chat was in, so "
+                    "your next message starts a new one \u2014 tap it in /sessions "
+                    "to come back to it.")
         return "Suspended. It keeps its history \u2014 tap it in /sessions to resume."
     return "That button no longer means anything \u2014 send /sessions for a fresh list."
 
@@ -433,9 +474,19 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "TERMINAL_LABELS_TOKEN aren't set."
         )
         return
-    session_id = await gateway.ensure_session(
+    # `ensure_session` creates when it finds nothing, and creating here mints a
+    # conversation id, binds this chat to it and spawns a harness — so a rename
+    # typed against a suspended conversation started an empty one and named
+    # that instead, reporting success.
+    session_id = await gateway.find_active_session(
         update.effective_user.id, update.effective_chat.id
     )
+    if not session_id:
+        await update.message.reply_text(
+            "This chat isn't in a conversation right now \u2014 send /sessions "
+            "and tap one, or say anything to start one."
+        )
+        return
     labels = await labels_client.fetch_labels()
     if labels is None:
         # Writing now would send an empty colour and wipe the one set at the
