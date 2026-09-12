@@ -25,7 +25,6 @@ from bots.bot_utils import time_ago
 # Telegram caps callback_data at 64 bytes. A prefix plus a 36-character UUID
 # fits with room to spare; anything longer than an id does not belong here.
 CB_SWITCH = "sw"
-CB_SUSPEND = "sp"
 CB_NEW = "new"
 
 # `new` carries no id, so it can never be mistaken for one: the handler splits
@@ -158,9 +157,11 @@ def build_session_rows(
 
     The gateway decides the order — it is the party that knows what was last
     active — and re-sorting here would mean the picker and every other surface
-    disagree about which conversation is on top. Each row carries switch and
-    suspend for that conversation; the new-session button is always last, so
-    an empty list is still a usable picker rather than a dead end.
+    disagree about which conversation is on top. A row is the conversation and
+    nothing else: suspending is `/suspend`, where it cannot be reached by a
+    thumb landing next to the name it meant to tap. The new-session button is
+    always last, so an empty list is still a usable picker rather than a dead
+    end.
     """
     labels = labels or {}
     rows: list[list[InlineKeyboardButton]] = []
@@ -168,19 +169,12 @@ def build_session_rows(
         session_id = str(session.get("id") or "")
         if not session_id:
             continue
-        if any(
-            len(encode(action, session_id).encode("utf-8")) > CALLBACK_DATA_LIMIT
-            for action in (CB_SWITCH, CB_SUSPEND)
-        ):
+        if len(encode(CB_SWITCH, session_id).encode("utf-8")) > CALLBACK_DATA_LIMIT:
             continue
         rows.append([
             InlineKeyboardButton(
                 button_text(session, labels),
                 callback_data=encode(CB_SWITCH, session_id),
-            ),
-            InlineKeyboardButton(
-                "⏸",
-                callback_data=encode(CB_SUSPEND, session_id),
             ),
         ])
     rows.append([InlineKeyboardButton("➕ New session", callback_data=encode(CB_NEW))])

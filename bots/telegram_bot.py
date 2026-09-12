@@ -420,6 +420,32 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(msg)
 
 
+async def _suspend_conversation(target: str, user_id: int, chat_id: int) -> str:
+    """Suspend one conversation and say what that meant for this chat.
+
+    Shared because `/suspend` with an id and `/suspend` without one differ only
+    in how the id was found; what suspending *costs* the operator is the same
+    sentence either way and must not drift between two copies of it.
+    """
+    active = await gateway.find_active_session(user_id, chat_id)
+    result = await gateway.suspend_session(target)
+    # comms raises through its own handlers as {"error": ...}, but a body
+    # FastAPI rejects comes back as {"detail": ...}. Reading only the first
+    # reported a 422 as a successful suspend.
+    if isinstance(result, dict):
+        problem = result.get("error") or result.get("detail")
+        if problem:
+            return f"Error: {problem}"
+    if target == active:
+        # "It keeps its history" is true of the row and false of this chat:
+        # suspending the conversation you are in clears the active binding,
+        # so the next thing typed starts a fresh one with no history.
+        return ("Suspended. That was the conversation this chat was in, so "
+                "your next message starts a new one \u2014 tap it in /sessions "
+                "to come back to it.")
+    return "Suspended. It keeps its history \u2014 tap it in /sessions to resume."
+
+
 async def _run_session_button(action: str, target: str, user_id: int, chat_id: int) -> str:
     """What a tapped button actually does. Separated so the handler's failure
     path is one place rather than one per branch."""
@@ -438,24 +464,6 @@ async def _run_session_button(action: str, target: str, user_id: int, chat_id: i
         # conversation killed or swept away since then is reported as gone —
         # the one thing a tap must never do is land on a different one.
         return await _handle_server_command(f"/switch {target}", user_id, chat_id)
-    if action == session_picker.CB_SUSPEND and target:
-        active = await gateway.find_active_session(user_id, chat_id)
-        result = await gateway.suspend_session(target)
-        # comms raises through its own handlers as {"error": ...}, but a body
-        # FastAPI rejects comes back as {"detail": ...}. Reading only the first
-        # reported a 422 as a successful suspend.
-        if isinstance(result, dict):
-            problem = result.get("error") or result.get("detail")
-            if problem:
-                return f"Error: {problem}"
-        if target == active:
-            # "It keeps its history" is true of the row and false of this chat:
-            # suspending the conversation you are in clears the active binding,
-            # so the next thing typed starts a fresh one with no history.
-            return ("Suspended. That was the conversation this chat was in, so "
-                    "your next message starts a new one \u2014 tap it in /sessions "
-                    "to come back to it.")
-        return "Suspended. It keeps its history \u2014 tap it in /sessions to resume."
     return "That button no longer means anything \u2014 send /sessions for a fresh list."
 
 
@@ -603,6 +611,35 @@ async def cmd_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /switch <number>")
         return
     msg = await _handle_server_command(f"/switch {target}", update.effective_user.id, update.effective_chat.id)
+    await _reply_chunked(update, msg)
+
+
+async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Put a conversation to sleep. Bare means the one this chat is in.
+
+    Given no id this is a verb about *here*, so it resolves the chat's own
+    binding rather than asking the operator to copy an id out of a picker they
+    are already inside of. An id is still accepted, because the picker draws
+    one and a conversation held elsewhere has no other way to be reached.
+    """
+    if not await _auth_check(update):
+        return
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    target = " ".join(context.args).strip() if context.args else ""
+    if not target:
+        target = await gateway.find_active_session(user_id, chat_id) or ""
+        if not target:
+            await update.message.reply_text(
+                "This chat isn't in a conversation right now \u2014 send /sessions "
+                "to see what there is, or /suspend with an id."
+            )
+            return
+    # Serialised against this chat's other work: suspending under an in-flight
+    # turn cuts the stream off mid-answer and the half of it that arrived is
+    # presented as the whole reply.
+    async with get_lock(chat_id):
+        msg = await _suspend_conversation(target, user_id, chat_id)
     await _reply_chunked(update, msg)
 
 
@@ -1077,6 +1114,7 @@ def _build_application(token: str):
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("autopilot", cmd_autopilot))
     app.add_handler(CommandHandler("switch", cmd_switch))
+    app.add_handler(CommandHandler("suspend", cmd_suspend))
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("prune", cmd_prune))
     app.add_handler(CommandHandler("remember", cmd_remember))
