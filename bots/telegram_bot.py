@@ -344,14 +344,16 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(result, dict) and "error" in result:
         await _reply_chunked(update, f"Error: {result['error']}")
         return
-    sessions = result if isinstance(result, list) else []
+    # Suspended conversations are filtered before anything is counted, so the
+    # "newest N of M" the operator reads is about the list they can see.
+    sessions = session_picker.visible_sessions(result if isinstance(result, list) else [])
     # An unreadable label store draws the same picker as an empty one: the
     # buttons fall back to the gateway's own summaries, which is what the
     # numbered list showed before any of this existed.
     labels = await labels_client.fetch_labels() or {}
     shown = min(len(sessions), session_picker.MAX_PICKER_ROWS)
     if not sessions:
-        header = "No conversations yet."
+        header = "No live conversations."
     elif len(sessions) > shown:
         header = f"Your conversations \u2014 newest {shown} of {len(sessions)}:"
     else:
