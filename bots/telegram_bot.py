@@ -345,9 +345,19 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunked(update, f"Error: {result['error']}")
         return
     sessions = result if isinstance(result, list) else []
-    labels = await labels_client.fetch_labels()
+    # An unreadable label store draws the same picker as an empty one: the
+    # buttons fall back to the gateway's own summaries, which is what the
+    # numbered list showed before any of this existed.
+    labels = await labels_client.fetch_labels() or {}
+    shown = min(len(sessions), session_picker.MAX_PICKER_ROWS)
+    if not sessions:
+        header = "No conversations yet."
+    elif len(sessions) > shown:
+        header = f"Your conversations \u2014 newest {shown} of {len(sessions)}:"
+    else:
+        header = "Your conversations:"
     await update.message.reply_text(
-        "Your conversations:" if sessions else "No conversations yet.",
+        header,
         reply_markup=session_picker.build_session_keyboard(sessions, labels),
     )
 
@@ -374,22 +384,38 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id=user_id, client_ref=chat_id,
     )
 
+    try:
+        msg = await _run_session_button(action, target, user_id, chat_id)
+    except Exception as exc:  # noqa: BLE001
+        # The spinner was cleared by `query.answer()` above, so an exception
+        # escaping here leaves the tap looking like it did nothing at all. The
+        # operator is told instead, and the traceback goes to the log.
+        log_event(
+            log, "surface.button.failed", level=logging.ERROR, surface="telegram",
+            command=action, user_id=user_id, client_ref=chat_id, error=str(exc),
+        )
+        msg = "That didn't go through \u2014 the gateway didn't answer."
+
+    await query.message.reply_text(msg)
+
+
+async def _run_session_button(action: str, target: str, user_id: int, chat_id: int) -> str:
+    """What a tapped button actually does. Separated so the handler's failure
+    path is one place rather than one per branch."""
     if action == session_picker.CB_NEW:
-        msg = await _handle_server_command("/new", user_id, chat_id)
-    elif action == session_picker.CB_SWITCH and target:
+        return await _handle_server_command("/new", user_id, chat_id)
+    if action == session_picker.CB_SWITCH and target:
         # The id travels whole, so the gateway resolves it against what exists
         # now rather than against the order this message was drawn in. A
         # conversation killed or swept away since then is reported as gone —
         # the one thing a tap must never do is land on a different one.
-        msg = await _handle_server_command(f"/switch {target}", user_id, chat_id)
-    elif action == session_picker.CB_SUSPEND and target:
+        return await _handle_server_command(f"/switch {target}", user_id, chat_id)
+    if action == session_picker.CB_SUSPEND and target:
         result = await gateway.suspend_session(target)
-        msg = (f"Error: {result['error']}" if isinstance(result, dict) and "error" in result
-               else "Suspended. It keeps its history \u2014 tap it in /sessions to resume.")
-    else:
-        msg = "That button no longer means anything \u2014 send /sessions for a fresh list."
-
-    await query.message.reply_text(msg)
+        if isinstance(result, dict) and "error" in result:
+            return f"Error: {result['error']}"
+        return "Suspended. It keeps its history \u2014 tap it in /sessions to resume."
+    return "That button no longer means anything \u2014 send /sessions for a fresh list."
 
 
 async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,6 +437,13 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.effective_user.id, update.effective_chat.id
     )
     labels = await labels_client.fetch_labels()
+    if labels is None:
+        # Writing now would send an empty colour and wipe the one set at the
+        # tile. A rename that cannot read the current label is not a rename.
+        await update.message.reply_text(
+            "Couldn't read the current label \u2014 nothing changed."
+        )
+        return
     body = session_picker.rename_body(
         " ".join(context.args) if context.args else "", labels.get(session_id)
     )

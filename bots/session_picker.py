@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from bots.bot_utils import time_ago
+
 # ---------------------------------------------------------------------------
 # Callback payloads
 # ---------------------------------------------------------------------------
@@ -64,6 +66,23 @@ _DOTS: tuple[tuple[str, tuple[int, int, int]], ...] = (
 )
 DEFAULT_DOT = "⚪"
 
+# Whether the conversation is running, asleep or over. A suspended row and a
+# live one render identically without this, which makes a suspend tap
+# unverifiable: the next picker looks exactly like the last one.
+_STATUS_ICONS = {
+    "running": "\U0001f7e2",
+    "idle": "\U0001f4a4",
+    "suspended": "\u23f8",
+    "closed": "\U0001f534",
+}
+DEFAULT_STATUS_ICON = "\u2753"
+
+# Telegram rejects an oversized `reply_markup` outright, and the bot's error
+# handler logs that rejection as a transient network blip \u2014 so the operator
+# taps /sessions and sees nothing at all. The gateway orders by last activity,
+# so the head of the list is the part worth drawing.
+MAX_PICKER_ROWS = 12
+
 
 def dot_for_color(color: object) -> str:
     """The nearest renderable dot to a label's hex colour.
@@ -103,7 +122,11 @@ def button_text(session: dict, labels: dict) -> str:
         label = {}
     name = (label.get("name") or "").strip()
     caption = name or (session.get("summary") or "").strip() or "Untitled"
-    dot = dot_for_color(label.get("color"))
+    # A colour is the operator's own mark and only they can decode it, so it is
+    # shown when they set one and never invented when they did not. The status
+    # icon is always there, because it is the gateway's fact about the row.
+    dot = dot_for_color(label["color"]) if label.get("color") else ""
+    status = _STATUS_ICONS.get(str(session.get("status") or ""), DEFAULT_STATUS_ICON)
     where = ""
     # A conversation another surface is holding has to read as elsewhere:
     # tapping it *moves* it here, ending the process at the other end, and
@@ -112,11 +135,18 @@ def button_text(session: dict, labels: dict) -> str:
     # move happens either way.
     if session.get("adoptable"):
         where = f" — on {session.get('surface') or 'another surface'}"
-    return f"{dot} {caption}{where}"
+    # The gateway writes a summary only on a chat turn, so every conversation
+    # the browser terminal is holding is called "New session" forever. Without
+    # the id and the age those rows are indistinguishable from each other, and
+    # a picker you cannot read is worse than the numbered list it replaced.
+    short = session_id[:8]
+    last = session.get("last_active") or 0
+    age = time_ago(last) if last else "?"
+    return f"{status}{dot} {caption}{where} \u00b7 {short} \u00b7 {age}"
 
 
 def build_session_rows(
-    sessions: list[dict], labels: dict | None = None
+    sessions: list[dict], labels: dict | None = None, limit: int = MAX_PICKER_ROWS
 ) -> list[list[InlineKeyboardButton]]:
     """One button per conversation, in the order the gateway returned them.
 
@@ -128,7 +158,7 @@ def build_session_rows(
     """
     labels = labels or {}
     rows: list[list[InlineKeyboardButton]] = []
-    for session in sessions or []:
+    for session in (sessions or [])[:limit]:
         session_id = str(session.get("id") or "")
         if not session_id:
             continue
@@ -147,10 +177,10 @@ def build_session_rows(
 
 
 def build_session_keyboard(
-    sessions: list[dict], labels: dict | None = None
+    sessions: list[dict], labels: dict | None = None, limit: int = MAX_PICKER_ROWS
 ) -> InlineKeyboardMarkup:
     """The rows, wrapped for the send call. No decisions of its own."""
-    return InlineKeyboardMarkup(build_session_rows(sessions, labels))
+    return InlineKeyboardMarkup(build_session_rows(sessions, labels, limit))
 
 
 def rename_body(new_name: object, existing: dict | None) -> dict | None:

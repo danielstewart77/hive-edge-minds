@@ -193,3 +193,196 @@ def test_a_conversation_held_elsewhere_says_so_on_its_button(session, expected):
         assert expected in text
     else:
         assert "on " not in text
+
+
+# ===========================================================================
+# The grill found four behaviours asserted nowhere: `/sessions` itself never
+# ran, `/rename` itself never ran, the suspend call's URL was never seen, and
+# the callback was never proved answered. Each mutation below was survived by
+# the original suite.
+# ===========================================================================
+class _Recorder:
+    """Records what the bot sent, standing in for Telegram only."""
+
+    def __init__(self):
+        self.text = None
+        self.markup = None
+
+    async def reply_text(self, text, reply_markup=None, **kwargs):
+        self.text = text
+        self.markup = reply_markup
+
+
+def _chat_update(recorder, args=None):
+    update = MagicMock()
+    update.message = recorder
+    update.effective_user.id = 4242
+    update.effective_chat.id = 99
+    ctx = MagicMock()
+    ctx.args = args or []
+    return update, ctx
+
+
+# --- Requirement 1, at the command rather than the renderer ----------------
+@pytest.mark.asyncio
+async def test_the_sessions_command_sends_a_keyboard_not_a_list(monkeypatch):
+    """Breaks if `/sessions` stops attaching the markup, which the renderer's
+    own tests cannot see: they never run the command."""
+    sessions = [
+        {"id": "11111111-aaaa", "summary": "Taxes", "status": "running", "last_active": 0},
+        {"id": "22222222-bbbb", "summary": "Roof", "status": "suspended", "last_active": 0},
+    ]
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder)
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
+    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
+
+    await bot.cmd_sessions(update, ctx)
+
+    assert recorder.markup is not None, "/sessions sent no buttons at all"
+    payloads = [b.callback_data for row in recorder.markup.inline_keyboard for b in row]
+    assert "sw:11111111-aaaa" in payloads
+    assert "sw:22222222-bbbb" in payloads
+
+
+@pytest.mark.asyncio
+async def test_a_long_session_list_is_capped_and_says_so(monkeypatch):
+    """Telegram rejects an oversized keyboard and the error handler swallows
+    it, so the operator sees nothing. Breaks if the cap is removed or the
+    count stops being reported."""
+    sessions = [
+        {"id": f"{i:08d}-xxxx", "summary": str(i), "status": "running", "last_active": 0}
+        for i in range(30)
+    ]
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder)
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
+    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
+
+    await bot.cmd_sessions(update, ctx)
+
+    switch_rows = [
+        b for row in recorder.markup.inline_keyboard for b in row
+        if b.callback_data.startswith("sw:")
+    ]
+    assert len(switch_rows) == 12
+    assert "12 of 30" in recorder.text
+
+
+# --- Requirement 3, against the payload the button really carries ----------
+def test_the_new_button_carries_a_payload_with_no_target_in_it():
+    """The original assertion decoded a module constant, which proved nothing
+    about the button. Breaks if `encode` ever emits a separator for it."""
+    rows = picker.build_session_rows(
+        [{"id": "11111111-aaaa", "summary": "x", "status": "running"}], {}
+    )
+    new_payload = rows[-1][0].callback_data
+
+    assert picker.decode(new_payload) == (picker.CB_NEW, "")
+
+
+# --- Requirement 4, at the HTTP call rather than the argument boundary -----
+@pytest.mark.asyncio
+async def test_suspend_posts_to_the_url_of_the_session_it_was_given():
+    """Breaks if the client ever posts to a fixed id — which the handler test
+    cannot see, because it replaces this method entirely."""
+    from bots.gateway_client import GatewayClient
+
+    posted = []
+
+    class _Resp:
+        status = 200
+
+        async def json(self):
+            return {"status": "suspended"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Http:
+        def post(self, url, **kwargs):
+            posted.append(url)
+            return _Resp()
+
+    client = GatewayClient(
+        _Http(), "http://gw.test", "telegram", mind_id="m", bearer_token="t"
+    )
+
+    await client.suspend_session("33333333-cccc")
+
+    assert posted == ["http://gw.test/sessions/33333333-cccc/suspend"]
+
+
+# --- Requirement 5, at the command rather than the body builder ------------
+@pytest.mark.asyncio
+async def test_a_bare_rename_command_writes_nothing_at_all(monkeypatch):
+    """`rename_body` returning None only helps if the handler obeys it.
+    Breaks if `cmd_rename` ever PUTs on an empty name."""
+    writes = []
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot.labels_client, "configured", lambda: True)
+    monkeypatch.setattr(bot.labels_client, "fetch_labels",
+                        AsyncMock(return_value={"sess-1": {"name": "Roof", "color": "#3481cc"}}))
+    monkeypatch.setattr(bot.labels_client, "put_label",
+                        AsyncMock(side_effect=lambda sid, body: writes.append((sid, body)) or True))
+    monkeypatch.setattr(bot, "gateway", MagicMock(ensure_session=AsyncMock(return_value="sess-1")))
+
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=[])
+    await bot.cmd_rename(update, ctx)
+    assert writes == [], "a bare /rename reached the label store"
+
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=["New", "roof"])
+    await bot.cmd_rename(update, ctx)
+    assert writes == [("sess-1", {"name": "New roof", "color": "#3481cc"})]
+
+
+@pytest.mark.asyncio
+async def test_a_rename_refuses_when_the_current_label_cannot_be_read(monkeypatch):
+    """An unreadable store used to look like an empty one, so the write went
+    out with a blank colour and erased the one set at the tile. Breaks if a
+    failed read is ever treated as "no labels"."""
+    writes = []
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot.labels_client, "configured", lambda: True)
+    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value=None))
+    monkeypatch.setattr(bot.labels_client, "put_label",
+                        AsyncMock(side_effect=lambda sid, body: writes.append((sid, body)) or True))
+    monkeypatch.setattr(bot, "gateway", MagicMock(ensure_session=AsyncMock(return_value="sess-1")))
+
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=["New", "roof"])
+    await bot.cmd_rename(update, ctx)
+
+    assert writes == []
+
+
+# --- The spinner, and the gate on it ---------------------------------------
+@pytest.mark.asyncio
+async def test_every_tap_answers_the_callback(tapped):
+    """An unanswered callback spins on the phone forever with no error
+    anywhere. Breaks if any path returns before answering."""
+    for payload in (picker.CB_NEW, picker.encode(picker.CB_SWITCH, "a"), "nonsense"):
+        query, _c, _s, update = tapped(payload)
+        await bot.on_session_button(update, None)
+        assert query.answer.await_count == 1, f"{payload} left the button spinning"
+
+
+@pytest.mark.asyncio
+async def test_a_tap_from_anyone_but_the_owner_does_nothing(tapped, monkeypatch):
+    """Every typed command goes through `_auth_check`; a tap has its own gate.
+    Breaks if that gate is dropped, which the other handler tests cannot see
+    because they all stub it to True."""
+    query, commands, suspended, update = tapped(picker.encode(picker.CB_SWITCH, "a"))
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: False)
+
+    await bot.on_session_button(update, None)
+
+    assert commands == []
+    assert suspended == []

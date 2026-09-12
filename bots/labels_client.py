@@ -43,10 +43,18 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TERMINAL_LABELS_TOKEN}"}
 
 
-async def fetch_labels() -> dict:
-    """Every label the terminal holds, keyed by session id. `{}` on any failure."""
+async def fetch_labels() -> dict | None:
+    """Every label the terminal holds, keyed by session id.
+
+    ``None`` means the store could not be read; ``{}`` means it was read and
+    holds nothing. A caller drawing buttons can treat both the same — it falls
+    back to the gateway's summaries either way — but a caller about to *write*
+    a label cannot. A failed read that looks like an empty store turns a
+    rename into a write of `{"name": ..., "color": ""}`, which erases the
+    colour set at the tile. The distinction is the whole point of the return.
+    """
     if not configured():
-        return {}
+        return None
     try:
         async with aiohttp.ClientSession(timeout=_TIMEOUT) as http:
             async with http.get(
@@ -58,7 +66,7 @@ async def fetch_labels() -> dict:
                         log, "labels.fetch.failed", level=logging.WARNING,
                         surface="telegram", status_code=resp.status,
                     )
-                    return {}
+                    return None
                 data = await resp.json()
                 return data if isinstance(data, dict) else {}
     except Exception as exc:  # noqa: BLE001 - a missing label is never fatal
@@ -66,7 +74,7 @@ async def fetch_labels() -> dict:
             log, "labels.fetch.failed", level=logging.WARNING,
             surface="telegram", error=str(exc),
         )
-        return {}
+        return None
 
 
 async def put_label(session_id: str, body: dict) -> bool:
