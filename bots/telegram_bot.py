@@ -254,6 +254,18 @@ def _format_status(data: dict) -> str:
 SERVER_COMMANDS = {"/clear", "/model", "/autopilot", "/kill", "/prune", "/status", "/sessions", "/switch", "/new", "/remember"}
 
 
+async def _conversation_caption(result: dict) -> str:
+    """Name a conversation the way the picker named it.
+
+    The gateway's reply carries only its own generated summary, so a reply
+    built from that alone contradicts the button that was just tapped. An
+    unreachable label store falls back to the summary rather than failing the
+    command — the label is how the reply reads, not whether it happened.
+    """
+    labels = await labels_client.fetch_labels() or {}
+    return session_picker.caption_for(result, labels)
+
+
 async def _handle_server_command(content: str, user_id: int, chat_id: int) -> str:
     parts = content.split()
     cmd = parts[0]
@@ -293,14 +305,15 @@ async def _handle_server_command(content: str, user_id: int, chat_id: int) -> st
         return msg
     if cmd == "/autopilot":
         on = result.get("autopilot", False)
-        summary = result.get("summary", "this session")
+        summary = await _conversation_caption(result)
         if on:
             return f"\U0001f916 Autopilot ON for \"{summary}\""
         return f"\U0001f512 Autopilot OFF for \"{summary}\""
     if cmd == "/switch":
-        return f"Resumed \"{result.get('summary', '?')}\""
+        return f"Resumed \"{await _conversation_caption(result)}\""
     if cmd == "/kill":
-        return f"Killed \"{result.get('summary', '?')}\" (status: {result.get('status')})"
+        caption = await _conversation_caption(result)
+        return f"Killed \"{caption}\" (status: {result.get('status')})"
     if cmd == "/prune":
         killed = result.get("killed") or []
         kept = result.get("kept")
