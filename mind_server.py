@@ -27,6 +27,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
+import code_symbols
 import host_metrics
 import models_api
 import pty_voice
@@ -734,6 +735,44 @@ async def put_file_content(request: Request, tree: str):
         return _files_failure(exc)
     log_event(log, "mind.file.saved", mind_id=MIND_ID, tree=tree, path=path)
     return result
+
+
+@app.get("/symbols")
+async def get_symbol(request: Request, repo: str = "", path: str = "", name: str = ""):
+    """Resolve one named function to the source actually on this mind's disk.
+
+    The console cannot do this itself — it holds no checkout and a mind on
+    another machine has no bind mount to offer — so the mind answers, the
+    same shape as `/skills`, `/files`, `/models` and `/host`.
+
+    Admin-guarded, because the reply is the contents of a source file and
+    this port answers across the LAN.
+
+    A name that is simply absent comes back as an unresolved answer with a
+    200, not as an error: "no such function" is a state page two renders,
+    and a 4xx in its place reads to the console as a mind that is broken.
+    """
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    if not path or not name:
+        return JSONResponse({"error": "path and name are required"}, status_code=400)
+    try:
+        symbol = await asyncio.to_thread(code_symbols.resolve_symbol, repo, path, name)
+    except code_symbols.SymbolError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except OSError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return symbol.as_dict()
+
+
+@app.get("/symbols/roots")
+async def get_symbol_roots(request: Request):
+    """The checkouts this mind will read for a design session."""
+    denied = _authorize_admin(request)
+    if denied is not None:
+        return denied
+    return {"roots": [str(root) for root in code_symbols.repo_roots()]}
 
 
 @app.get("/sessions")
