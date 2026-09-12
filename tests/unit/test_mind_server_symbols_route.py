@@ -116,8 +116,29 @@ def test_a_repository_this_mind_was_not_given_is_a_404(client, tmp_path):
     assert response.status_code == 404
 
 
-def test_the_roots_route_reports_what_this_mind_will_read(client):
+def test_the_roots_route_is_guarded_like_every_other_configuration_route(client):
+    """A roots listing names every checkout path on the host, on a port that
+    answers across the LAN."""
+    http, mind_server, _ = client
+
+    assert http.get("/symbols/roots").status_code == 401
+    assert http.get(
+        "/symbols/roots", headers={"Authorization": "Bearer not-the-token"}
+    ).status_code == 401
+
+
+def test_the_roots_route_reports_only_the_checkouts_that_are_actually_there(
+    client, monkeypatch, tmp_path
+):
+    """A declared root that does not resolve is dropped rather than offered:
+    an unmounted volume must not be reported as a repository this mind reads.
+    Comparing the answer to the declared value alone would prove only that
+    the route echoes its own environment back."""
     http, _, repo = client
+    missing = tmp_path / "never-mounted"
+    monkeypatch.setenv(
+        "DESIGN_REPO_ROOTS", os.pathsep.join([str(repo), str(missing)])
+    )
 
     response = http.get(
         "/symbols/roots", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"}
