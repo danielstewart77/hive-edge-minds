@@ -1,10 +1,9 @@
 """The Telegram session picker, at the layer each behaviour actually lands.
 
-Four requirements, four tests. The picker is a pure function over the
-gateway's session list, so the first and third need no bot at all; the second
-and fourth drive the real callback handler with a stand-in for Telegram's
-transport, because routing a tap is the behaviour and Telegram is only how the
-tap arrives.
+The picker is a pure function over the gateway's session list, so the
+rendering requirements need no bot at all; the routing ones drive the real
+handlers with a stand-in for Telegram's transport, because routing is the
+behaviour and Telegram is only how the tap or the command arrives.
 
 What is deliberately *not* here: a test that a tap on a conversation the
 gateway no longer holds reports it as gone. The good id would come from the
@@ -153,19 +152,64 @@ def test_a_bare_rename_sends_nothing_rather_than_erasing_the_label():
 
 
 # ---------------------------------------------------------------------------
-# Requirement 4 — the suspend button suspends that conversation.
+# Requirement 4 — /suspend puts a conversation to sleep: the chat's own when
+# given nothing, the named one when given an id.
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_the_suspend_button_suspends_the_tapped_conversation(tapped):
-    """Breaks if suspend is routed as a server command or loses the id."""
-    query, commands, suspended, update = tapped(
-        picker.encode(picker.CB_SUSPEND, "33333333-cccc")
-    )
+async def test_a_bare_suspend_suspends_the_conversation_this_chat_is_in(monkeypatch):
+    """Breaks if the bare form stops resolving the chat's own binding, or
+    starts demanding an id the operator would have to copy out of a picker."""
+    suspended = []
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(
+        find_active_session=AsyncMock(return_value="sess-here"),
+        suspend_session=AsyncMock(
+            side_effect=lambda sid: suspended.append(sid) or {"status": "suspended"}),
+    ))
 
-    await bot.on_session_button(update, None)
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=[])
+    await bot.cmd_suspend(update, ctx)
+
+    assert suspended == ["sess-here"]
+
+
+@pytest.mark.asyncio
+async def test_suspend_with_an_id_suspends_that_one_not_the_current_one(monkeypatch):
+    """The picker draws ids and a conversation held elsewhere has no other way
+    to be reached. Breaks if the argument is ignored for the chat's binding."""
+    suspended = []
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(
+        find_active_session=AsyncMock(return_value="sess-here"),
+        suspend_session=AsyncMock(
+            side_effect=lambda sid: suspended.append(sid) or {"status": "suspended"}),
+    ))
+
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=["33333333-cccc"])
+    await bot.cmd_suspend(update, ctx)
 
     assert suspended == ["33333333-cccc"]
-    assert commands == []
+
+
+@pytest.mark.asyncio
+async def test_a_bare_suspend_with_nothing_to_suspend_suspends_nothing(monkeypatch):
+    """An unbound chat has no conversation to name. Breaks if the empty
+    lookup is ever passed through to the gateway as a target."""
+    suspended = []
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(
+        find_active_session=AsyncMock(return_value=None),
+        suspend_session=AsyncMock(
+            side_effect=lambda sid: suspended.append(sid) or {"status": "suspended"}),
+    ))
+
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=[])
+    await bot.cmd_suspend(update, ctx)
+
+    assert suspended == []
 
 
 # ---------------------------------------------------------------------------
@@ -426,24 +470,28 @@ async def test_rename_never_creates_the_conversation_it_is_naming(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_rejected_suspend_body_is_reported_as_an_error(tapped):
+async def test_a_rejected_suspend_body_is_reported_as_an_error(monkeypatch):
     """comms raises through its own handlers as {"error": ...}, but a body
     FastAPI rejects comes back as {"detail": ...}. Reading only the first
     reported a 422 as a successful suspend.
 
     Breaks if the handler goes back to checking one key.
     """
-    query, _c, _s, update = tapped(picker.encode(picker.CB_SUSPEND, "33333333-cccc"))
-    update.callback_query.message.reply_text = AsyncMock()
-
     async def fastapi_rejection(session_id):
         return {"detail": [{"loc": ["path", "session_id"], "msg": "value is not valid"}]}
 
-    bot.gateway.suspend_session = fastapi_rejection
-    await bot.on_session_button(update, None)
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(
+        find_active_session=AsyncMock(return_value="sess-here"),
+        suspend_session=fastapi_rejection,
+    ))
 
-    sent = update.callback_query.message.reply_text.await_args.args[0]
-    assert sent.startswith("Error:"), f"a rejected suspend reported as {sent!r}"
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder, args=["33333333-cccc"])
+    await bot.cmd_suspend(update, ctx)
+
+    assert recorder.text.startswith("Error:"), \
+        f"a rejected suspend reported as {recorder.text!r}"
 
 
 def test_one_unsendable_row_does_not_take_the_whole_picker_with_it():
