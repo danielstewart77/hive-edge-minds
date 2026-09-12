@@ -19,6 +19,7 @@ from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -28,6 +29,7 @@ from telegram.ext import (
 from config import config
 from bots.bot_utils import get_lock, get_queue, time_ago
 from bots.gateway_client import GatewayClient
+from bots import labels_client, session_picker
 from bots.skills import get_skills
 from hive_logging import configure_logging, log_event
 
@@ -238,39 +240,6 @@ def _format_queue_batch(messages: list[str]) -> str:
     )
 
 
-def _format_sessions(sessions: list[dict]) -> str:
-    """The session picker, including sessions another surface is holding.
-
-    A conversation started in the browser terminal is listed here with the
-    surface it currently lives on, because switching to it moves it: the
-    terminal's process ends and the conversation carries on in this chat
-    with its whole history intact. That's the point \u2014 you started it at the
-    desk and you're not at the desk any more.
-    """
-    if not sessions:
-        return "No sessions found."
-    lines = ["Your Sessions:\n"]
-    for i, s in enumerate(sessions, 1):
-        status_icon = {"running": "\U0001f7e2", "idle": "\U0001f4a4", "closed": "\U0001f534"}.get(
-            s["status"], "\u2753"
-        )
-        autopilot = " \U0001f916" if s.get("autopilot") else ""
-        short_id = s["id"][:8]
-        summary = s.get("summary", "Untitled")
-        last = s.get("last_active", 0)
-        ago = time_ago(last) if last else "?"
-        where = f" \u2014 on {s.get('surface') or 'another surface'}" if s.get("adoptable") else ""
-        lines.append(
-            f"{i}. {status_icon}{autopilot} {short_id} \u2014 \"{summary}\" "
-            f"[{s.get('model', '?')}] ({ago}){where}"
-        )
-    if any(s.get("adoptable") for s in sessions):
-        lines.append("\nSessions marked with a surface are running elsewhere \u2014 "
-                     "/switch moves one here.")
-    lines.append("\n/switch <number> \u00b7 /new to start \u00b7 /kill <number> to kill")
-    return "\n".join(lines)
-
-
 def _format_status(data: dict) -> str:
     return (
         f"Server port: {data.get('server_port')}\n"
@@ -305,8 +274,6 @@ async def _handle_server_command(content: str, user_id: int, chat_id: int) -> st
         user_id=user_id, client_ref=chat_id,
     )
 
-    if cmd == "/sessions":
-        return _format_sessions(result)
     if cmd == "/status":
         return _format_status(result)
     if cmd == "/new":
@@ -363,10 +330,181 @@ async def _auth_check(update: Update) -> bool:
 # Command handlers
 # ---------------------------------------------------------------------------
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The picker: one tappable button per conversation.
+
+    The old numbered list made the reader resolve a position into a
+    conversation, which only works if nothing has moved since it was printed.
+    On a phone the message sits in scrollback for days. Buttons carry the id.
+    """
     if not await _auth_check(update):
         return
-    msg = await _handle_server_command("/sessions", update.effective_user.id, update.effective_chat.id)
-    await _reply_chunked(update, msg)
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    result = await gateway.server_command(user_id, chat_id, "/sessions")
+    if isinstance(result, dict) and "error" in result:
+        await _reply_chunked(update, f"Error: {result['error']}")
+        return
+    sessions = result if isinstance(result, list) else []
+    # An unreadable label store draws the same picker as an empty one: the
+    # buttons fall back to the gateway's own summaries, which is what the
+    # numbered list showed before any of this existed.
+    labels = await labels_client.fetch_labels() or {}
+    shown = min(len(sessions), session_picker.MAX_PICKER_ROWS)
+    if not sessions:
+        header = "No conversations yet."
+    elif len(sessions) > shown:
+        header = f"Your conversations \u2014 newest {shown} of {len(sessions)}:"
+    else:
+        header = "Your conversations:"
+    await update.message.reply_text(
+        header,
+        reply_markup=session_picker.build_session_keyboard(sessions, labels),
+    )
+
+
+async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A tapped button. Every path answers the callback before it returns.
+
+    Telegram spins a progress ring on the button until the query is answered,
+    and an unanswered one never times out visibly — it just stays spinning,
+    which reads as the bot having died rather than as anything going wrong.
+    So the answer comes first and the work happens after it.
+    """
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not _is_allowed_user(user_id):
+        # Every typed command logs its rejection; a tap is the one surface
+        # where an unauthorised attempt used to leave no record at all.
+        log_event(
+            log, "surface.auth.rejected", level=logging.WARNING, surface="telegram",
+            user_id=user_id, client_ref=chat_id,
+        )
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    # A tap redelivered across a restart can be too old to answer, and the 400
+    # that comes back used to abort the handler before the action ever ran —
+    # the spinner is cosmetic, the action is not.
+    try:
+        await query.answer()
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            log, "surface.button.answer.failed", level=logging.WARNING,
+            surface="telegram", user_id=user_id, client_ref=chat_id, error=str(exc),
+        )
+
+    action, target = session_picker.decode(query.data or "")
+    log_event(
+        log, "surface.button.tapped", surface="telegram", command=action,
+        user_id=user_id, client_ref=chat_id,
+    )
+
+    # Serialised against this chat's other work. Two taps on one row raced
+    # each other into `activate_session`, which takes no lock of its own, and
+    # landed two harness processes on a single transcript; a tap during a
+    # streaming turn cut the answer off mid-sentence and it was presented as
+    # complete. The button made both a one-finger operation.
+    try:
+        async with get_lock(chat_id):
+            msg = await _run_session_button(action, target, user_id, chat_id)
+    except Exception as exc:  # noqa: BLE001
+        # The spinner was cleared by `query.answer()` above, so an exception
+        # escaping here leaves the tap looking like it did nothing at all. The
+        # operator is told instead, and the traceback goes to the log.
+        log_event(
+            log, "surface.button.failed", level=logging.ERROR, surface="telegram",
+            command=action, user_id=user_id, client_ref=chat_id, error=str(exc),
+        )
+        msg = "That didn't go through \u2014 the gateway didn't answer."
+
+    await query.message.reply_text(msg)
+
+
+async def _run_session_button(action: str, target: str, user_id: int, chat_id: int) -> str:
+    """What a tapped button actually does. Separated so the handler's failure
+    path is one place rather than one per branch."""
+    if action == session_picker.CB_NEW:
+        # comms' /new closes the conversation this chat is holding before it
+        # creates one, and closed is permanent — it never appears in a picker
+        # again. One tap, no confirmation, so the reply has to say it.
+        had_one = await gateway.find_active_session(user_id, chat_id)
+        msg = await _handle_server_command("/new", user_id, chat_id)
+        if had_one:
+            msg += "\nThe conversation you were in was ended."
+        return msg
+    if action == session_picker.CB_SWITCH and target:
+        # The id travels whole, so the gateway resolves it against what exists
+        # now rather than against the order this message was drawn in. A
+        # conversation killed or swept away since then is reported as gone —
+        # the one thing a tap must never do is land on a different one.
+        return await _handle_server_command(f"/switch {target}", user_id, chat_id)
+    if action == session_picker.CB_SUSPEND and target:
+        active = await gateway.find_active_session(user_id, chat_id)
+        result = await gateway.suspend_session(target)
+        # comms raises through its own handlers as {"error": ...}, but a body
+        # FastAPI rejects comes back as {"detail": ...}. Reading only the first
+        # reported a 422 as a successful suspend.
+        if isinstance(result, dict):
+            problem = result.get("error") or result.get("detail")
+            if problem:
+                return f"Error: {problem}"
+        if target == active:
+            # "It keeps its history" is true of the row and false of this chat:
+            # suspending the conversation you are in clears the active binding,
+            # so the next thing typed starts a fresh one with no history.
+            return ("Suspended. That was the conversation this chat was in, so "
+                    "your next message starts a new one \u2014 tap it in /sessions "
+                    "to come back to it.")
+        return "Suspended. It keeps its history \u2014 tap it in /sessions to resume."
+    return "That button no longer means anything \u2014 send /sessions for a fresh list."
+
+
+async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rename the conversation this chat is holding.
+
+    A bare `/rename` is refused rather than passed through: the terminal's
+    label route deletes the row when name and colour are both blank, so an
+    empty name would silently erase a name set at the tile.
+    """
+    if not await _auth_check(update):
+        return
+    if not labels_client.configured():
+        await update.message.reply_text(
+            "Renaming isn't wired up on this mind \u2014 TERMINAL_URL and "
+            "TERMINAL_LABELS_TOKEN aren't set."
+        )
+        return
+    # `ensure_session` creates when it finds nothing, and creating here mints a
+    # conversation id, binds this chat to it and spawns a harness — so a rename
+    # typed against a suspended conversation started an empty one and named
+    # that instead, reporting success.
+    session_id = await gateway.find_active_session(
+        update.effective_user.id, update.effective_chat.id
+    )
+    if not session_id:
+        await update.message.reply_text(
+            "This chat isn't in a conversation right now \u2014 send /sessions "
+            "and tap one, or say anything to start one."
+        )
+        return
+    labels = await labels_client.fetch_labels()
+    if labels is None:
+        # Writing now would send an empty colour and wipe the one set at the
+        # tile. A rename that cannot read the current label is not a rename.
+        await update.message.reply_text(
+            "Couldn't read the current label \u2014 nothing changed."
+        )
+        return
+    body = session_picker.rename_body(
+        " ".join(context.args) if context.args else "", labels.get(session_id)
+    )
+    if body is None:
+        await update.message.reply_text("Usage: /rename <name>")
+        return
+    if await labels_client.put_label(session_id, body):
+        await update.message.reply_text(f"Renamed to \"{body['name']}\".")
+    else:
+        await update.message.reply_text("Couldn't reach the label store \u2014 name unchanged.")
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -930,6 +1068,8 @@ def _build_application(token: str):
     app.add_error_handler(_on_error)
 
     app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("rename", cmd_rename))
+    app.add_handler(CallbackQueryHandler(on_session_button))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("status", cmd_status))

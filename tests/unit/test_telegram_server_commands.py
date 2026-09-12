@@ -35,30 +35,6 @@ class TestHandleServerCommand:
         assert result.startswith("Error:")
         assert "something went wrong" in result
 
-    async def test_handle_server_command_sessions_formats_list(self) -> None:
-        from bots.telegram_bot import _handle_server_command
-
-        mock_gateway = AsyncMock()
-        mock_gateway.server_command = AsyncMock(
-            return_value=[
-                {
-                    "id": "abcd1234-5678-9012-3456-789012345678",
-                    "status": "running",
-                    "summary": "Test session",
-                    "model": "sonnet",
-                    "last_active": 0,
-                }
-            ]
-        )
-
-        with patch("bots.telegram_bot.gateway", mock_gateway):
-            result = await _handle_server_command("/sessions", 123, 456)
-
-        assert "Sessions" in result or "session" in result.lower()
-        # Must not be raw JSON
-        assert not result.startswith("[")
-        assert not result.startswith("{")
-
     async def test_handle_server_command_new_formats_short_id(self) -> None:
         from bots.telegram_bot import _handle_server_command
 

@@ -1,10 +1,10 @@
-"""The mind decides what its own soul says; the sub-mind only points.
+"""The mind decides what its own soul says.
 
-Branch B of ``auto_remember.sh`` used to read a 7B model's verdict and write
-it straight to the graph. It now writes a proposal file, and
-``soul_proposal_inject.sh`` puts that in front of the mind on its next
-message, where the ``review-identity-proposal`` skill is what accepts,
-rewords or rejects it.
+The per-turn flagger that used to raise proposals automatically was removed
+on 2026-09-11: it re-proposed the same trait across every thread and every
+one was rejected. What remains is the manual path — a proposal file that
+``soul_proposal_inject.sh`` puts in front of the mind, and the
+``review-identity-proposal`` skill that accepts, rewords or rejects it.
 
 The hooks and the skill live in ``~/.claude`` and are not tracked (edit is
 deploy), so they are loaded by path and this module skips where they are not
@@ -34,12 +34,11 @@ import pytest
 HOOKS_DIR = Path.home() / ".claude" / "hooks"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
 INJECT_HOOK = HOOKS_DIR / "soul_proposal_inject.sh"
-CAPTURE_HOOK = HOOKS_DIR / "auto_remember.sh"
 SKILL = SKILLS_DIR / "review-identity-proposal" / "SKILL.md"
 REVIEW_CRON = Path(__file__).resolve().parent.parent / "scripts" / "soul_review_cron.sh"
 
 pytestmark = pytest.mark.skipif(
-    not (INJECT_HOOK.is_file() and CAPTURE_HOOK.is_file() and SKILL.is_file()),
+    not (INJECT_HOOK.is_file() and SKILL.is_file()),
     reason="soul-proposal hooks/skill not installed on this host",
 )
 
@@ -116,120 +115,6 @@ if [ -n "${QUERY:-}" ]; then
 fi
 printf '{}'
 """
-
-
-def _run_branch_b(tmp_path: Path, *, verdict: dict, user="why did that break",
-                  assistant="because I put it there") -> dict:
-    """Run the real Stop hook against a stubbed network, return what it did.
-
-    Branch B was covered by two greps for absent string literals. Both
-    survived re-adding a soul write through a route with a different name,
-    and one survived blanking every proposal file to zero bytes. Running it
-    is the only way to know it does what it says.
-    """
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "curl").write_text(FAKE_CURL)
-    (bin_dir / "curl").chmod(0o755)
-
-    reply = tmp_path / "ollama.json"
-    reply.write_text(json.dumps(verdict))
-    curl_log = tmp_path / "curl.log"
-    curl_log.write_text("")
-    log_root = tmp_path / "logs"
-    log_root.mkdir()
-    proposals = log_root / "soul-proposals"
-
-    transcript = tmp_path / "transcript.jsonl"
-    transcript.write_text("\n".join(json.dumps(row) for row in [
-        {"type": "user", "message": {"role": "user", "content": user}},
-        {"type": "assistant",
-         "message": {"role": "assistant", "content": [{"type": "text", "text": assistant}]}},
-    ]))
-
-    env = dict(
-        os.environ,
-        PATH=f"{bin_dir}:{os.environ['PATH']}",
-        CURL_LOG=str(curl_log),
-        OLLAMA_REPLY=str(reply),
-        AUTO_REMEMBER_LOG_DIR=str(log_root),
-        SOUL_PROPOSAL_DIR=str(proposals),
-        HIVE_TOOLS_TOKEN="stub-token",
-    )
-    subprocess.run(
-        ["bash", str(CAPTURE_HOOK)],
-        input=json.dumps({
-            "session_id": "271f6719-ae88-44f3-97c8-0a1c20438a2a",
-            "transcript_path": str(transcript),
-        }),
-        capture_output=True, text=True, env=env, timeout=120,
-    )
-
-    # Branch B is forked and detached; give it a moment to land.
-    for _ in range(80):
-        if proposals.is_dir() and list(proposals.glob("*.json")):
-            break
-        time.sleep(0.25)
-
-    files = sorted(proposals.glob("*.json")) if proposals.is_dir() else []
-    # Contents, not paths: the caller reads these after its temporary
-    # directory is gone, and a handful of paths to deleted files is a
-    # FileNotFoundError dressed up as a test failure.
-    return {
-        "proposals": [json.loads(f.read_text()) for f in files],
-        "curl": curl_log.read_text(),
-    }
-
-
-def test_a_yes_verdict_writes_a_proposal_and_touches_no_graph_route():
-    """Test 4: Branch B spots; it does not write.
-
-    The hook is run for real with the network stubbed, so the assertion is
-    about the requests it actually made rather than about which identifiers
-    happen to appear in its source.
-    """
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as d:
-        result = _run_branch_b(Path(d), verdict={
-            "update": True,
-            "reason": "He called the learning-rate bug deliberate.",
-            "closest_line": "NONE",
-            "quotes": [THE_LINE],
-        })
-
-    assert result["proposals"], "a flagged turn must leave a proposal behind"
-    body = result["proposals"][0]
-    assert body["quotes"] == [THE_LINE]
-    assert body["reason"] == "He called the learning-rate bug deliberate."
-    assert body["excerpt"], "the exchange must travel with the flag"
-    assert body["session_id"] == "271f6719-ae88-44f3-97c8-0a1c20438a2a"
-
-    # Every request the hook made, by URL. The August write was a POST to a
-    # graph route; nothing here may be one.
-    for line in result["curl"].splitlines():
-        assert "/graph/properties/merge" not in line, line
-        assert "/graph/upsert" not in line, line
-        assert "/graph/soul" not in line, line
-        assert "/graph/nodes" not in line, line
-
-
-def test_a_no_verdict_writes_nothing():
-    """The flagger declining must leave the directory empty, not a blank file."""
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as d:
-        result = _run_branch_b(Path(d), verdict={
-            "update": False, "reason": "characterless",
-            "closest_line": "NONE", "quotes": [],
-        })
-
-    assert result["proposals"] == []
-
-
-# ---------------------------------------------------------------------------
-# Requirement 6 — a pending proposal is put in front of the mind
-# ---------------------------------------------------------------------------
 
 
 def test_a_pending_proposal_arrives_as_additional_context(proposal_dir: Path):

@@ -149,6 +149,27 @@ class GatewayClient:
             )
             return result
 
+    async def suspend_session(self, session_id: str) -> dict:
+        """Stop a conversation's processes but keep it resumable.
+
+        The same route the terminal tile's suspend button calls, so a
+        conversation suspended from a phone and one suspended at the desk
+        reach the identical state — there is no Telegram-flavoured suspend.
+        """
+        async with self.http.post(
+            f"{self.server_url}/sessions/{session_id}/suspend",
+            headers=self._auth_headers,
+        ) as resp:
+            result = await resp.json()
+            status = resp.status if isinstance(resp.status, int) else 200
+            log_event(
+                log,
+                "gateway.session.suspend.completed" if status < 400 else "gateway.session.suspend.failed",
+                level=logging.INFO if status < 400 else logging.ERROR,
+                session_id=session_id, mind_id=self.mind_id, status_code=status,
+            )
+            return result
+
     async def query_stream(
         self, user_id: int, client_ref: int | str, prompt: str,
         images: list[dict] | None = None,
