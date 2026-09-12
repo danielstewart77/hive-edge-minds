@@ -182,3 +182,71 @@ def test_a_file_that_does_not_parse_is_reported_rather_than_raised(
 
     assert symbol.resolved is False
     assert "parse" in symbol.note.lower()
+
+
+def test_a_form_feed_above_the_target_does_not_shift_the_body(tmp_path, monkeypatch):
+    """`str.splitlines` breaks on form feed; Python's line numbering does not.
+    One of them above the target silently returns a different function."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "ff.py").write_text(
+        "def alpha():\n    return 1\n\x0c\ndef beta():\n    return 2\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DESIGN_REPO_ROOTS", str(repo))
+
+    symbol = code_symbols.resolve_symbol(str(repo), "ff.py", "beta")
+
+    assert symbol.resolved is True
+    assert symbol.source == "def beta():\n    return 2"
+
+
+def test_a_unicode_line_separator_in_a_docstring_does_not_shift_the_body(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "sep.py").write_text(
+        'def alpha():\n    """one two"""\n    return 1\n\n\ndef beta():\n    return 2\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DESIGN_REPO_ROOTS", str(repo))
+
+    symbol = code_symbols.resolve_symbol(str(repo), "sep.py", "beta")
+
+    assert symbol.source == "def beta():\n    return 2"
+
+
+def test_a_file_that_is_not_utf8_is_reported_rather_than_raised(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "cp1252.py").write_bytes(b"# don\x92t\ndef thing():\n    return 1\n")
+    monkeypatch.setenv("DESIGN_REPO_ROOTS", str(repo))
+
+    symbol = code_symbols.resolve_symbol(str(repo), "cp1252.py", "thing")
+
+    assert symbol.resolved is False
+    assert "UTF-8" in symbol.note
+
+
+def test_a_bare_repository_is_refused_when_the_mind_reads_several(
+    tmp_path, monkeypatch
+):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "mod.py").write_text("def shared():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setenv("DESIGN_REPO_ROOTS", os.pathsep.join([str(first), str(second)]))
+
+    with pytest.raises(code_symbols.SymbolError):
+        code_symbols.resolve_symbol("", "mod.py", "shared")
+
+
+def test_a_bare_repository_is_allowed_when_there_is_only_one(tmp_path, monkeypatch):
+    only = tmp_path / "only"
+    only.mkdir()
+    (only / "mod.py").write_text("def shared():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setenv("DESIGN_REPO_ROOTS", str(only))
+
+    assert code_symbols.resolve_symbol("", "mod.py", "shared").resolved is True

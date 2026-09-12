@@ -101,6 +101,10 @@ def resolve_repo(repo: str) -> Path:
         raise SymbolError("This mind has no design repository roots configured")
     wanted = (repo or "").strip()
     if not wanted:
+        if len(roots) > 1:
+            raise SymbolError(
+                "This mind reads more than one checkout — name the repository"
+            )
         return roots[0]
     candidate = Path(wanted).expanduser()
     try:
@@ -169,14 +173,26 @@ def _definitions(tree: ast.AST, name: str) -> list[ast.AST]:
     return found
 
 
+def _lines(text: str) -> list[str]:
+    """Split the way Python's tokenizer counts lines, and no other way.
+
+    `str.splitlines` also breaks on form feed, vertical tab, NEL and the
+    Unicode line/paragraph separators — none of which advance a line number
+    in the AST. One form feed above the target function, or one literal
+    U+2028 in a docstring, shifts every index below it: the resolver then
+    returns a real body from the wrong place, marked resolved, with a line
+    span that checks out and a fingerprint attesting to the wrong bytes.
+    """
+    return text.split("\n")
+
+
 def _span(node: ast.AST, text: str) -> tuple[int, int, str]:
     first = getattr(node, "lineno", 1)
     decorators = getattr(node, "decorator_list", []) or []
     for decorator in decorators:
         first = min(first, getattr(decorator, "lineno", first))
     last = getattr(node, "end_lineno", first)
-    lines = text.splitlines()
-    body = "\n".join(lines[first - 1 : last])
+    body = "\n".join(line.rstrip("\r") for line in _lines(text)[first - 1 : last])
     return first, last, body
 
 
@@ -190,11 +206,23 @@ def resolve_symbol(repo: str, path: str, name: str) -> Symbol:
     root = resolve_repo(repo)
     symbol = Symbol(name=name, repo=str(root), path=path)
     target = _contained(root, path)
-    text = _read(target)
+    try:
+        text = _read(target)
+    except UnicodeDecodeError:
+        # A source file that is not UTF-8 — a cp1252 quote in a comment, a
+        # stray NUL. Neither SymbolError nor OSError, so unhandled it escapes
+        # the route as a 500 and the console reads it as a mind that is down.
+        symbol.note = f"{path} is not valid UTF-8 text"
+        return symbol
     try:
         tree = ast.parse(text, filename=str(target))
     except SyntaxError as exc:
         symbol.note = f"Could not parse {path}: {exc.msg} at line {exc.lineno}"
+        return symbol
+    except ValueError as exc:
+        # A NUL byte reaches the compiler as a bare ValueError, not a
+        # SyntaxError.
+        symbol.note = f"Could not parse {path}: {exc}"
         return symbol
 
     found = _definitions(tree, name)
@@ -223,7 +251,10 @@ def list_symbols(repo: str, path: str) -> list[str]:
     """Every function and class a file defines, for a caller checking a name."""
     root = resolve_repo(repo)
     target = _contained(root, path)
-    tree = ast.parse(_read(target), filename=str(target))
+    try:
+        tree = ast.parse(_read(target), filename=str(target))
+    except (SyntaxError, ValueError, UnicodeDecodeError) as exc:
+        raise SymbolError(f"Could not parse {path}: {exc}") from exc
     names: list[str] = []
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
