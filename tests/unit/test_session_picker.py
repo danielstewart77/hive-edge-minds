@@ -152,6 +152,46 @@ def test_a_bare_rename_sends_nothing_rather_than_erasing_the_label():
 
 
 # ---------------------------------------------------------------------------
+# Requirement — a reply that names a conversation calls it what the button
+# called it, not what the gateway generated.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_switching_reports_the_name_the_button_showed(monkeypatch):
+    """A row reading "dragoman" whose tap answered "Resumed New session" reads
+    as having resumed something else. Breaks if the reply goes back to the
+    gateway's summary, or if the label stops beating it."""
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(
+        return_value={"id": "77777777-eeee", "summary": "New session"})))
+    monkeypatch.setattr(bot.labels_client, "fetch_labels",
+                        AsyncMock(return_value={"77777777-eeee": {"name": "dragoman"}}))
+
+    named = await bot._handle_server_command("/switch 77777777-eeee", 4242, 99)
+
+    assert named == 'Resumed "dragoman"'
+
+    # No label: the gateway's summary is all there is, and it is used.
+    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
+    unnamed = await bot._handle_server_command("/switch 77777777-eeee", 4242, 99)
+
+    assert unnamed == 'Resumed "New session"'
+
+
+def test_the_button_and_the_reply_read_the_same_name(monkeypatch):
+    """One function names a conversation, so the two cannot drift. Breaks if
+    either side starts resolving the caption for itself."""
+    session = {"id": "77777777-eeee", "summary": "New session", "status": "running"}
+    labels = {"77777777-eeee": {"name": "dragoman"}}
+
+    assert picker.caption_for(session, labels) == "dragoman"
+    assert "dragoman" in picker.button_text(session, labels)
+    # An unreadable store is not an empty one at the caller, but here a
+    # missing label simply leaves the gateway's own summary standing.
+    assert picker.caption_for(session, None) == "New session"
+    assert picker.caption_for({"id": "x"}, {}) == "Untitled"
+
+
+# ---------------------------------------------------------------------------
 # Requirement — the picker lists live conversations only; a suspended one is
 # not drawn and is not counted.
 # ---------------------------------------------------------------------------

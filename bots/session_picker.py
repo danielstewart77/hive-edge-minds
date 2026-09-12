@@ -113,20 +113,36 @@ def dot_for_color(color: object) -> str:
     )[0]
 
 
+def caption_for(session: dict, labels: dict | None) -> str:
+    """What a conversation is called whenever it is named to the operator.
+
+    The operator's own label wins over the gateway's generated summary — they
+    named it, and a name they chose is the only thing they can predict. One
+    function because the button and the reply that follows tapping it have to
+    agree: a picker row reading "dragoman" whose tap answers "Resumed New
+    session" reads as having resumed something else entirely. The gateway
+    writes a summary only on a chat turn, so every conversation the browser
+    terminal holds is called "New session" forever, which is exactly the
+    population most likely to carry a label.
+    """
+    label = (labels or {}).get(str(session.get("id") or "")) or {}
+    if not isinstance(label, dict):
+        label = {}
+    name = (label.get("name") or "").strip()
+    return name or (str(session.get("summary") or "")).strip() or "Untitled"
+
+
 def button_text(session: dict, labels: dict) -> str:
     """What one conversation's button says.
 
-    The operator's own label wins over the gateway's generated summary — they
-    named it, and a name they chose is the only thing on the button they can
-    predict. Everything falls back rather than raising, because a malformed
-    row must cost its own button's prose, not the whole picker.
+    Everything falls back rather than raising, because a malformed row must
+    cost its own button's prose, not the whole picker.
     """
     session_id = str(session.get("id") or "")
     label = labels.get(session_id) or {}
     if not isinstance(label, dict):
         label = {}
-    name = (label.get("name") or "").strip()
-    caption = name or (session.get("summary") or "").strip() or "Untitled"
+    caption = caption_for(session, labels)
     # A colour is the operator's own mark and only they can decode it, so it is
     # shown when they set one and never invented when they did not. The status
     # icon is always there, because it is the gateway's fact about the row.
