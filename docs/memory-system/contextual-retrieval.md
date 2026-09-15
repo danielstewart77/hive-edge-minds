@@ -36,7 +36,7 @@ flowchart TD
 1. **Standing rules** — `GET /memory/list?tier=standing`, filtered
    client-side to `mind_id == MIND_ID` plus the `shared` sentinel.
    Emitted as `<standing-rules>`.
-2. **Cosine similarity** — `GET /memory/retrieve` against the prompt
+2. **Cosine similarity** — `POST /memory/retrieve` with the prompt in the body
    text, top-3, `min_score=0.50`, no class or mind filter (cross-hive
    recall). Emitted as part of `<relevant-memory>`.
 3. **Known-persons cue** — name candidates from the prompt are checked
