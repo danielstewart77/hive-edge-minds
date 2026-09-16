@@ -7,7 +7,7 @@ turn. Three parallel pulls against lucent, three `systemMessage` blocks.
 flowchart TD
     PROMPT[User prompt]
 
-    PROMPT --> NER{"Names a known person?<br/>For each candidate name:<br/>GET /graph/query?<br/>entity_name=&lt;name&gt;<br/>keep iff count == 1<br/>and type == Person"}
+    PROMPT --> NER{"Names a known person?<br/>All candidate names in one<br/>POST /graph/query body<br/>keep each iff count == 1<br/>and type == Person"}
     PROMPT --> COS["Cosine similarity<br/>k=3, min_score=0.50,<br/>no class or mind filter"]
     PROMPT --> STD["Standing-rules pull<br/>GET /memory/list?tier=standing<br/>filter to self UUID + shared"]
 
@@ -40,7 +40,8 @@ flowchart TD
    text, top-3, `min_score=0.50`, no class or mind filter (cross-hive
    recall). Emitted as part of `<relevant-memory>`.
 3. **Known-persons cue** — name candidates from the prompt are checked
-   against the KG via `GET /graph/query?entity_name=X`. A name resolves
+   against the KG via a single `POST /graph/query` carrying every
+   candidate name in its body. A name resolves
    only if `count == 1` and `type == "Person"`. For each resolved
    person, pull scalar properties + the **list of edge types present**
    on the node (just type names, not the connected targets). Emitted
@@ -71,7 +72,7 @@ person's graph). That judgment is reserved for the main model.
 
 **What the agent does in-turn:**
 
-The mind has direct `/graph/query?entity_name=X` tool access. When the
+The mind has direct `POST /graph/query` tool access. When the
 `<known-persons>` cue indicates a relevant person and the turn warrants
 deeper context, the agent calls `/graph/query` itself, walks the edges
 that matter for the question, and uses what comes back. Same harness

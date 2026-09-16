@@ -14,7 +14,7 @@ flowchart TD
     CHUNK --> ISS{"Is self?<br/>Identity-shaping content"}
     CHUNK --> ISF{"Is feedback?<br/>Stable preference,<br/>correction, or pushback"}
 
-    ISP --> PEX{"entity_name lookup<br/>GET /graph/query<br/>count==1, type==Person?"}
+    ISP --> PEX{"name lookup<br/>POST /graph/query (body)<br/>count==1, type==Person?"}
     PEX -->|yes| PFITS{"Fits KG schema?"}
     PFITS -->|no| VSP[(VS write<br/>data_class=current-state<br/>"[About &lt;Name&gt;] &lt;prose&gt;")]
 
@@ -63,7 +63,7 @@ the verdict and drops.
 ## Person branch — the `entity_name` validation
 
 When `person.present=true` and `person.fits_schema=false`, the hook
-runs a naive `GET /graph/query?entity_name=<name>` to confirm the name
+runs a naive `POST /graph/query` with the name in its body to confirm it
 resolves to exactly one Person node:
 
 - `count != 1` → drop (unknown name, ambiguous match, or non-Person hit).
@@ -96,7 +96,7 @@ breadcrumb.
 ## Open follow-ups
 
 - **Context-augmented person query.** v1 ships naive
-  `/graph/query?entity_name=X`. A smarter path (subagent emits JSON
+  `POST /graph/query`. A smarter path (subagent emits JSON
   scope spec with typed edge constraints; hook walks the anchor to
   disambiguate names like "my brother David" vs "David from work")
   is deferred until measurement shows the naive false-drop rate is

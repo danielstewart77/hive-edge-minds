@@ -368,7 +368,8 @@ curl -sf -H "Authorization: Bearer ${COMMS_BEARER_TOKEN}" \
 
 # 4. Soul seeded into lucent KG
 curl -sf -H "Authorization: Bearer ${LUCENT_BEARER_TOKEN}" \
-  "$LUCENT_URL_SELF/graph/query?name=<Name>&mind_id=$MIND_ID" | jq '.nodes[0].properties.soul_values | length'
+  -H 'Content-Type: application/json' -d '{"names": ["<Name>"], "depth": 1}' \
+  "$LUCENT_URL_SELF/graph/query" | jq '.results[0].matches[0].properties.soul_values | length'
 # Expect: an integer > 0 matching the number of non-empty lines in souls/<name>.md
 
 # 5. Telegram bot started

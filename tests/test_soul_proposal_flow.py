@@ -105,12 +105,12 @@ printf '%s\n' "$*" >> "$CURL_LOG"
 for arg in "$@"; do
   case "$arg" in
     */ollama/structured) OLLAMA=1 ;;
-    */graph/query)       QUERY=1 ;;
+    */graph/query)       QUERY=1 ;;   # POST now; the names ride in the body
   esac
 done
 if [ -n "${OLLAMA:-}" ]; then cat "$OLLAMA_REPLY"; exit 0; fi
 if [ -n "${QUERY:-}" ]; then
-  printf '{"found":true,"matches":[{"properties":{"soul_values":["I am ancient."]}}]}'
+  printf '{"results":[{"entity":"Skippy","found":true,"count":1,"matches":[{"properties":{"soul_values":["I am ancient."]}}]}]}'
   exit 0
 fi
 printf '{}'
