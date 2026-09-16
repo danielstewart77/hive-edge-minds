@@ -97,26 +97,6 @@ def _run_inject(proposal_dir: Path) -> subprocess.CompletedProcess:
 # ---------------------------------------------------------------------------
 
 
-FAKE_CURL = r"""#!/usr/bin/env bash
-# Stands in for curl so Branch B can be run for real. Every invocation is
-# logged with its full argument list, which is what lets a test assert that
-# no request reached a graph route — the thing the August failure did.
-printf '%s\n' "$*" >> "$CURL_LOG"
-for arg in "$@"; do
-  case "$arg" in
-    */ollama/structured) OLLAMA=1 ;;
-    */graph/query)       QUERY=1 ;;   # POST now; the names ride in the body
-  esac
-done
-if [ -n "${OLLAMA:-}" ]; then cat "$OLLAMA_REPLY"; exit 0; fi
-if [ -n "${QUERY:-}" ]; then
-  printf '{"results":[{"entity":"Skippy","found":true,"count":1,"matches":[{"properties":{"soul_values":["I am ancient."]}}]}]}'
-  exit 0
-fi
-printf '{}'
-"""
-
-
 def test_a_pending_proposal_arrives_as_additional_context(proposal_dir: Path):
     """Test 6: additionalContext, not systemMessage.
 
