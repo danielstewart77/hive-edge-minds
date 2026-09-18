@@ -312,3 +312,44 @@ class TestRenameRefusesLoudly:
         said = update.message.reply_text.call_args[0][0]
         assert said.strip()
         assert said != rename_prompt.PROMPT_TEXT
+
+
+@pytest.mark.asyncio
+class TestTheRenamePromptHasATarget:
+    async def test_the_prompt_quotes_the_command_that_asked_for_it(
+        self, labels, gateway
+    ) -> None:
+        """Requirement 2: `selective` needs something to select.
+
+        The Bot API targets a force-reply at "users @mentioned in the text" or,
+        if the bot's message is a reply, "the sender of the original". The
+        prompt mentions nobody, and PTB does not quote in a private chat unless
+        told to — so without this the reply box opens for nobody and the
+        keyboard does not come up aimed at the prompt.
+        """
+        from bots.telegram_bot import cmd_rename
+
+        update = _make_update()
+        context = MagicMock()
+        context.args = []
+
+        await cmd_rename(update, context)
+
+        assert update.message.reply_text.call_args.kwargs.get("do_quote") is True
+
+
+@pytest.mark.asyncio
+class TestAnEditedMessageIsNotARename:
+    async def test_an_update_carrying_no_message_is_ignored(self) -> None:
+        """Editing a sent message re-fires these handlers with no `message`.
+
+        The helper guards for it, but a caller dereferencing `update.message`
+        to build the argument defeats that guard — the argument is evaluated
+        first, so the AttributeError happens before the guard is reached.
+        """
+        from bots.telegram_bot import _handled_as_rename_reply
+
+        update = MagicMock()
+        update.message = None
+
+        assert await _handled_as_rename_reply(update, MagicMock(), "Dragoman") is False

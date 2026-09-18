@@ -6,8 +6,11 @@ Lives in the bot's Python process; not shared via NS.
 """
 
 import asyncio
+import json
+import os
 from collections import OrderedDict
 from datetime import datetime
+from pathlib import Path
 
 _locks: dict[int, asyncio.Lock] = {}
 _chat_queues: dict[int, asyncio.Queue] = {}
@@ -21,11 +24,67 @@ _chat_queues: dict[int, asyncio.Queue] = {}
 # synchronously, before anything is awaited: two taps that arrive before the
 # edit lands are ordered by this dict, not by the network.
 #
-# Bounded, because a long-lived bot draws a lot of pickers. Eviction can only
-# make a very old picker claimable again, and a very old picker has had its
-# keyboard removed, so there is nothing left on it to tap.
+# **It is written to disk**, because the incident it exists to prevent runs
+# straight through a restart. Polling goes down, taps queue at Telegram's end,
+# and the usual way polling comes back is `skippy.service` restarting —
+# whereupon `getUpdates` redelivers every queued tap to a fresh process. With
+# the claims in memory only, both taps claim successfully and the second ends
+# the conversation the first just created, which is exactly 2026-09-17.
 _MAX_REMEMBERED_PICKERS = 512
+_DEFAULT_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "spent_pickers.json"
+
+
+def _state_path() -> Path:
+    """Where the claims live. Read per call, not frozen at import.
+
+    `PICKER_STATE_PATH` points it elsewhere for an install that keeps state
+    outside the checkout — and resolving it each time is what lets a test aim
+    it at a temp directory without depending on when this module happened to
+    be imported.
+    """
+    return Path(os.environ.get("PICKER_STATE_PATH") or _DEFAULT_STATE_PATH)
 _spent_pickers: "OrderedDict[tuple[int, int], None]" = OrderedDict()
+_loaded = False
+
+
+def _load() -> None:
+    """Read the claims left by the previous process, once.
+
+    Unreadable, absent or corrupt all mean the same thing here and are not
+    fatal: the claim degrades to in-memory, which is what it was before. A
+    picker failing to be remembered across a restart is the old behaviour; a
+    bot that will not start is worse than either.
+    """
+    global _loaded
+    _loaded = True
+    try:
+        raw = json.loads(_state_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(raw, list):
+        return
+    for entry in raw[-_MAX_REMEMBERED_PICKERS:]:
+        try:
+            chat_id, message_id = entry
+            _spent_pickers[(int(chat_id), int(message_id))] = None
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _persist() -> None:
+    """Write the claims out, atomically and never fatally."""
+    try:
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps([[c, m] for c, m in _spent_pickers]), encoding="utf-8"
+        )
+        # Replaced rather than truncated, so a crash mid-write cannot leave a
+        # half-written file that reads as "nothing is claimed".
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def claim_picker(chat_id: int, message_id: int) -> bool:
@@ -39,18 +98,23 @@ def claim_picker(chat_id: int, message_id: int) -> bool:
     precise race that let a second ``New session`` tap destroy the
     conversation the first one had just created.
     """
-    key = (chat_id, message_id)
+    if not _loaded:
+        _load()
+    key = (int(chat_id), int(message_id))
     if key in _spent_pickers:
         return False
     _spent_pickers[key] = None
     while len(_spent_pickers) > _MAX_REMEMBERED_PICKERS:
         _spent_pickers.popitem(last=False)
+    _persist()
     return True
 
 
 def _reset_pickers() -> None:
     """Test helper — forget every claim so a test starts from a clean slate."""
+    global _loaded
     _spent_pickers.clear()
+    _loaded = True
 
 
 def get_lock(chat_id: int) -> asyncio.Lock:

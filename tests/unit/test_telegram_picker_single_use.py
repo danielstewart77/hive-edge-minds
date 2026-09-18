@@ -43,7 +43,14 @@ def _patch_config():
 
 
 @pytest.fixture(autouse=True)
-def _clean_pickers():
+def _clean_pickers(tmp_path, monkeypatch):
+    """Every test gets its own claim store.
+
+    The claims are persisted so they survive a restart, which means a test that
+    takes one writes a real file — and without this the next test inherits it
+    and a fresh picker reads as already used.
+    """
+    monkeypatch.setenv("PICKER_STATE_PATH", str(tmp_path / "spent_pickers.json"))
     from bots import bot_utils
 
     bot_utils._reset_pickers()
@@ -82,7 +89,7 @@ class TestTapBehaviour:
         from bots.telegram_bot import on_session_button
 
         update, context = _make_callback()
-        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value="New session: abcd1234")):
+        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value=(True, "New session: abcd1234"))):
             await on_session_button(update, context)
 
         update.callback_query.edit_message_reply_markup.assert_awaited_once()
@@ -99,7 +106,7 @@ class TestTapBehaviour:
         """
         from bots.telegram_bot import on_session_button, SPENT_PICKER_TEXT
 
-        run = AsyncMock(return_value="New session: abcd1234")
+        run = AsyncMock(return_value=(True, "New session: abcd1234"))
         with patch("bots.telegram_bot._run_session_button", run):
             update, context = _make_callback()
             await on_session_button(update, context)
@@ -120,7 +127,7 @@ class TestTapBehaviour:
         from bots.telegram_bot import on_session_button
 
         update, context = _make_callback(data="sw:sess-1")
-        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value='Resumed "Dragoman"')):
+        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value=(True, 'Resumed "Dragoman"'))):
             await on_session_button(update, context)
 
         update.callback_query.edit_message_text.assert_awaited_once()
@@ -131,7 +138,7 @@ class TestTapBehaviour:
         from bots.telegram_bot import on_session_button
 
         update, context = _make_callback()
-        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value="New session: abcd1234")):
+        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value=(True, "New session: abcd1234"))):
             await on_session_button(update, context)
 
         context.bot.send_message.assert_awaited()
@@ -163,7 +170,7 @@ class TestTapBehaviour:
 
         async def _work(*_a, **_k):
             order.append("work")
-            return "New session: abcd1234"
+            return True, "New session: abcd1234"
 
         with patch("bots.telegram_bot._run_session_button", _work):
             await on_session_button(update, context)
@@ -249,7 +256,7 @@ class TestConcurrentTaps:
             runs += 1
             started.set()
             await release.wait()
-            return "New session: abcd1234"
+            return True, "New session: abcd1234"
 
         # Both taps carry the same picker message id, as a double-tap does.
         first, ctx1 = _make_callback()
@@ -278,7 +285,7 @@ class TestConcurrentTaps:
 
         update, context = _make_callback()
         update.callback_query.message = None
-        run = AsyncMock(return_value="New session: abcd1234")
+        run = AsyncMock(return_value=(True, "New session: abcd1234"))
 
         with patch("bots.telegram_bot._run_session_button", run):
             await on_session_button(update, context)
@@ -294,7 +301,7 @@ class TestAcknowledgement:
         from bots.telegram_bot import ACK_TEXT, on_session_button
 
         update, context = _make_callback()
-        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value="ok")):
+        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value=(True, "ok"))):
             await on_session_button(update, context)
 
         assert ACK_TEXT.strip()
@@ -312,7 +319,7 @@ class TestAcknowledgement:
         update, context = _make_callback()
         update.callback_query.answer = AsyncMock(side_effect=RuntimeError("query is too old"))
 
-        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value="ok")):
+        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value=(True, "ok"))):
             await on_session_button(update, context)
 
         sent = [c.kwargs["text"] for c in context.bot.send_message.await_args_list]
@@ -347,7 +354,7 @@ class TestTheMarkTellsTheTruth:
 
         update, context = _make_callback()
         with patch("bots.telegram_bot._run_session_button",
-                   AsyncMock(return_value="Error: session not found")):
+                   AsyncMock(return_value=(False, "Error: session not found"))):
             await on_session_button(update, context)
 
         annotated = update.callback_query.edit_message_text.call_args[0][0]
@@ -358,7 +365,7 @@ class TestTheMarkTellsTheTruth:
         from bots.telegram_bot import on_session_button
 
         update, context = _make_callback()
-        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value='Resumed "Dragoman"')):
+        with patch("bots.telegram_bot._run_session_button", AsyncMock(return_value=(True, 'Resumed "Dragoman"'))):
             await on_session_button(update, context)
 
         assert "✅" in update.callback_query.edit_message_text.call_args[0][0]
@@ -443,3 +450,200 @@ class TestARetryDoesNotRepeatWhatLanded:
 
         _chat, queued, _attempts = await asyncio.wait_for(proactive.get(), timeout=2)
         assert queued == "B" * 50
+
+
+class TestTheClaimSurvivesARestart:
+    """Requirement 8, through the restart the incident actually ran through.
+
+    Polling goes down, taps queue at Telegram's end, and the usual way polling
+    comes back is the service restarting — whereupon `getUpdates` redelivers
+    every queued tap to a fresh process. A claim held only in memory lets both
+    taps through, and the second ends the conversation the first created.
+    """
+
+    def test_a_claim_taken_before_a_restart_still_holds_after_one(self) -> None:
+        from bots import bot_utils
+
+        assert bot_utils.claim_picker(456, 99) is True
+
+        # A fresh process holds nothing in memory and has not read the store
+        # yet — so the claim can only come back off disk.
+        bot_utils._spent_pickers.clear()
+        bot_utils._loaded = False
+
+        assert bot_utils.claim_picker(456, 99) is False
+        assert bot_utils.claim_picker(456, 100) is True
+
+    def test_an_unreadable_store_does_not_stop_the_bot_claiming(self, tmp_path, monkeypatch) -> None:
+        """A picker not remembered across a restart is the old behaviour.
+
+        A bot that will not start is worse than either, so corruption degrades
+        to in-memory rather than raising.
+        """
+        from bots import bot_utils
+
+        broken = tmp_path / "broken" / "spent_pickers.json"
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("{not json at all", encoding="utf-8")
+        monkeypatch.setenv("PICKER_STATE_PATH", str(broken))
+
+        bot_utils._spent_pickers.clear()
+        bot_utils._loaded = False
+        assert bot_utils.claim_picker(456, 99) is True
+        assert bot_utils.claim_picker(456, 99) is False
+
+
+@pytest.mark.asyncio
+class TestARefusalIsNeverReportedAsSuccess:
+    """Requirement 10, at the layer where the lie was actually told.
+
+    `GatewayClient.server_command` returns the parsed body whatever the status
+    was, and FastAPI reports its own rejections as `detail`, not `error` — a
+    401 on a rotated bearer, a 404 on a swept session, a 422 on a body it will
+    not parse. Reading only `error` meant a switch that never happened answered
+    `Resumed "..."` with a tick on it, and the operator's next message went to
+    the conversation they were already in.
+    """
+
+    async def test_a_fastapi_rejection_is_reported_as_an_error(self) -> None:
+        from bots.telegram_bot import _handle_server_command
+
+        gw = AsyncMock()
+        gw.server_command = AsyncMock(return_value={"detail": "Not authenticated"})
+
+        with patch("bots.telegram_bot.gateway", gw):
+            msg = await _handle_server_command("/switch abc", 123, 456)
+
+        assert msg.startswith("Error:")
+        assert "Not authenticated" in msg
+
+    async def test_a_comms_error_is_still_reported_as_an_error(self) -> None:
+        """The original shape must keep working — this added a key, not swapped one."""
+        from bots.telegram_bot import _handle_server_command
+
+        gw = AsyncMock()
+        gw.server_command = AsyncMock(return_value={"error": "session not found"})
+
+        with patch("bots.telegram_bot.gateway", gw):
+            msg = await _handle_server_command("/switch abc", 123, 456)
+
+        assert msg.startswith("Error:")
+
+    async def test_a_refused_switch_is_not_marked_done(self) -> None:
+        """Requirement 10: and the refusal reaches the picker as a failure."""
+        from bots.telegram_bot import on_session_button
+
+        gw = AsyncMock()
+        gw.server_command = AsyncMock(return_value={"detail": "Not authenticated"})
+        update, context = _make_callback(data="sw:sess-1")
+
+        with patch("bots.telegram_bot.gateway", gw), \
+                patch("bots.telegram_bot.labels_client.fetch_labels", AsyncMock(return_value={})):
+            await on_session_button(update, context)
+
+        annotated = update.callback_query.edit_message_text.call_args[0][0]
+        assert "✅" not in annotated
+
+    async def test_a_failed_new_does_not_claim_the_conversation_was_ended(self) -> None:
+        """Requirement 10: the sentence under the mark must be true too.
+
+        The "your conversation was ended" line was appended on whether one
+        existed, not on whether ending it worked — so a failed /new told the
+        operator to rebuild from scratch over a conversation still sitting
+        there.
+        """
+        from bots.telegram_bot import _run_session_button
+
+        gw = AsyncMock()
+        gw.find_active_session = AsyncMock(return_value="sess-1")
+        gw.server_command = AsyncMock(return_value={"error": "comms unreachable"})
+
+        with patch("bots.telegram_bot.gateway", gw):
+            worked, msg = await _run_session_button("new", "", 123, 456)
+
+        assert worked is False
+        assert "ended" not in msg
+
+    async def test_a_tap_that_resolves_to_nothing_is_a_failure(self) -> None:
+        """Requirement 10: the third failure shape, which reads like success.
+
+        A refusal that happens not to begin with "Error:" was ticked, because
+        the flag was sniffed from the prose instead of returned.
+        """
+        from bots.telegram_bot import _run_session_button
+
+        worked, msg = await _run_session_button("sw", "", 123, 456)
+
+        assert worked is False
+        assert msg.strip()
+
+
+@pytest.mark.asyncio
+class TestTheQueueKeepsMoving:
+    async def test_an_item_in_flight_is_put_back_when_the_consumer_is_cancelled(self) -> None:
+        """Requirement 13: a restart mid-send must not swallow the answer.
+
+        The item is taken off the queue and lives only in the consumer's frame,
+        so a cancellation there drops it — and the shutdown drain cannot see
+        what is no longer in the queue.
+        """
+        from bots import proactive
+        from bots.telegram_bot import _proactive_consumer
+
+        proactive._reset()
+        blocked = asyncio.Event()
+
+        async def _hang(**_kwargs):
+            blocked.set()
+            await asyncio.Event().wait()
+
+        app = MagicMock()
+        app.bot.send_message = _hang
+        proactive.enqueue(4242, "the answer you never saw")
+
+        task = asyncio.create_task(_proactive_consumer(app))
+        await blocked.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert proactive.drain() == [(4242, "the answer you never saw", 0)]
+
+    async def test_one_undeliverable_item_does_not_delay_the_others(self) -> None:
+        """Requirement 13: the retry wait rides on the item, not the consumer.
+
+        Sleeping in the consumer made the interval global — one message with
+        nowhere to go delayed every other answer by the full retry interval,
+        and a queue of N items shed one attempt per interval rather than one
+        per item.
+        """
+        from bots import proactive
+        from bots.telegram_bot import _proactive_consumer
+
+        proactive._reset()
+        delivered: list[str] = []
+
+        async def _send(chat_id=None, text=None, **_kwargs):
+            if chat_id == 1:
+                raise RuntimeError("blocked forever")
+            delivered.append(text)
+
+        app = MagicMock()
+        app.bot.send_message = _send
+
+        with patch("bots.telegram_bot._PROACTIVE_RETRY_S", 3600):
+            proactive.enqueue(1, "poison")
+            for n in range(5):
+                proactive.enqueue(2, f"good {n}")
+
+            task = asyncio.create_task(_proactive_consumer(app))
+            for _ in range(200):
+                await asyncio.sleep(0)
+                if len(delivered) == 5:
+                    break
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        # All five landed without waiting out the poison item's hour.
+        assert delivered == [f"good {n}" for n in range(5)]

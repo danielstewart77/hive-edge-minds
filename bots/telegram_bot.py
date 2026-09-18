@@ -244,20 +244,23 @@ async def _deliver(bot, chat_id: int, text: str) -> bool:
 
     # Only what has not landed. Queuing the whole text after a partial send
     # would repeat the part the operator already has.
-    proactive.enqueue(chat_id, "".join(chunks[sent:]) if sent else text)
+    proactive.enqueue(chat_id, "".join(chunks[sent:]))
     return False
 
 
 async def _reply_chunked(update: Update, text: str) -> None:
-    """Reply with text of any length.
+    """Reply with text of any length, and never silently fail to.
 
-    Command replies used to go straight to ``reply_text``, so one that ran
-    past Telegram's limit came back as a BadRequest the error handler logs
-    as a transient network blip and drops. The user sees nothing at all —
-    the command reads as broken rather than as too chatty.
+    Command replies used to go straight to ``reply_text``, so one that ran past
+    Telegram's limit came back as a BadRequest the error handler logs as a
+    transient network blip and drops. The user sees nothing at all — the
+    command reads as broken rather than as too chatty. A `NetworkError` does
+    the same thing, which is why this goes through `_deliver`: a typed command
+    deserves the guarantee a tapped button got, and `/sessions` failing
+    silently during an outage is how the operator ends up with no picker and no
+    idea why.
     """
-    for chunk in _chunk_message(text):
-        await update.message.reply_text(chunk)
+    await _deliver(update.get_bot(), update.effective_chat.id, text)
 
 
 # ---------------------------------------------------------------------------
@@ -394,12 +397,23 @@ async def _handle_server_command(content: str, user_id: int, chat_id: int) -> st
     )
     result = await gateway.server_command(user_id, chat_id, content)
 
-    if "error" in result:
+    # `server_command` returns the parsed body whatever the status was, and
+    # FastAPI reports its own rejections as `detail`, not `error` — a 401 on a
+    # rotated bearer, a 404 on a swept session, a 422 on a body it will not
+    # parse. Reading only `error` let all three fall through to the success
+    # branch below, so a switch that never happened answered `Resumed "..."`
+    # and the operator's next message went to the conversation they were
+    # already in. `_suspend_conversation` learned this from a 422 and fixed it
+    # in one place; this is the other.
+    problem = None
+    if isinstance(result, dict):
+        problem = result.get("error") or result.get("detail")
+    if problem:
         log_event(
             log, "surface.command.failed", level=logging.WARNING, surface="telegram",
             command=cmd, user_id=user_id, client_ref=chat_id,
         )
-        return f"Error: {result['error']}"
+        return f"Error: {problem}"
     log_event(
         log, "surface.command.completed", surface="telegram", command=cmd,
         user_id=user_id, client_ref=chat_id,
@@ -490,9 +504,31 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         header = f"Your conversations \u2014 newest {shown} of {len(sessions)}:"
     else:
         header = "Your conversations:"
-    await update.message.reply_text(
-        header,
-        reply_markup=session_picker.build_session_keyboard(sessions, labels),
+    # Retried, because this is the message the operator sends to *recover*
+    # from a failed tap. A bare `reply_text` here fails into `_on_error`, which
+    # logs a network error at INFO and returns — so during an outage /sessions
+    # produces no picker, says nothing, and leaves nothing above INFO to find.
+    keyboard = session_picker.build_session_keyboard(sessions, labels)
+    last: Exception | None = None
+    for attempt in range(_DELIVER_ATTEMPTS):
+        try:
+            await update.message.reply_text(header, reply_markup=keyboard)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt + 1 < _DELIVER_ATTEMPTS:
+                await asyncio.sleep(_DELIVER_BACKOFF_S * (attempt + 1))
+    log_event(
+        log, "surface.picker.send.failed", level=logging.WARNING, surface="telegram",
+        user_id=user_id, client_ref=chat_id, error=str(last),
+    )
+    # A picker cannot be queued — its buttons are only meaningful against the
+    # list as it was — so what gets queued is the fact that it failed.
+    await _deliver(
+        context.bot, chat_id,
+        "Couldn't draw the conversation list \u2014 send /sessions to try again.",
     )
 
 
@@ -594,11 +630,7 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     worked = True
     try:
         async with get_lock(chat_id):
-            msg = await _run_session_button(action, target, user_id, chat_id)
-        # `_handle_server_command` reports a refusing gateway in the string
-        # rather than by raising, so the mark below cannot key on the
-        # exception alone.
-        worked = not msg.startswith("Error:")
+            worked, msg = await _run_session_button(action, target, user_id, chat_id)
     except Exception as exc:  # noqa: BLE001
         worked = False
         # An exception escaping here leaves the tap looking like it did nothing
@@ -656,25 +688,42 @@ async def _suspend_conversation(target: str, user_id: int, chat_id: int) -> str:
     return "Suspended. It keeps its history \u2014 tap it in /sessions to resume."
 
 
-async def _run_session_button(action: str, target: str, user_id: int, chat_id: int) -> str:
-    """What a tapped button actually does. Separated so the handler's failure
-    path is one place rather than one per branch."""
+async def _run_session_button(
+    action: str, target: str, user_id: int, chat_id: int
+) -> tuple[bool, str]:
+    """What a tapped button actually does, and whether it worked.
+
+    Returns ``(worked, message)``. The flag is returned rather than sniffed
+    from the message, because there are three distinct failure shapes here — a
+    raised exception, a gateway refusal reported in the string, and a tap that
+    resolved to nothing — and only the first two look like failures from
+    outside.
+    """
     if action == session_picker.CB_NEW:
         # comms' /new closes the conversation this chat is holding before it
         # creates one, and closed is permanent — it never appears in a picker
         # again. One tap, no confirmation, so the reply has to say it.
         had_one = await gateway.find_active_session(user_id, chat_id)
         msg = await _handle_server_command("/new", user_id, chat_id)
+        if msg.startswith("Error:"):
+            # Appending on `had_one` alone told the operator their conversation
+            # had been ended by a command that failed to end anything — so they
+            # rebuild from scratch over a conversation that is still there.
+            return False, msg
         if had_one:
             msg += "\nThe conversation you were in was ended."
-        return msg
+        return True, msg
     if action == session_picker.CB_SWITCH and target:
         # The id travels whole, so the gateway resolves it against what exists
         # now rather than against the order this message was drawn in. A
         # conversation killed or swept away since then is reported as gone —
         # the one thing a tap must never do is land on a different one.
-        return await _handle_server_command(f"/switch {target}", user_id, chat_id)
-    return "That button no longer means anything \u2014 send /sessions for a fresh list."
+        msg = await _handle_server_command(f"/switch {target}", user_id, chat_id)
+        return not msg.startswith("Error:"), msg
+    # A tap that resolved to nothing is a failure, and saying so in the return
+    # rather than in the prose is what keeps the mark on the picker honest: a
+    # refusal that happens not to begin with "Error:" was being ticked.
+    return False, "That button no longer means anything \u2014 send /sessions for a fresh list."
 
 
 async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -704,11 +753,18 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Asked, not refused. `ForceReply` opens the keyboard with the composer
         # already aimed at this message, so the next thing typed is the name —
         # which is the whole point of tapping a command rather than typing it.
+        # `do_quote=True` makes the prompt a reply to the `/rename` that asked
+        # for it, which is what gives `selective` a target. PTB does not quote
+        # in a private chat by default, so without this the force-reply names
+        # nobody: the Bot API targets "users @mentioned in the text" or, if the
+        # bot's message is a reply, "the sender of the original", and the
+        # prompt is neither.
         await update.message.reply_text(
             rename_prompt.PROMPT_TEXT,
             reply_markup=ForceReply(
                 selective=True, input_field_placeholder="Conversation name"
             ),
+            do_quote=True,
         )
         return
 
@@ -990,7 +1046,14 @@ async def _handled_as_rename_reply(update, context, content: str) -> bool:
     which is what lets a prompt sent before a `skippy.service` restart still be
     answered after one.
     """
-    replied = getattr(update.message, "reply_to_message", None)
+    message = getattr(update, "message", None)
+    if message is None:
+        # PTB filters on `effective_message`, so an *edited* message re-fires
+        # these handlers with `update.message` unset. Guarding inside the
+        # helper is pointless while a caller dereferences it to build the
+        # argument — the argument is evaluated first.
+        return False
+    replied = getattr(message, "reply_to_message", None)
     new_name = rename_prompt.name_from_reply(
         getattr(replied, "text", None),
         content,
@@ -1019,7 +1082,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # the composer at the operator, so the natural thing to type in a group is
     # the bare name with no mention — and the gate below would drop it, giving
     # no rename, no turn and no reply at all.
-    if await _handled_as_rename_reply(update, context, update.message.text or ""):
+    if await _handled_as_rename_reply(
+        update, context, getattr(getattr(update, "message", None), "text", None) or ""
+    ):
         return
 
     # In group chats, only respond to @mentions
@@ -1090,11 +1155,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed_user(update.effective_user.id):
-        return
-
-    # A caption replying to the rename prompt is a name. Before the group gate
-    # for the same reason as in `handle_text`: the reply carries no mention.
-    if await _handled_as_rename_reply(update, context, update.message.caption or ""):
         return
 
     # In group chats, only respond to @mentions in the caption
@@ -1416,6 +1476,17 @@ async def _publish_command_menu(app) -> None:
 
 
 async def _on_shutdown(app) -> None:
+    # Cancelled first: it sleeps a minute between attempts, and one waking
+    # after the Application is gone calls `set_my_commands` on a dead bot and
+    # goes on retrying into the shutdown.
+    global _menu_task
+    if _menu_task is not None:
+        _menu_task.cancel()
+        try:
+            await _menu_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        _menu_task = None
     # The queue is process memory. A restart with items pending loses them, and
     # losing them silently is the failure this whole path exists to close —
     # reached through the one action the operator takes by hand. Written out
@@ -1566,11 +1637,15 @@ async def _proactive_consumer(app) -> None:
                 sent += 1
             continue
         except asyncio.CancelledError:
+            # The item was taken off the queue and lives only in this frame, so
+            # a cancellation mid-send drops it — and `_on_shutdown`'s drain
+            # cannot see what is no longer in the queue. Put it back, then go.
+            proactive.enqueue(chat_id, "".join(chunks[sent:]), attempts)
             raise
         except Exception as exc:  # noqa: BLE001
             attempts += 1
             # Whatever already landed is not sent again.
-            remaining = "".join(chunks[sent:]) if sent else text
+            remaining = "".join(chunks[sent:])
             if attempts >= _PROACTIVE_MAX_ATTEMPTS:
                 log_event(
                     log, "surface.proactive.abandoned", level=logging.WARNING,
@@ -1589,8 +1664,11 @@ async def _proactive_consumer(app) -> None:
             )
             # Back to the tail, not retried in place: an item that cannot be
             # delivered must not hold up the ones behind it for three hours.
-            proactive.enqueue(chat_id, remaining, attempts)
-            await asyncio.sleep(_PROACTIVE_RETRY_S)
+            # The wait rides on the item, not on the consumer. Sleeping here
+            # made the retry interval global: one message with nowhere to go
+            # delayed every other answer by three minutes, and a queue of N
+            # items shed one attempt per interval rather than one per item.
+            proactive.enqueue(chat_id, remaining, attempts, delay=_PROACTIVE_RETRY_S)
 
 
 async def run_telegram_bot() -> None:

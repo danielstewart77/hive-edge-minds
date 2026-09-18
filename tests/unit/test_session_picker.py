@@ -18,6 +18,8 @@ import os
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
+import itertools
+
 import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -74,6 +76,10 @@ def tapped(monkeypatch):
     def _tap(payload: str):
         query = MagicMock()
         query.data = payload
+        # A real id, because the single-use claim keys on it. A MagicMock
+        # coerces to 1, so every tap in this file would share one claim and
+        # the second test to run would find its picker already spent.
+        query.message.message_id = next(_message_ids)
         query.answer = AsyncMock()
         query.message.reply_text = AsyncMock()
         query.message.text = "Your conversations:"
@@ -341,6 +347,25 @@ def test_a_conversation_held_elsewhere_says_so_on_its_button(session, expected):
 # the callback was never proved answered. Each mutation below was survived by
 # the original suite.
 # ===========================================================================
+_message_ids = itertools.count(1000)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_picker_claims(tmp_path, monkeypatch):
+    """Claims are persisted, so a tap in a test writes a file.
+
+    Pointed at a temp directory, or the suite leaves claims in `data/` that
+    the next run reads back as pickers already used.
+    """
+    monkeypatch.setenv("PICKER_STATE_PATH", str(tmp_path / "spent_pickers.json"))
+    from bots import bot_utils
+
+    bot_utils._reset_pickers()
+    yield
+    bot_utils._reset_pickers()
+
+
+
 class _Recorder:
     """Records what the bot sent, standing in for Telegram only."""
 
@@ -352,14 +377,22 @@ class _Recorder:
         self.text = text
         self.markup = reply_markup
 
+    async def send_message(self, chat_id=None, text=None, **kwargs):
+        # Command replies go out on the bot rather than as a reply to the
+        # message, so a failed send can be retried and then queued instead of
+        # vanishing into the error handler at INFO.
+        self.text = text
+
 
 def _chat_update(recorder, args=None):
     update = MagicMock()
     update.message = recorder
     update.effective_user.id = 4242
     update.effective_chat.id = 99
+    update.get_bot = lambda: recorder
     ctx = MagicMock()
     ctx.args = args or []
+    ctx.bot = recorder
     return update, ctx
 
 
