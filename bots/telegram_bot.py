@@ -15,7 +15,7 @@ import sys
 import time
 
 import aiohttp
-from telegram import Update
+from telegram import ForceReply, Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
@@ -27,9 +27,9 @@ from telegram.ext import (
 )
 
 from config import config
-from bots.bot_utils import get_lock, get_queue, time_ago
+from bots.bot_utils import claim_picker, get_lock, get_queue, time_ago
 from bots.gateway_client import GatewayClient
-from bots import labels_client, session_picker
+from bots import labels_client, rename_prompt, session_picker
 from bots.skills import get_skills
 from hive_logging import configure_logging, log_event
 
@@ -142,6 +142,67 @@ def _chunk_message(text: str) -> list[str]:
     return chunks
 
 
+# ---------------------------------------------------------------------------
+# Guaranteed delivery
+# ---------------------------------------------------------------------------
+# How hard to try before handing the text to the proactive queue. Three
+# attempts over ~3s covers the shape of failure actually seen on this host —
+# a burst of `Bad Gateway` from api.telegram.org lasting seconds — without
+# holding the handler open long enough to matter.
+_DELIVER_ATTEMPTS = 3
+_DELIVER_BACKOFF_S = 1.0
+# Pauses between the proactive consumer's attempts at one message. The final
+# ``None`` is the give-up: four attempts spread over ~50 seconds, then the text
+# goes to the journal and the queue moves on.
+_PROACTIVE_BACKOFF_S: tuple[float | None, ...] = (5.0, 15.0, 30.0, None)
+
+
+async def _deliver(bot, chat_id: int, text: str) -> bool:
+    """Put ``text`` in front of the operator, and never silently fail to.
+
+    A tapped button that produces no visible answer is indistinguishable from
+    a bot that has died, and the operator's rational response — tap it again —
+    is what destroyed a conversation on 2026-09-17: two `New session` taps 75
+    seconds apart, each one ending what the last had created, because neither
+    reply arrived to say the first had worked.
+
+    The send used to be a bare `reply_text` outside any try, so a `NetworkError`
+    escaped into the global error handler, which logs transient network errors
+    at INFO and returns. The answer was gone, at a log level nobody reads,
+    while the action it described had already happened.
+
+    So: retried, then queued. The proactive queue is the same path unsolicited
+    turns already take, and it drains whenever the connection comes back — the
+    answer arrives late rather than never. Returns whether it went out on this
+    call; a queued message reports ``False`` because it has not been delivered
+    yet.
+    """
+    last: Exception | None = None
+    for attempt in range(_DELIVER_ATTEMPTS):
+        try:
+            for chunk in _chunk_message(text):
+                await bot.send_message(chat_id=chat_id, text=chunk)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt + 1 < _DELIVER_ATTEMPTS:
+                await asyncio.sleep(_DELIVER_BACKOFF_S * (attempt + 1))
+    # WARNING, not INFO. The distinction is the whole point: this names an
+    # action that already happened whose answer the operator never saw, which
+    # is the state the whole feature exists to make impossible to reach
+    # quietly.
+    log_event(
+        log, "surface.delivery.failed", level=logging.WARNING, surface="telegram",
+        client_ref=chat_id, error=str(last), content_chars=len(text),
+    )
+    from bots import proactive
+
+    proactive.enqueue(chat_id, text)
+    return False
+
+
 async def _reply_chunked(update: Update, text: str) -> None:
     """Reply with text of any length.
 
@@ -252,6 +313,19 @@ def _format_status(data: dict) -> str:
 # Server command dispatcher
 # ---------------------------------------------------------------------------
 SERVER_COMMANDS = {"/clear", "/model", "/autopilot", "/kill", "/prune", "/status", "/sessions", "/switch", "/new", "/remember"}
+
+# Shown on the button itself the moment a tap is received, before any work
+# runs. Telegram renders it as a toast over the chat, which is the only
+# feedback available that costs no round trip of its own — answering the
+# callback query is mandatory anyway.
+ACK_TEXT = "Working…"
+
+# What a tap on an already-used picker says. It exists for the case where the
+# keyboard removal failed and the buttons are still sitting there: the tap is
+# refused, but it is refused out loud.
+SPENT_PICKER_TEXT = (
+    "That list has already been used — send /sessions for a fresh one."
+)
 
 
 async def _conversation_caption(result: dict) -> str:
@@ -397,11 +471,13 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.answer("Not authorized.", show_alert=True)
         return
-    # A tap redelivered across a restart can be too old to answer, and the 400
-    # that comes back used to abort the handler before the action ever ran —
-    # the spinner is cosmetic, the action is not.
+    # Acknowledged before any work starts, so the tap is visibly received even
+    # when the answer behind it is still in flight or never arrives. A tap
+    # redelivered across a restart can be too old to answer, and the 400 that
+    # comes back used to abort the handler before the action ever ran — the
+    # spinner is cosmetic, the action is not.
     try:
-        await query.answer()
+        await query.answer(ACK_TEXT)
     except Exception as exc:  # noqa: BLE001
         log_event(
             log, "surface.button.answer.failed", level=logging.WARNING,
@@ -414,6 +490,35 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id=user_id, client_ref=chat_id,
     )
 
+    # A picker is single use, and the claim is taken before anything is
+    # awaited. Telegram delivered two `New session` taps 75 seconds apart on
+    # 2026-09-17 — queued at its end while polling was down, then acted on
+    # back to back — and the second one ended the conversation the first had
+    # just created. The list a tap came from is stale the instant it is used;
+    # what protects the operator is that it stops working, not that they
+    # remember it is stale.
+    picker_id = getattr(query.message, "message_id", None)
+    if picker_id is not None and not claim_picker(chat_id, picker_id):
+        log_event(
+            log, "surface.button.spent", surface="telegram", command=action,
+            user_id=user_id, client_ref=chat_id,
+        )
+        await _deliver(context.bot, chat_id, SPENT_PICKER_TEXT)
+        return
+
+    # The keyboard goes before the work, not after. It is the enforcement the
+    # operator can see — a message with no buttons produces no taps — and
+    # doing it first means a slow or failing action cannot leave a live
+    # picker sitting there inviting a second tap. Best effort: the claim above
+    # is what makes the guarantee, this is what makes it visible.
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            log, "surface.button.keyboard.clear.failed", level=logging.WARNING,
+            surface="telegram", user_id=user_id, client_ref=chat_id, error=str(exc),
+        )
+
     # Serialised against this chat's other work. Two taps on one row raced
     # each other into `activate_session`, which takes no lock of its own, and
     # landed two harness processes on a single transcript; a tap during a
@@ -423,16 +528,28 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with get_lock(chat_id):
             msg = await _run_session_button(action, target, user_id, chat_id)
     except Exception as exc:  # noqa: BLE001
-        # The spinner was cleared by `query.answer()` above, so an exception
-        # escaping here leaves the tap looking like it did nothing at all. The
-        # operator is told instead, and the traceback goes to the log.
+        # An exception escaping here leaves the tap looking like it did nothing
+        # at all. The operator is told instead, and the traceback goes to the
+        # log. Every path out of this handler ends in a delivered sentence.
         log_event(
             log, "surface.button.failed", level=logging.ERROR, surface="telegram",
             command=action, user_id=user_id, client_ref=chat_id, error=str(exc),
         )
         msg = "That didn't go through \u2014 the gateway didn't answer."
 
-    await query.message.reply_text(msg)
+    # The picker itself records what it was used for. Without this the message
+    # is a bare header over a vanished keyboard, and scrollback cannot say
+    # which conversation a tap chose \u2014 which matters most in exactly the case
+    # this feature is about, where the answer below arrived late or not at all.
+    try:
+        await query.edit_message_text(f"{query.message.text}\n\n\u2705 {msg}")
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            log, "surface.button.caption.failed", level=logging.WARNING,
+            surface="telegram", user_id=user_id, client_ref=chat_id, error=str(exc),
+        )
+
+    await _deliver(context.bot, chat_id, msg)
 
 
 async def _suspend_conversation(target: str, user_id: int, chat_id: int) -> str:
@@ -485,49 +602,83 @@ async def _run_session_button(action: str, target: str, user_id: int, chat_id: i
 async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Rename the conversation this chat is holding.
 
-    A bare `/rename` is refused rather than passed through: the terminal's
-    label route deletes the row when name and colour are both blank, so an
-    empty name would silently erase a name set at the tile.
+    A bare `/rename` asks for the name rather than printing a usage line.
+    Tapping the command in Telegram's menu *sends* it — the menu does not type
+    it into the composer for you to finish — so a usage line makes the menu
+    entry useless to the one person it was added for: the operator on a phone
+    who does not want to remember the syntax.
+
+    An empty name is still never written. The terminal's label route deletes
+    the row when name and colour are both blank, so a rename that cannot name
+    anything asks again instead of erasing what is there.
     """
     if not await _auth_check(update):
         return
-    if not labels_client.configured():
+    session_id, refusal = await _rename_target(
+        update.effective_user.id, update.effective_chat.id
+    )
+    if refusal:
+        await update.message.reply_text(refusal)
+        return
+
+    name = " ".join(context.args) if context.args else ""
+    if not name.strip():
+        # Asked, not refused. `ForceReply` opens the keyboard with the composer
+        # already aimed at this message, so the next thing typed is the name —
+        # which is the whole point of tapping a command rather than typing it.
         await update.message.reply_text(
+            rename_prompt.PROMPT_TEXT,
+            reply_markup=ForceReply(
+                selective=True, input_field_placeholder="Conversation name"
+            ),
+        )
+        return
+
+    await update.message.reply_text(await _apply_rename(session_id, name))
+
+
+async def _rename_target(user_id: int, chat_id: int) -> tuple[str, str]:
+    """The conversation a rename would land on, or why it cannot land at all.
+
+    Returns ``(session_id, "")`` or ``("", refusal)``. Shared because a rename
+    arriving as an argument and one arriving as a reply have to refuse for the
+    same reasons in the same words — and because asking for a name before
+    checking there is anything to name is how the operator gets prompted, types
+    a name, and is only then told it was all for nothing.
+    """
+    if not labels_client.configured():
+        return "", (
             "Renaming isn't wired up on this mind \u2014 TERMINAL_URL and "
             "TERMINAL_LABELS_TOKEN aren't set."
         )
-        return
     # `ensure_session` creates when it finds nothing, and creating here mints a
     # conversation id, binds this chat to it and spawns a harness — so a rename
     # typed against a suspended conversation started an empty one and named
     # that instead, reporting success.
-    session_id = await gateway.find_active_session(
-        update.effective_user.id, update.effective_chat.id
-    )
+    session_id = await gateway.find_active_session(user_id, chat_id)
     if not session_id:
-        await update.message.reply_text(
+        return "", (
             "This chat isn't in a conversation right now \u2014 send /sessions "
             "and tap one, or say anything to start one."
         )
-        return
+    return session_id, ""
+
+
+async def _apply_rename(session_id: str, name: str) -> str:
+    """Write the label and say what happened, in one sentence either way."""
     labels = await labels_client.fetch_labels()
     if labels is None:
         # Writing now would send an empty colour and wipe the one set at the
         # tile. A rename that cannot read the current label is not a rename.
-        await update.message.reply_text(
-            "Couldn't read the current label \u2014 nothing changed."
-        )
-        return
-    body = session_picker.rename_body(
-        " ".join(context.args) if context.args else "", labels.get(session_id)
-    )
+        return "Couldn't read the current label \u2014 nothing changed."
+    body = session_picker.rename_body(name, labels.get(session_id))
     if body is None:
-        await update.message.reply_text("Usage: /rename <name>")
-        return
+        # A name that trimmed to nothing. Asking again beats a usage line for
+        # the same reason the bare command asks in the first place.
+        return rename_prompt.PROMPT_TEXT
     if await labels_client.put_label(session_id, body):
-        await update.message.reply_text(f"Renamed to \"{body['name']}\".")
-    else:
-        await update.message.reply_text("Couldn't reach the label store \u2014 name unchanged.")
+        return f"Renamed to \"{body['name']}\"."
+    return "Couldn't reach the label store \u2014 name unchanged."
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -760,6 +911,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+
+    # A reply to the rename prompt is a name, not a turn. Recognised by what it
+    # replies *to* and nothing else — there is no pending-rename registry, no
+    # expiry and no per-chat state, which is what lets a prompt sent before a
+    # `skippy.service` restart still be answered after one.
+    #
+    # This runs before anything else touches the message: the alternative is
+    # the harness being asked to think about the word "Dragoman", which is both
+    # a wasted turn and a rename that silently did not happen.
+    new_name = rename_prompt.name_from_reply(
+        getattr(getattr(update.message, "reply_to_message", None), "text", None),
+        content,
+    )
+    if new_name is not None:
+        session_id, refusal = await _rename_target(update.effective_user.id, chat_id)
+        await update.message.reply_text(
+            refusal or await _apply_rename(session_id, new_name)
+        )
+        return
+
     log_event(
         log, "surface.message.received", surface="telegram", message_type="text",
         user_id=update.effective_user.id, client_ref=chat_id, content_chars=len(content),
@@ -1085,6 +1256,17 @@ async def _on_startup(app) -> None:
     )
     log.info("Allowed users: %s", config.telegram_allowed_users)
 
+    # Publish the slash menu. Never fatal: a mind whose menu could not be set
+    # is a mind you have to type commands at, which is how it worked before
+    # this existed — not a reason to refuse to start.
+    try:
+        await app.bot.set_my_commands(command_menu())
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            log, "surface.command.menu.failed", level=logging.WARNING,
+            surface="telegram", error=str(exc),
+        )
+
 
 async def _on_shutdown(app) -> None:
     if http:
@@ -1099,6 +1281,53 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("transient telegram network error (%s): %s", err.__class__.__name__, err)
         return
     log.exception("unhandled exception in telegram handler", exc_info=err)
+
+
+# ---------------------------------------------------------------------------
+# The command table
+# ---------------------------------------------------------------------------
+# One list, feeding both the handlers and Telegram's slash menu. They were
+# never going to stay in step as two lists: the bot had seventeen registered
+# handlers and had published none of them, so `getMyCommands` returned an
+# empty array and the menu offered nothing to tap.
+#
+# Descriptions are written for someone holding a phone who does not remember
+# the syntax. A command taking an argument says so in the wording, because
+# tapping a menu entry *sends* it — there is no half-typed command left in the
+# composer to complete. `/rename` is the exception that proves it: it asks for
+# the name instead, since it is the one where the argument is the whole point.
+COMMANDS: tuple[tuple[str, str, object], ...] = (
+    ("sessions", "List your conversations and switch between them", cmd_sessions),
+    ("rename", "Name this conversation", cmd_rename),
+    ("new", "Start a fresh conversation (ends this one)", cmd_new),
+    ("clear", "Clear this conversation and start over", cmd_clear),
+    ("status", "Server port, default model, sessions running", cmd_status),
+    ("model", "Show the current model, or /model <name> to switch", cmd_model),
+    ("models", "List the models this mind can be pointed at", cmd_models),
+    ("autopilot", "Toggle autopilot for this conversation", cmd_autopilot),
+    ("switch", "Resume a conversation: /switch <id>", cmd_switch),
+    ("suspend", "Put a conversation to sleep, keeping its history", cmd_suspend),
+    ("kill", "End a conversation for good: /kill <id>", cmd_kill),
+    ("prune", "End every conversation except the active one", cmd_prune),
+    ("remember", "Save something to memory: /remember <what>", cmd_remember),
+    ("stop", "Interrupt whatever the mind is working on", cmd_stop),
+    ("skills", "List the skills this mind can run", cmd_skills),
+    ("skill", "Run a skill: /skill <name>", cmd_skill),
+)
+
+# Telegram's documented limits. A single malformed entry makes the whole
+# `set_my_commands` call fail, which takes the menu down for every command at
+# once — the bot runs on perfectly, offering nothing to tap, which is exactly
+# the state this feature was written to get out of.
+COMMAND_NAME_MAX = 32
+COMMAND_DESCRIPTION_MAX = 256
+
+
+def command_menu() -> list:
+    """The table as Telegram wants it, for `set_my_commands`."""
+    from telegram import BotCommand
+
+    return [BotCommand(name, description) for name, description, _ in COMMANDS]
 
 
 def _build_application(token: str):
@@ -1119,23 +1348,9 @@ def _build_application(token: str):
 
     app.add_error_handler(_on_error)
 
-    app.add_handler(CommandHandler("sessions", cmd_sessions))
-    app.add_handler(CommandHandler("rename", cmd_rename))
+    for name, _description, handler in COMMANDS:
+        app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(on_session_button))
-    app.add_handler(CommandHandler("new", cmd_new))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("models", cmd_models))
-    app.add_handler(CommandHandler("autopilot", cmd_autopilot))
-    app.add_handler(CommandHandler("switch", cmd_switch))
-    app.add_handler(CommandHandler("suspend", cmd_suspend))
-    app.add_handler(CommandHandler("kill", cmd_kill))
-    app.add_handler(CommandHandler("prune", cmd_prune))
-    app.add_handler(CommandHandler("remember", cmd_remember))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("skills", cmd_skills))
-    app.add_handler(CommandHandler("skill", cmd_skill))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -1168,13 +1383,44 @@ async def _proactive_consumer(app) -> None:
 
     while True:
         chat_id, text = await proactive.get()
-        try:
-            for chunk in _chunk_message(text):
-                await app.bot.send_message(chat_id=chat_id, text=chunk)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Proactive delivery to chat %s failed", chat_id)
+        for attempt, pause in enumerate(_PROACTIVE_BACKOFF_S):
+            try:
+                for chunk in _chunk_message(text):
+                    await app.bot.send_message(chat_id=chat_id, text=chunk)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # Retried in place rather than re-queued. This queue is where
+                # an undeliverable button answer lands, and the reason it is
+                # there is that Telegram was unreachable — draining it once
+                # into the same dead connection just moves where the message
+                # disappears.
+                #
+                # Bounded, because the alternative is worse than the bug. A
+                # message that can never be delivered — the bot blocked, the
+                # chat gone — re-queued forever is a loop that never drains,
+                # and every later answer queues behind a message with nowhere
+                # to go. Roughly a minute of trying covers the outage actually
+                # seen here (a ~6s burst of `Bad Gateway`) with room to spare.
+                if pause is None:
+                    log_event(
+                        log, "surface.proactive.abandoned", level=logging.WARNING,
+                        surface="telegram", client_ref=chat_id, error=str(exc),
+                        content_chars=len(text),
+                    )
+                    # The text goes in the record. It is the last copy: the
+                    # queue is in memory and the operator never saw it, so a
+                    # log line naming only the failure loses the answer for
+                    # good.
+                    log.warning("undelivered text for chat %s: %s", chat_id, text)
+                    break
+                log_event(
+                    log, "surface.proactive.retry", level=logging.WARNING,
+                    surface="telegram", client_ref=chat_id, error=str(exc),
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(pause)
 
 
 async def run_telegram_bot() -> None:

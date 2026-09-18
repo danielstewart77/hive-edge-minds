@@ -76,10 +76,18 @@ def tapped(monkeypatch):
         query.data = payload
         query.answer = AsyncMock()
         query.message.reply_text = AsyncMock()
+        query.message.text = "Your conversations:"
+        query.edit_message_reply_markup = AsyncMock()
+        query.edit_message_text = AsyncMock()
         update = MagicMock()
         update.callback_query = query
         update.effective_user.id = 4242
         update.effective_chat.id = 99
+        # The tap's answer is delivered through the bot rather than by replying
+        # to the picker, so that a send which fails can be retried and then
+        # queued instead of vanishing into the global error handler.
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
 
         commands: list[str] = []
         suspended: list[str] = []
@@ -101,16 +109,16 @@ def tapped(monkeypatch):
             suspend_session=fake_suspend,
             find_active_session=AsyncMock(return_value=None),
         ))
-        return query, commands, suspended, update
+        return query, commands, suspended, update, ctx
     return _tap
 
 
 @pytest.mark.asyncio
 async def test_the_new_button_starts_a_session_and_is_never_read_as_an_id(tapped):
     """Breaks if the sentinel ever parses as a target, or routes to switch."""
-    query, commands, suspended, update = tapped(picker.CB_NEW)
+    query, commands, suspended, update, ctx = tapped(picker.CB_NEW)
 
-    await bot.on_session_button(update, None)
+    await bot.on_session_button(update, ctx)
 
     assert commands == ["/new"]
     assert suspended == []
@@ -122,11 +130,11 @@ async def test_the_new_button_starts_a_session_and_is_never_read_as_an_id(tapped
 @pytest.mark.asyncio
 async def test_a_tapped_conversation_switches_to_that_id(tapped):
     """Breaks if the handler switches on anything but the id it was handed."""
-    query, commands, suspended, update = tapped(
+    query, commands, suspended, update, ctx = tapped(
         picker.encode(picker.CB_SWITCH, "22222222-bbbb")
     )
 
-    await bot.on_session_button(update, None)
+    await bot.on_session_button(update, ctx)
 
     assert commands == ["/switch 22222222-bbbb"]
 
@@ -503,8 +511,8 @@ async def test_every_tap_answers_the_callback(tapped):
     """An unanswered callback spins on the phone forever with no error
     anywhere. Breaks if any path returns before answering."""
     for payload in (picker.CB_NEW, picker.encode(picker.CB_SWITCH, "a"), "nonsense"):
-        query, _c, _s, update = tapped(payload)
-        await bot.on_session_button(update, None)
+        query, _c, _s, update, ctx = tapped(payload)
+        await bot.on_session_button(update, ctx)
         assert query.answer.await_count == 1, f"{payload} left the button spinning"
 
 
@@ -513,10 +521,10 @@ async def test_a_tap_from_anyone_but_the_owner_does_nothing(tapped, monkeypatch)
     """Every typed command goes through `_auth_check`; a tap has its own gate.
     Breaks if that gate is dropped, which the other handler tests cannot see
     because they all stub it to True."""
-    query, commands, suspended, update = tapped(picker.encode(picker.CB_SWITCH, "a"))
+    query, commands, suspended, update, ctx = tapped(picker.encode(picker.CB_SWITCH, "a"))
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: False)
 
-    await bot.on_session_button(update, None)
+    await bot.on_session_button(update, ctx)
 
     assert commands == []
     assert suspended == []
