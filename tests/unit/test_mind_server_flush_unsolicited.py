@@ -101,7 +101,7 @@ async def test_flushed_assistant_text_goes_to_proactive_queue(mind_server_mod):
     session = _make_session([_assistant_text_event("unprompted thought")], chat_id=777)
     await mind_server_mod._flush_unsolicited(session, session["proc"], "sess-1")
     assert not proactive._queue.empty()
-    assert await proactive.get() == (777, "unprompted thought")
+    assert await proactive.get() == (777, "unprompted thought", 0)
 
 
 async def test_quiet_pipe_flushes_nothing(mind_server_mod):

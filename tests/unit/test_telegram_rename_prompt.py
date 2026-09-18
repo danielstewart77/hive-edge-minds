@@ -106,23 +106,6 @@ class TestReplyRecognition:
         near = rename_prompt.PROMPT_TEXT[:20]
         assert rename_prompt.name_from_reply(near, "Dragoman") is None
 
-    def test_recognition_survives_a_restart(self) -> None:
-        """Requirement 6: the prompt never expires.
-
-        Nothing in this process has ever sent a prompt — the module was just
-        imported. A reply to one is still resolved, because the decision reads
-        the replied-to text and consults no stored state. This fails the moment
-        anyone introduces a pending-prompt registry keyed by message id, which
-        is precisely the thing that would not survive `skippy.service`
-        restarting between the question and the answer.
-        """
-        import importlib
-
-        import bots.rename_prompt as fresh
-
-        fresh = importlib.reload(fresh)
-        assert fresh.name_from_reply(fresh.PROMPT_TEXT, "Dragoman") == "Dragoman"
-
 
 @pytest.mark.asyncio
 class TestBareRenameAsks:
@@ -212,3 +195,120 @@ class TestReplyRenamesTheConversation:
 
         stream.assert_awaited()
         labels.put_label.assert_not_awaited()
+
+
+class TestOnlyTheBotsOwnPromptCounts:
+    def test_the_same_words_from_anyone_else_are_not_the_prompt(self) -> None:
+        """Requirement 5: a name is never taken from a message the bot didn't send.
+
+        The operator can type the prompt's exact words themselves, and a mind
+        asked what `/rename` does may quote them verbatim. Replying to either
+        would otherwise write a label.
+        """
+        from bots import rename_prompt
+
+        assert rename_prompt.name_from_reply(
+            rename_prompt.PROMPT_TEXT, "Dragoman", False
+        ) is None
+        assert rename_prompt.name_from_reply(
+            rename_prompt.PROMPT_TEXT, "Dragoman", True
+        ) == "Dragoman"
+
+    def test_a_reply_too_long_to_be_a_name_is_not_taken_as_one(self) -> None:
+        """Requirement 3: a changed mind must not become the conversation's name.
+
+        Truncating to forty characters named the conversation with the head of
+        whatever was typed and swallowed the rest, so replying "actually never
+        mind, what is the status of the deploy?" both renamed the conversation
+        to a sentence fragment and lost the question.
+        """
+        from bots import rename_prompt
+
+        sentence = "actually never mind, what is the status of the deploy on comms?"
+        assert len(sentence) > rename_prompt.MAX_NAME_CHARS
+        assert rename_prompt.name_from_reply(rename_prompt.PROMPT_TEXT, sentence) is None
+        # A name at the boundary is still a name.
+        at_limit = "x" * rename_prompt.MAX_NAME_CHARS
+        assert rename_prompt.name_from_reply(
+            rename_prompt.PROMPT_TEXT, at_limit
+        ) == at_limit
+
+
+@pytest.mark.asyncio
+class TestTheReplyIsFoundOnEverySurface:
+    async def test_a_group_reply_carrying_no_mention_still_renames(
+        self, labels, gateway
+    ) -> None:
+        """Requirement 3: ForceReply aims the composer, so no mention is typed.
+
+        The group @mention gate used to run first and drop the reply outright —
+        no rename, no turn, no answer, nothing in the log. The bot looked dead.
+        """
+        from bots.telegram_bot import handle_text
+        from bots import rename_prompt
+
+        update = _make_update("Dragoman", reply_to_text=rename_prompt.PROMPT_TEXT)
+        update.effective_chat.type = "group"
+        context = MagicMock()
+        context.bot.username = "skippybot"
+        context.bot.send_message = AsyncMock()
+
+        await handle_text(update, context)
+
+        labels.put_label.assert_awaited_once()
+        assert labels.put_label.call_args[0][1]["name"] == "Dragoman"
+
+    async def test_a_spoken_reply_renames(self, labels, gateway) -> None:
+        """Requirement 3: the prompt opens a reply box on a voice-first surface.
+
+        Telegram is the primary surface here and runs with voice on, so the
+        obvious way to answer an open reply box is to speak the name. Without
+        this the transcript went to the harness and the mind answered
+        "Dragoman?" while nothing was renamed.
+        """
+        from bots.telegram_bot import handle_voice
+        from bots import rename_prompt
+
+        update = _make_update("", reply_to_text=rename_prompt.PROMPT_TEXT)
+        update.message.voice = MagicMock()
+        context = MagicMock()
+        context.bot.send_message = AsyncMock()
+
+        with patch("bots.telegram_bot._stt", AsyncMock(return_value="Dragoman")), \
+                patch("bots.telegram_bot._stream_to_message", AsyncMock()) as stream:
+            update.message.voice.get_file = AsyncMock()
+            update.message.voice.get_file.return_value.download_as_bytearray = AsyncMock(
+                return_value=bytearray(b"ogg")
+            )
+            await handle_voice(update, context)
+
+        labels.put_label.assert_awaited_once()
+        assert labels.put_label.call_args[0][1]["name"] == "Dragoman"
+        stream.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestRenameRefusesLoudly:
+    async def test_an_unreachable_gateway_refuses_instead_of_vanishing(
+        self, labels, gateway
+    ) -> None:
+        """Requirements 2 and 7: no path through /rename produces silence.
+
+        `find_active_session` raises aiohttp errors, not telegram ones, so the
+        exception escaped the handler entirely — the operator tapped the menu
+        entry and got neither the prompt nor a refusal.
+        """
+        from bots.telegram_bot import cmd_rename
+        from bots import rename_prompt
+
+        gateway.find_active_session = AsyncMock(side_effect=OSError("connection refused"))
+        update = _make_update()
+        context = MagicMock()
+        context.args = []
+
+        await cmd_rename(update, context)
+
+        update.message.reply_text.assert_awaited_once()
+        said = update.message.reply_text.call_args[0][0]
+        assert said.strip()
+        assert said != rename_prompt.PROMPT_TEXT

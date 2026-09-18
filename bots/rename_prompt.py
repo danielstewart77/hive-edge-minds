@@ -39,17 +39,25 @@ PROMPT_TEXT = "What should this conversation be called? Reply with the name."
 MAX_NAME_CHARS = 40
 
 
-def is_prompt(text: object) -> bool:
+def is_prompt(text: object, from_bot: object = True) -> bool:
     """Whether a message is the rename prompt this module sends.
 
     Compared whole rather than by prefix: a conversation whose *name* happens
     to begin with the prompt's opening words is not a prompt, and a reply to
     one must not be swallowed as a rename.
+
+    ``from_bot`` is whether the message came from the bot. Text alone is not
+    enough: the operator can send the prompt's exact words themselves, and a
+    mind asked "what does /rename do?" may quote them verbatim — replying to
+    either would then write a label. It defaults to ``True`` so a caller that
+    genuinely cannot tell is not silently refused, but every caller here can.
     """
-    return isinstance(text, str) and text.strip() == PROMPT_TEXT
+    return bool(from_bot) and isinstance(text, str) and text.strip() == PROMPT_TEXT
 
 
-def name_from_reply(reply_to_text: object, body: object) -> str | None:
+def name_from_reply(
+    reply_to_text: object, body: object, from_bot: object = True
+) -> str | None:
     """The new name carried by a reply to the prompt, or ``None``.
 
     ``None`` means "this is not a rename" and the message goes to the harness
@@ -62,9 +70,18 @@ def name_from_reply(reply_to_text: object, body: object) -> str | None:
     route deletes the row outright when name and colour are both blank, so a
     stray reply carrying nothing would erase a name set at the tile.
     """
-    if not is_prompt(reply_to_text):
+    if not is_prompt(reply_to_text, from_bot):
         return None
     if not isinstance(body, str):
         return None
-    name = body.strip()[:MAX_NAME_CHARS]
-    return name or None
+    name = body.strip()
+    if not name:
+        return None
+    # Too long to be a name is treated as not a name. Truncating instead named
+    # the conversation with the first forty characters of whatever was typed —
+    # so an operator who changed their mind and replied with a question got a
+    # conversation called "actually never mind, what is the status" and their
+    # question was swallowed rather than answered.
+    if len(name) > MAX_NAME_CHARS:
+        return None
+    return name

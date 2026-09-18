@@ -65,11 +65,13 @@ class TestCommandMenu:
         assert "rename" in {name for name, _d, _h in COMMANDS}
 
     @pytest.mark.asyncio
-    async def test_menu_failure_does_not_stop_the_bot_starting(self) -> None:
-        """Requirement 1: an unpublishable menu costs hints, not the mind.
+    async def test_startup_schedules_the_menu_and_does_not_block_on_it(self) -> None:
+        """Requirement 1: the menu is published, and never at the cost of booting.
 
-        A mind that refuses to boot because Telegram would not take its command
-        list is strictly worse than one you have to type commands at.
+        Publication runs as a background task — it retries for minutes, and a
+        mind that waited for that before accepting its first message would be
+        down for the duration. So startup schedules it and returns; what the
+        task itself does is covered below.
         """
         from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -80,9 +82,95 @@ class TestCommandMenu:
 
         with patch.dict("os.environ", {"MIND_ID": "test-mind"}), \
                 patch.object(tb, "aiohttp") as aio, \
-                patch.object(tb, "GatewayClient", MagicMock()):
+                patch.object(tb, "GatewayClient", MagicMock()), \
+                patch.object(tb, "_MENU_RETRY_S", 0):
             aio.ClientSession = MagicMock()
             aio.ClientTimeout = MagicMock()
             await tb._on_startup(app)
+            assert tb._menu_task is not None
+            await tb._menu_task
 
+        # Boot survived a menu Telegram would not take, and the attempt was
+        # made rather than skipped.
         app.bot.set_my_commands.assert_awaited()
+
+
+class TestWhatIsActuallyPublished:
+    """The table is not the menu. Publishing is what the operator sees.
+
+    Every test above inspects `COMMANDS`, and a mutation run proved all of
+    them pass with `command_menu()` returning an empty list — which is
+    precisely the regression that started this work: sixteen handlers
+    registered and `getMyCommands` returning nothing.
+    """
+
+    def test_the_published_menu_carries_every_command_in_the_table(self) -> None:
+        """Requirement 1: what is published is what the table says."""
+        from bots.telegram_bot import COMMANDS, valid_menu_entries
+
+        assert [name for name, _ in valid_menu_entries()] == [
+            name for name, _d, _h in COMMANDS
+        ]
+
+    def test_a_malformed_entry_costs_only_itself(self) -> None:
+        """Requirement 1: one bad entry must not take the whole menu down.
+
+        `set_my_commands` rejects the entire batch over a single invalid name,
+        so passing the table through unchecked means one typo silently removes
+        every hint the operator has.
+        """
+        from unittest.mock import patch
+
+        import bots.telegram_bot as tb
+
+        broken = (("Rename", "capitals are rejected by Telegram", print),) + tb.COMMANDS
+        with patch.object(tb, "COMMANDS", broken):
+            published = [name for name, _ in tb.valid_menu_entries()]
+
+        assert "Rename" not in published
+        assert published == [name for name, _d, _h in tb.COMMANDS]
+
+    def test_an_over_long_description_is_dropped_not_published(self) -> None:
+        """Requirement 1: the 256-char ceiling is enforced in the product."""
+        from unittest.mock import patch
+
+        import bots.telegram_bot as tb
+
+        broken = (("verbose", "x" * 257, print),) + tb.COMMANDS
+        with patch.object(tb, "COMMANDS", broken):
+            assert "verbose" not in [name for name, _ in tb.valid_menu_entries()]
+
+    @pytest.mark.asyncio
+    async def test_publishing_is_retried_after_a_failure(self) -> None:
+        """Requirement 1: booting during an outage must not empty the menu forever.
+
+        A single attempt at boot is published into whatever the network happens
+        to be doing that second — and the outage this work exists to survive is
+        exactly when a restart is likely.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import bots.telegram_bot as tb
+
+        app = MagicMock()
+        app.bot.set_my_commands = AsyncMock(side_effect=[RuntimeError("502"), None])
+
+        with patch.object(tb, "_MENU_RETRY_S", 0):
+            await tb._publish_command_menu(app)
+
+        assert app.bot.set_my_commands.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_publishing_gives_up_rather_than_retrying_forever(self) -> None:
+        """Requirement 1: an unpublishable menu is inconvenient, not a spin."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import bots.telegram_bot as tb
+
+        app = MagicMock()
+        app.bot.set_my_commands = AsyncMock(side_effect=RuntimeError("502"))
+
+        with patch.object(tb, "_MENU_RETRY_S", 0):
+            await tb._publish_command_menu(app)
+
+        assert app.bot.set_my_commands.await_count == tb._MENU_ATTEMPTS
