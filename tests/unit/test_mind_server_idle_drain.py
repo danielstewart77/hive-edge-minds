@@ -106,7 +106,7 @@ async def test_unsolicited_assistant_text_is_enqueued(mind_server_mod):
     session = _make_session([_assistant_text_event("proactive hello")], chat_id=777)
     await _drain_briefly(mind_server_mod, session)
     assert not proactive._queue.empty()
-    chat_id, text = await proactive.get()
+    chat_id, text, _attempts = await proactive.get()
     assert chat_id == 777
     assert text == "proactive hello"
 
@@ -142,7 +142,7 @@ async def test_multiple_text_blocks_each_enqueued(mind_server_mod):
     got = []
     while not proactive._queue.empty():
         got.append(await proactive.get())
-    assert got == [(42, "one"), (42, "two")]
+    assert got == [(42, "one", 0), (42, "two", 0)]
 
 
 async def test_drain_does_not_read_stdout_while_request_holds_lock(mind_server_mod):

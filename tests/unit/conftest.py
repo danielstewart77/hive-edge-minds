@@ -37,6 +37,10 @@ def _mock_third_party_modules(monkeypatch):
     # --- Telegram mocks ---
     telegram_mock = _create_mock_module("telegram")
     telegram_mock.Update = MagicMock()
+    telegram_mock.ForceReply = MagicMock()
+    telegram_mock.BotCommand = MagicMock()
+    telegram_mock.InlineKeyboardButton = MagicMock()
+    telegram_mock.InlineKeyboardMarkup = MagicMock()
 
     telegram_ext_mock = _create_mock_module("telegram.ext")
     telegram_ext_mock.ApplicationBuilder = MagicMock()

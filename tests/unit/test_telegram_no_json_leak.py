@@ -13,6 +13,9 @@ def _make_update(text: str, user_id: int = 123, chat_id: int = 456, chat_type: s
     update.message.text = text
     update.message.reply_text = AsyncMock()
     update.effective_chat.send_message = AsyncMock()
+    # Command replies go out through `_deliver` on the bot, not as a reply to
+    # the message, so a failed send can be retried and then queued.
+    update.get_bot.return_value.send_message = AsyncMock()
     return update
 
 
@@ -54,7 +57,7 @@ class TestNoJsonLeak:
         ):
             await cmd_new(update, context)
 
-        reply_text = update.message.reply_text.call_args[0][0]
+        reply_text = update.get_bot.return_value.send_message.call_args.kwargs["text"]
         assert "{" not in reply_text
         assert "abcd1234" in reply_text
 
@@ -75,7 +78,7 @@ class TestNoJsonLeak:
         ):
             await cmd_clear(update, context)
 
-        reply_text = update.message.reply_text.call_args[0][0]
+        reply_text = update.get_bot.return_value.send_message.call_args.kwargs["text"]
         assert "{" not in reply_text
         assert "efgh5678" in reply_text
 
