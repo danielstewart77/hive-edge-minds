@@ -166,18 +166,37 @@ def button_text(session: dict, labels: dict) -> str:
     return f"{status}{dot} {caption}{where} \u00b7 {short} \u00b7 {age}"
 
 
-def visible_sessions(sessions: list[dict] | None) -> list[dict]:
-    """The conversations the picker draws: everything not asleep.
+# The statuses a tap can actually reach, named positively.
+#
+# A denylist of the dead ones re-opens this bug the day comms adds a status:
+# anything unrecognised — a new terminal state, a missing field, a null —
+# passes the filter and is drawn with the `?` icon, which is a shrug rather
+# than a warning. The requirement is "the conversations a tap can reach", so
+# the code names those and nothing else.
+#
+# `idle` belongs here: it is a live conversation between turns, not a
+# sleeping one, and dropping it would empty the picker of exactly the
+# conversations an operator walks away from and comes back to.
+_REACHABLE_STATUSES = frozenset({"running", "idle"})
 
-    A suspended conversation has no process behind it and is not what anyone
-    is looking for when they open the picker — on this host they outnumber the
-    live ones better than two to one, and the live ones are what the picker
-    exists to get back to. They are still resumable by id through `/switch`;
-    what they no longer do is fill the keyboard.
+
+def visible_sessions(sessions: list[dict] | None) -> list[dict]:
+    """The conversations the picker draws: the ones a tap can actually reach.
+
+    A `suspended` conversation has no process behind it and is still resumable
+    by id through `/switch`; what it no longer does is fill the keyboard. A
+    `closed` one cannot be resumed at all — comms refuses the switch with
+    "Session ... is closed" — so a button for one is guaranteed to fail.
+
+    comms already excludes closed rows from the list it hands back, so this is
+    defence at the renderer rather than the only guard. It matters because the
+    picker is drawn once and tapped later: a conversation that ends while the
+    message sits in scrollback is exactly the tap this protects, and the
+    renderer is the last place that can still refuse to draw it.
     """
     return [
         s for s in (sessions or [])
-        if str(s.get("status") or "").lower() != "suspended"
+        if str(s.get("status") or "").lower() in _REACHABLE_STATUSES
     ]
 
 
