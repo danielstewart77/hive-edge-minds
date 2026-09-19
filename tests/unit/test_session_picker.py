@@ -224,6 +224,55 @@ def test_a_suspended_conversation_is_not_in_the_picker():
     ]
 
 
+# ---------------------------------------------------------------------------
+# Requirement 1 — the picker never offers a conversation that has ended.
+# ---------------------------------------------------------------------------
+def test_an_ended_conversation_is_not_in_the_picker():
+    """A closed conversation cannot be switched to — comms refuses it — so a
+    button for one is a button that is guaranteed to fail. On 2026-09-18 the
+    host held 6,899 closed rows against 19 live ones, so the picker was
+    almost entirely dead buttons.
+
+    Breaks if `closed` is dropped from the filter, and breaks if the filter
+    grows an appetite for `idle`, which is a live conversation between turns.
+    """
+    sessions = [
+        {"id": "11111111-aaaa", "summary": "Taxes", "status": "running"},
+        {"id": "22222222-bbbb", "summary": "Roof", "status": "closed"},
+        {"id": "33333333-cccc", "summary": "Laptop", "status": "idle"},
+        {"id": "44444444-dddd", "summary": "Shouty", "status": "CLOSED"},
+        {"id": "55555555-eeee", "summary": "Asleep", "status": "suspended"},
+    ]
+
+    assert [s["id"] for s in picker.visible_sessions(sessions)] == [
+        "11111111-aaaa", "33333333-cccc",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_sessions_command_neither_draws_nor_counts_an_ended_one(monkeypatch):
+    """Requirement 1, at the command rather than the renderer: the command is
+    what fetches the list and writes the count. Breaks if the filter lands
+    after the count, which would report a total the keyboard does not show."""
+    sessions = [
+        {"id": f"{i:08d}-dead", "summary": str(i), "status": "closed", "last_active": 0}
+        for i in range(20)
+    ] + [
+        {"id": "99999999-live", "summary": "awake", "status": "running", "last_active": 0},
+    ]
+    recorder = _Recorder()
+    update, ctx = _chat_update(recorder)
+    monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
+    monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
+    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
+
+    await bot.cmd_sessions(update, ctx)
+
+    payloads = [b.callback_data for row in recorder.markup.inline_keyboard for b in row]
+    assert payloads == ["sw:99999999-live", picker.CB_NEW]
+    assert "21" not in recorder.text, f"an ended conversation was counted: {recorder.text!r}"
+
+
 @pytest.mark.asyncio
 async def test_the_sessions_command_neither_draws_nor_counts_a_suspended_one(monkeypatch):
     """The renderer's own test cannot see this: the command is what fetches

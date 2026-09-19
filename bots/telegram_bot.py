@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 from config import config
-from bots.bot_utils import claim_picker, get_lock, get_queue, time_ago
+from bots.bot_utils import claim_picker, get_lock, get_queue, release_picker, time_ago
 from bots.gateway_client import GatewayClient
 from bots import labels_client, rename_prompt, session_picker
 from bots.skills import get_skills
@@ -614,6 +614,10 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # doing it first means a slow or failing action cannot leave a live
     # picker sitting there inviting a second tap. Best effort: the claim above
     # is what makes the guarantee, this is what makes it visible.
+    # Kept so a failed action can put it back. Clearing first is what stops a
+    # slow action from leaving a live picker inviting a second tap; restoring
+    # after a failure is what stops one dead row from ending the list.
+    original_markup = getattr(query.message, "reply_markup", None)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception as exc:  # noqa: BLE001
@@ -642,6 +646,18 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         msg = "That didn't go through \u2014 the gateway didn't answer."
 
+    if not worked:
+        # The claim is spent by an action, not by a tap, so an action that did
+        # not run hands the picker back and the rest of the list keeps working.
+        # `worked` reflects what the gateway did and nothing about delivery —
+        # a `/new` that succeeded stays claimed even when its reply never
+        # arrives, which is the 2026-09-17 case and must not be released here.
+        #
+        # Releasing without restoring the keyboard would be a no-op the
+        # operator could never use: the buttons are already gone, so there is
+        # nothing left to tap. Both halves or neither.
+        release_picker(chat_id, picker_id)
+
     # The picker itself records what it was used for. Without this the message
     # is a bare header over a vanished keyboard, and scrollback cannot say
     # which conversation a tap chose \u2014 which matters most in exactly the case
@@ -650,9 +666,15 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # permanently reading "done: that didn't go through", which is a lie told
     # in scrollback long after the operator could check.
     mark = "\u2705" if worked else "\u26a0\ufe0f"
-    header = getattr(query.message, "text", None) or "Your conversations:"
+    # Only the part above the previous mark. A retried tap re-annotates the
+    # same picker, and without this each attempt stacks another mark under the
+    # last until the header is a column of dead error messages.
+    header = (getattr(query.message, "text", None) or "Your conversations:").split("\n\n")[0]
     try:
-        await query.edit_message_text(f"{header}\n\n{mark} {msg}")
+        await query.edit_message_text(
+            f"{header}\n\n{mark} {msg}",
+            reply_markup=None if worked else original_markup,
+        )
     except Exception as exc:  # noqa: BLE001
         log_event(
             log, "surface.button.caption.failed", level=logging.WARNING,

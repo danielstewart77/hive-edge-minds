@@ -647,3 +647,126 @@ class TestTheQueueKeepsMoving:
 
         # All five landed without waiting out the poison item's hour.
         assert delivered == [f"good {n}" for n in range(5)]
+
+
+@pytest.mark.asyncio
+class TestAFailedTapLeavesTheListUsable:
+    """Requirement 3 — the claim is spent by an action, not by a tap.
+
+    The claim was taken before the action ran and never released when it
+    failed, so one tap on a dead row burned the whole picker: every remaining
+    button, including `New session`, was refused from then on, and the refusal
+    survived a restart because the claims are persisted. On 2026-09-18 the
+    picker was mostly closed conversations, so the first tap the operator made
+    was overwhelmingly likely to be the one that killed the list.
+    """
+
+    async def test_a_refused_action_releases_the_picker(self) -> None:
+        """Breaks if the release is dropped: the second tap never reaches the
+        gateway and the operator is told the list is spent instead."""
+        from bots.telegram_bot import on_session_button
+
+        run = AsyncMock(return_value=(False, "Error: Session abc is closed"))
+        with patch("bots.telegram_bot._run_session_button", run):
+            update, context = _make_callback(data="sw:abc")
+            await on_session_button(update, context)
+            again, context2 = _make_callback(data="sw:abc")  # same chat, same message id
+            await on_session_button(again, context2)
+
+        assert run.await_count == 2
+
+    async def test_an_action_that_raised_releases_the_picker(self) -> None:
+        """The other failure shape. A raise leaves the tap looking like it did
+        nothing at all, so the list it came from must still work."""
+        from bots.telegram_bot import on_session_button
+
+        run = AsyncMock(side_effect=[RuntimeError("gateway down"), (True, 'Resumed "Taxes"')])
+        with patch("bots.telegram_bot._run_session_button", run):
+            update, context = _make_callback(data="sw:abc")
+            await on_session_button(update, context)
+            again, context2 = _make_callback(data="sw:abc")
+            await on_session_button(again, context2)
+
+        assert run.await_count == 2
+        assert "✅" in again.callback_query.edit_message_text.call_args[0][0]
+
+    async def test_an_action_that_worked_keeps_the_picker_though_the_reply_failed(self) -> None:
+        """Requirement 5, and the one that must not regress.
+
+        Releasing on a *delivery* failure is exactly how 2026-09-17 happened:
+        `/new` succeeded, the reply never arrived, and the operator — with no
+        way to know it had worked — tapped again and destroyed the conversation
+        the first tap had just created. The claim follows whether the action
+        ran, never whether the sentence about it got through.
+        """
+        from bots.telegram_bot import on_session_button
+
+        run = AsyncMock(return_value=(True, "New session: abcd1234"))
+        with patch("bots.telegram_bot._run_session_button", run):
+            update, context = _make_callback(data="new")
+            context.bot.send_message = AsyncMock(side_effect=RuntimeError("no route to host"))
+            update.callback_query.edit_message_text = AsyncMock(
+                side_effect=RuntimeError("no route to host")
+            )
+            await on_session_button(update, context)
+
+            again, context2 = _make_callback(data="new")
+            await on_session_button(again, context2)
+
+        assert run.await_count == 1
+
+    async def test_a_failed_tap_gives_the_buttons_back(self) -> None:
+        """Requirement 3, at the layer the operator can see.
+
+        Releasing the claim is invisible on its own: the keyboard is cleared
+        before the action runs, so a released picker with no buttons is a list
+        that is still, as far as anyone can tell, dead. Breaks if the restore
+        is dropped, or if the failure path stops passing the original markup.
+        """
+        from bots.telegram_bot import on_session_button
+
+        run = AsyncMock(return_value=(False, "Error: Session abc is closed"))
+        update, context = _make_callback(data="sw:abc")
+        keyboard = update.callback_query.message.reply_markup
+
+        with patch("bots.telegram_bot._run_session_button", run):
+            await on_session_button(update, context)
+
+        assert update.callback_query.edit_message_text.call_args.kwargs[
+            "reply_markup"
+        ] is keyboard
+
+    async def test_a_successful_tap_still_takes_the_buttons_away(self) -> None:
+        """The other side of it: success must not hand the keyboard back, or
+        the single-use guarantee is only a claim nobody can see."""
+        from bots.telegram_bot import on_session_button
+
+        run = AsyncMock(return_value=(True, 'Resumed "Taxes"'))
+        update, context = _make_callback(data="sw:abc")
+
+        with patch("bots.telegram_bot._run_session_button", run):
+            await on_session_button(update, context)
+
+        assert update.callback_query.edit_message_text.call_args.kwargs[
+            "reply_markup"
+        ] is None
+
+    async def test_a_retried_tap_does_not_stack_marks_on_the_picker(self) -> None:
+        """A picker that survives a failure gets annotated again on the next
+        attempt. Breaks if the header stops being trimmed to the part above
+        the previous mark, which turns it into a column of dead errors."""
+        from bots.telegram_bot import on_session_button
+
+        run = AsyncMock(return_value=(False, "Error: Session abc is closed"))
+        with patch("bots.telegram_bot._run_session_button", run):
+            update, context = _make_callback(data="sw:abc")
+            await on_session_button(update, context)
+            first = update.callback_query.edit_message_text.call_args[0][0]
+
+            again, context2 = _make_callback(data="sw:abc")
+            again.callback_query.message.text = first
+            await on_session_button(again, context2)
+            second = again.callback_query.edit_message_text.call_args[0][0]
+
+        assert second.count("⚠️") == 1
+        assert second.startswith("Your conversations:")

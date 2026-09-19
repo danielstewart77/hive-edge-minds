@@ -166,18 +166,32 @@ def button_text(session: dict, labels: dict) -> str:
     return f"{status}{dot} {caption}{where} \u00b7 {short} \u00b7 {age}"
 
 
-def visible_sessions(sessions: list[dict] | None) -> list[dict]:
-    """The conversations the picker draws: everything not asleep.
+# Statuses a button must never be drawn for, and they are excluded for two
+# different reasons.
+#
+# A **suspended** conversation has no process behind it and is not what anyone
+# is looking for when they open the picker. It is still resumable by id
+# through `/switch`; what it no longer does is fill the keyboard.
+#
+# A **closed** one cannot be resumed at all — comms refuses the switch with
+# "Session ... is closed" — so a button for one is a button guaranteed to
+# fail. Leaving them in was not a cosmetic problem: on 2026-09-18 this host
+# held 6,899 closed conversations against 19 live ones, so the newest twelve
+# rows were mostly dead, and a tap on any of them failed *and* spent the
+# picker, taking `New session` and every live row down with it.
+_UNDRAWABLE_STATUSES = frozenset({"suspended", "closed"})
 
-    A suspended conversation has no process behind it and is not what anyone
-    is looking for when they open the picker — on this host they outnumber the
-    live ones better than two to one, and the live ones are what the picker
-    exists to get back to. They are still resumable by id through `/switch`;
-    what they no longer do is fill the keyboard.
+
+def visible_sessions(sessions: list[dict] | None) -> list[dict]:
+    """The conversations the picker draws: the ones a tap can actually reach.
+
+    `running` and `idle` both survive — idle is a live conversation between
+    turns, not a sleeping one, and eating it would empty the picker of exactly
+    the conversations the operator steps away from and comes back to.
     """
     return [
         s for s in (sessions or [])
-        if str(s.get("status") or "").lower() != "suspended"
+        if str(s.get("status") or "").lower() not in _UNDRAWABLE_STATUSES
     ]
 
 
