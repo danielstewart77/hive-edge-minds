@@ -110,30 +110,6 @@ def claim_picker(chat_id: int, message_id: int) -> bool:
     return True
 
 
-def release_picker(chat_id: int, message_id: int) -> None:
-    """Give a picker back, because the action it was claimed for did not run.
-
-    The claim is spent by an *action*, not by a tap. Taking it before the work
-    and never returning it meant a single failure disabled the whole list —
-    every other button on it, `New session` included — and because the claims
-    are persisted, a restart did not clear it either. On 2026-09-18 the picker
-    was mostly conversations comms would refuse, so the operator's first tap
-    was the one that killed the list.
-
-    Released on whether the action ran, never on whether the sentence about it
-    was delivered. That distinction is the whole of 2026-09-17: `/new`
-    succeeded, its reply never arrived, and a second tap destroyed the
-    conversation the first had just created. A picker whose action worked
-    stays spent however badly the reply went.
-
-    Idempotent, and contains no ``await`` — it is the counterpart to
-    ``claim_picker`` and has to order against it synchronously for the same
-    reason.
-    """
-    _spent_pickers.pop((int(chat_id), int(message_id)), None)
-    _persist()
-
-
 def _reset_pickers() -> None:
     """Test helper — forget every claim so a test starts from a clean slate."""
     global _loaded

@@ -651,58 +651,121 @@ class TestTheQueueKeepsMoving:
 
 @pytest.mark.asyncio
 class TestAFailedTapLeavesTheListUsable:
-    """Requirement 3 — the claim is spent by an action, not by a tap.
+    """Requirement 3 — a refused tap costs one tap, not the whole picker.
 
-    The claim was taken before the action ran and never released when it
-    failed, so one tap on a dead row burned the whole picker: every remaining
-    button, including `New session`, was refused from then on, and the refusal
-    survived a restart because the claims are persisted. On 2026-09-18 the
-    picker was mostly closed conversations, so the first tap the operator made
-    was overwhelmingly likely to be the one that killed the list.
+    The claim that makes a picker single-use was taken before the action ran,
+    and the keyboard was cleared first, so a tap that failed spent the list and
+    removed its buttons — every remaining row and `New session` with them. The
+    claims are persisted, so a restart did not clear it either.
+
+    The list is *not* un-spent to fix this. Un-spending erases the row from
+    the claim file, which is the only defence against a tap Telegram
+    redelivers after a restart; a `/new` whose response was lost has already
+    killed the conversation comms kills before creating its replacement, so a
+    failed tap does not mean nothing happened; and a keyboard put back into
+    scrollback stays tappable for months. The operator gets a *fresh* picker
+    instead.
     """
 
-    async def test_a_refused_action_releases_the_picker(self) -> None:
-        """Breaks if the release is dropped: the second tap never reaches the
-        gateway and the operator is told the list is spent instead."""
+    async def test_a_refused_action_redraws_the_list(self) -> None:
+        """Breaks if the redraw is dropped: the operator is left with a spent
+        picker and has to know to type /sessions."""
         from bots.telegram_bot import on_session_button
 
+        redraw = AsyncMock()
         run = AsyncMock(return_value=(False, "Error: Session abc is closed"))
-        with patch("bots.telegram_bot._run_session_button", run):
+        with patch("bots.telegram_bot._run_session_button", run), \
+                patch("bots.telegram_bot._send_session_picker", redraw):
             update, context = _make_callback(data="sw:abc")
             await on_session_button(update, context)
-            again, context2 = _make_callback(data="sw:abc")  # same chat, same message id
-            await on_session_button(again, context2)
 
-        assert run.await_count == 2
+        redraw.assert_awaited_once()
+        assert redraw.await_args[0][1:] == (123, 456)
 
-    async def test_an_action_that_raised_releases_the_picker(self) -> None:
-        """The other failure shape. A raise leaves the tap looking like it did
-        nothing at all, so the list it came from must still work."""
+    async def test_an_action_that_raised_redraws_the_list(self) -> None:
+        """The other failure shape: a raise leaves the tap looking like it did
+        nothing at all, so the operator still needs a usable list."""
         from bots.telegram_bot import on_session_button
 
-        run = AsyncMock(side_effect=[RuntimeError("gateway down"), (True, 'Resumed "Taxes"')])
-        with patch("bots.telegram_bot._run_session_button", run):
+        redraw = AsyncMock()
+        with patch("bots.telegram_bot._run_session_button",
+                   AsyncMock(side_effect=RuntimeError("gateway down"))), \
+                patch("bots.telegram_bot._send_session_picker", redraw):
             update, context = _make_callback(data="sw:abc")
             await on_session_button(update, context)
-            again, context2 = _make_callback(data="sw:abc")
-            await on_session_button(again, context2)
 
-        assert run.await_count == 2
-        assert "✅" in again.callback_query.edit_message_text.call_args[0][0]
+        redraw.assert_awaited_once()
+
+    async def test_a_successful_action_does_not_redraw(self) -> None:
+        """A tap that worked has changed which conversation the chat is in.
+        Drawing a picker under that is an invitation to undo it."""
+        from bots.telegram_bot import on_session_button
+
+        redraw = AsyncMock()
+        with patch("bots.telegram_bot._run_session_button",
+                   AsyncMock(return_value=(True, 'Resumed "Taxes"'))), \
+                patch("bots.telegram_bot._send_session_picker", redraw):
+            update, context = _make_callback(data="sw:abc")
+            await on_session_button(update, context)
+
+        redraw.assert_not_awaited()
+
+    async def test_a_failed_tap_never_un_spends_its_picker(self) -> None:
+        """Requirement 4, at the point the 2026-09-17 incident re-enters.
+
+        comms kills the chat's conversation *before* creating a replacement,
+        so a `/new` that reports failure may already have destroyed one. A
+        picker handed back after that is a second tap away from destroying the
+        replacement too. Breaks the moment anything releases the claim.
+        """
+        from bots.telegram_bot import on_session_button
+        from bots.bot_utils import claim_picker
+
+        run = AsyncMock(return_value=(False, "Error: comms unreachable"))
+        with patch("bots.telegram_bot._run_session_button", run), \
+                patch("bots.telegram_bot._send_session_picker", AsyncMock()):
+            update, context = _make_callback(data="new")
+            await on_session_button(update, context)
+
+        # The picker's own chat and message id: still claimed, so the action
+        # cannot run twice.
+        assert claim_picker(456, 99) is False
+
+    async def test_a_failed_tap_stays_spent_across_a_restart(self) -> None:
+        """The claim is on disk because the incident runs through a restart:
+        polling down, taps queued at Telegram's end, service restarts,
+        `getUpdates` redelivers. Breaks if a failure path ever writes the
+        store back without the row it just used.
+        """
+        from bots.telegram_bot import on_session_button
+        from bots import bot_utils
+
+        with patch("bots.telegram_bot._run_session_button",
+                   AsyncMock(return_value=(False, "Error: comms unreachable"))), \
+                patch("bots.telegram_bot._send_session_picker", AsyncMock()):
+            update, context = _make_callback(data="new")
+            await on_session_button(update, context)
+
+        # A fresh process: forget everything held in memory and read the file
+        # back, exactly as a restarted bot does.
+        bot_utils._reset_pickers()
+        bot_utils._loaded = False
+        assert bot_utils.claim_picker(456, 99) is False
 
     async def test_an_action_that_worked_keeps_the_picker_though_the_reply_failed(self) -> None:
         """Requirement 5, and the one that must not regress.
 
-        Releasing on a *delivery* failure is exactly how 2026-09-17 happened:
-        `/new` succeeded, the reply never arrived, and the operator — with no
-        way to know it had worked — tapped again and destroyed the conversation
-        the first tap had just created. The claim follows whether the action
-        ran, never whether the sentence about it got through.
+        `/new` succeeded on 2026-09-17, the reply never arrived, and the
+        operator — with no way to know it had worked — tapped again and
+        destroyed the conversation the first tap had just created. The claim
+        follows whether the action ran, never whether the sentence about it
+        got through.
         """
         from bots.telegram_bot import on_session_button
 
         run = AsyncMock(return_value=(True, "New session: abcd1234"))
-        with patch("bots.telegram_bot._run_session_button", run):
+        with patch("bots.telegram_bot._run_session_button", run), \
+                patch("bots.telegram_bot._send_session_picker", AsyncMock()):
             update, context = _make_callback(data="new")
             context.bot.send_message = AsyncMock(side_effect=RuntimeError("no route to host"))
             update.callback_query.edit_message_text = AsyncMock(
@@ -714,59 +777,3 @@ class TestAFailedTapLeavesTheListUsable:
             await on_session_button(again, context2)
 
         assert run.await_count == 1
-
-    async def test_a_failed_tap_gives_the_buttons_back(self) -> None:
-        """Requirement 3, at the layer the operator can see.
-
-        Releasing the claim is invisible on its own: the keyboard is cleared
-        before the action runs, so a released picker with no buttons is a list
-        that is still, as far as anyone can tell, dead. Breaks if the restore
-        is dropped, or if the failure path stops passing the original markup.
-        """
-        from bots.telegram_bot import on_session_button
-
-        run = AsyncMock(return_value=(False, "Error: Session abc is closed"))
-        update, context = _make_callback(data="sw:abc")
-        keyboard = update.callback_query.message.reply_markup
-
-        with patch("bots.telegram_bot._run_session_button", run):
-            await on_session_button(update, context)
-
-        assert update.callback_query.edit_message_text.call_args.kwargs[
-            "reply_markup"
-        ] is keyboard
-
-    async def test_a_successful_tap_still_takes_the_buttons_away(self) -> None:
-        """The other side of it: success must not hand the keyboard back, or
-        the single-use guarantee is only a claim nobody can see."""
-        from bots.telegram_bot import on_session_button
-
-        run = AsyncMock(return_value=(True, 'Resumed "Taxes"'))
-        update, context = _make_callback(data="sw:abc")
-
-        with patch("bots.telegram_bot._run_session_button", run):
-            await on_session_button(update, context)
-
-        assert update.callback_query.edit_message_text.call_args.kwargs[
-            "reply_markup"
-        ] is None
-
-    async def test_a_retried_tap_does_not_stack_marks_on_the_picker(self) -> None:
-        """A picker that survives a failure gets annotated again on the next
-        attempt. Breaks if the header stops being trimmed to the part above
-        the previous mark, which turns it into a column of dead errors."""
-        from bots.telegram_bot import on_session_button
-
-        run = AsyncMock(return_value=(False, "Error: Session abc is closed"))
-        with patch("bots.telegram_bot._run_session_button", run):
-            update, context = _make_callback(data="sw:abc")
-            await on_session_button(update, context)
-            first = update.callback_query.edit_message_text.call_args[0][0]
-
-            again, context2 = _make_callback(data="sw:abc")
-            again.callback_query.message.text = first
-            await on_session_button(again, context2)
-            second = again.callback_query.edit_message_text.call_args[0][0]
-
-        assert second.count("⚠️") == 1
-        assert second.startswith("Your conversations:")

@@ -426,11 +426,15 @@ class _Recorder:
         self.text = text
         self.markup = reply_markup
 
-    async def send_message(self, chat_id=None, text=None, **kwargs):
+    async def send_message(self, chat_id=None, text=None, reply_markup=None, **kwargs):
         # Command replies go out on the bot rather than as a reply to the
         # message, so a failed send can be retried and then queued instead of
-        # vanishing into the error handler at INFO.
+        # vanishing into the error handler at INFO. The picker goes out this
+        # way too, because the same drawing code serves `/sessions` and the
+        # redraw after a failed tap, which has no message to reply to.
         self.text = text
+        if reply_markup is not None:
+            self.markup = reply_markup
 
 
 def _chat_update(recorder, args=None):

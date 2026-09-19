@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 from config import config
-from bots.bot_utils import claim_picker, get_lock, get_queue, release_picker, time_ago
+from bots.bot_utils import claim_picker, get_lock, get_queue, time_ago
 from bots.gateway_client import GatewayClient
 from bots import labels_client, rename_prompt, session_picker
 from bots.skills import get_skills
@@ -484,14 +484,45 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     if not await _auth_check(update):
         return
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    await _send_session_picker(
+        context.bot, update.effective_user.id, update.effective_chat.id
+    )
+
+
+async def _send_session_picker(bot, user_id: int, chat_id: int) -> None:
+    """Draw a conversation picker into the chat, from the list as it is now.
+
+    Shared by `/sessions` and by the failure path of a tap. A picker is spent
+    by its one action and is never un-spent, so the way a failed tap leaves
+    the operator with a working list is that it hands them a *new* one —
+    drawn against current state, and therefore not offering the conversation
+    that just refused them.
+
+    Resurrecting the old picker instead was tried and is worse in three
+    separate ways: un-spending a claim erases the row from
+    `data/spent_pickers.json`, which is the only thing standing between a
+    tap Telegram redelivers after a restart and a second action; a `/new`
+    whose response was lost has already killed the conversation comms kills
+    *before* it creates the replacement, so "the tap failed" does not mean
+    "nothing happened"; and a keyboard restored into scrollback stays
+    tappable for months, where one thumb on a stale row kills whatever
+    browser terminal now holds that id.
+    """
     result = await gateway.server_command(user_id, chat_id, "/sessions")
-    if isinstance(result, dict) and "error" in result:
-        await _reply_chunked(update, f"Error: {result['error']}")
+    if isinstance(result, dict):
+        # FastAPI reports its own rejections as `detail`, not `error` — a 401
+        # on a rotated bearer, a 422 on a body it will not parse. Reading only
+        # `error` let those fall through as "not a list", so `visible_sessions`
+        # was handed `[]` and an expired token was reported to the operator as
+        # "No live conversations." — whose reasonable next move is to tap New
+        # session. `_handle_server_command` and `_suspend_conversation` each
+        # learned this separately; this is the third site.
+        problem = result.get("error") or result.get("detail")
+        await _deliver(bot, chat_id, f"Error: {problem}" if problem else
+                       "Couldn't read the conversation list.")
         return
-    # Suspended conversations are filtered before anything is counted, so the
-    # "newest N of M" the operator reads is about the list they can see.
+    # Filtered before anything is counted, so the "newest N of M" the operator
+    # reads is about the list they can actually see.
     sessions = session_picker.visible_sessions(result if isinstance(result, list) else [])
     # An unreadable label store draws the same picker as an empty one: the
     # buttons fall back to the gateway's own summaries, which is what the
@@ -504,15 +535,15 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         header = f"Your conversations \u2014 newest {shown} of {len(sessions)}:"
     else:
         header = "Your conversations:"
-    # Retried, because this is the message the operator sends to *recover*
-    # from a failed tap. A bare `reply_text` here fails into `_on_error`, which
-    # logs a network error at INFO and returns — so during an outage /sessions
-    # produces no picker, says nothing, and leaves nothing above INFO to find.
+    # Retried, because this is the message that *recovers* from a failed tap.
+    # A bare send here fails into `_on_error`, which logs a network error at
+    # INFO and returns — so during an outage the picker never appears, says
+    # nothing, and leaves nothing above INFO to find.
     keyboard = session_picker.build_session_keyboard(sessions, labels)
     last: Exception | None = None
     for attempt in range(_DELIVER_ATTEMPTS):
         try:
-            await update.message.reply_text(header, reply_markup=keyboard)
+            await bot.send_message(chat_id=chat_id, text=header, reply_markup=keyboard)
             return
         except asyncio.CancelledError:
             raise
@@ -527,7 +558,7 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # A picker cannot be queued — its buttons are only meaningful against the
     # list as it was — so what gets queued is the fact that it failed.
     await _deliver(
-        context.bot, chat_id,
+        bot, chat_id,
         "Couldn't draw the conversation list \u2014 send /sessions to try again.",
     )
 
@@ -614,10 +645,6 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # doing it first means a slow or failing action cannot leave a live
     # picker sitting there inviting a second tap. Best effort: the claim above
     # is what makes the guarantee, this is what makes it visible.
-    # Kept so a failed action can put it back. Clearing first is what stops a
-    # slow action from leaving a live picker inviting a second tap; restoring
-    # after a failure is what stops one dead row from ending the list.
-    original_markup = getattr(query.message, "reply_markup", None)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception as exc:  # noqa: BLE001
@@ -646,18 +673,6 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         msg = "That didn't go through \u2014 the gateway didn't answer."
 
-    if not worked:
-        # The claim is spent by an action, not by a tap, so an action that did
-        # not run hands the picker back and the rest of the list keeps working.
-        # `worked` reflects what the gateway did and nothing about delivery —
-        # a `/new` that succeeded stays claimed even when its reply never
-        # arrives, which is the 2026-09-17 case and must not be released here.
-        #
-        # Releasing without restoring the keyboard would be a no-op the
-        # operator could never use: the buttons are already gone, so there is
-        # nothing left to tap. Both halves or neither.
-        release_picker(chat_id, picker_id)
-
     # The picker itself records what it was used for. Without this the message
     # is a bare header over a vanished keyboard, and scrollback cannot say
     # which conversation a tap chose \u2014 which matters most in exactly the case
@@ -666,15 +681,9 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # permanently reading "done: that didn't go through", which is a lie told
     # in scrollback long after the operator could check.
     mark = "\u2705" if worked else "\u26a0\ufe0f"
-    # Only the part above the previous mark. A retried tap re-annotates the
-    # same picker, and without this each attempt stacks another mark under the
-    # last until the header is a column of dead error messages.
-    header = (getattr(query.message, "text", None) or "Your conversations:").split("\n\n")[0]
+    header = getattr(query.message, "text", None) or "Your conversations:"
     try:
-        await query.edit_message_text(
-            f"{header}\n\n{mark} {msg}",
-            reply_markup=None if worked else original_markup,
-        )
+        await query.edit_message_text(f"{header}\n\n{mark} {msg}")
     except Exception as exc:  # noqa: BLE001
         log_event(
             log, "surface.button.caption.failed", level=logging.WARNING,
@@ -682,6 +691,24 @@ async def on_session_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await _deliver(context.bot, chat_id, msg)
+
+    if not worked:
+        # The list this tap came from is spent for good — that is what stops a
+        # stale tap acting, and it must survive a restart, so it is never
+        # given back. What the operator gets instead is a current one, so a
+        # refused conversation costs them a tap rather than the whole picker.
+        #
+        # Best effort, and last: the tap's own answer is already delivered
+        # above, and a gateway too sick to draw a fresh list must not also
+        # swallow the sentence explaining why the tap failed.
+        try:
+            await _send_session_picker(context.bot, user_id, chat_id)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                log, "surface.picker.redraw.failed", level=logging.WARNING,
+                surface="telegram", user_id=user_id, client_ref=chat_id,
+                error=str(exc),
+            )
 
 
 async def _suspend_conversation(target: str, user_id: int, chat_id: int) -> str:

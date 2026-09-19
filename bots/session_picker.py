@@ -166,32 +166,37 @@ def button_text(session: dict, labels: dict) -> str:
     return f"{status}{dot} {caption}{where} \u00b7 {short} \u00b7 {age}"
 
 
-# Statuses a button must never be drawn for, and they are excluded for two
-# different reasons.
+# The statuses a tap can actually reach, named positively.
 #
-# A **suspended** conversation has no process behind it and is not what anyone
-# is looking for when they open the picker. It is still resumable by id
-# through `/switch`; what it no longer does is fill the keyboard.
+# A denylist of the dead ones re-opens this bug the day comms adds a status:
+# anything unrecognised — a new terminal state, a missing field, a null —
+# passes the filter and is drawn with the `?` icon, which is a shrug rather
+# than a warning. The requirement is "the conversations a tap can reach", so
+# the code names those and nothing else.
 #
-# A **closed** one cannot be resumed at all — comms refuses the switch with
-# "Session ... is closed" — so a button for one is a button guaranteed to
-# fail. Leaving them in was not a cosmetic problem: on 2026-09-18 this host
-# held 6,899 closed conversations against 19 live ones, so the newest twelve
-# rows were mostly dead, and a tap on any of them failed *and* spent the
-# picker, taking `New session` and every live row down with it.
-_UNDRAWABLE_STATUSES = frozenset({"suspended", "closed"})
+# `idle` belongs here: it is a live conversation between turns, not a
+# sleeping one, and dropping it would empty the picker of exactly the
+# conversations an operator walks away from and comes back to.
+_REACHABLE_STATUSES = frozenset({"running", "idle"})
 
 
 def visible_sessions(sessions: list[dict] | None) -> list[dict]:
     """The conversations the picker draws: the ones a tap can actually reach.
 
-    `running` and `idle` both survive — idle is a live conversation between
-    turns, not a sleeping one, and eating it would empty the picker of exactly
-    the conversations the operator steps away from and comes back to.
+    A `suspended` conversation has no process behind it and is still resumable
+    by id through `/switch`; what it no longer does is fill the keyboard. A
+    `closed` one cannot be resumed at all — comms refuses the switch with
+    "Session ... is closed" — so a button for one is guaranteed to fail.
+
+    comms already excludes closed rows from the list it hands back, so this is
+    defence at the renderer rather than the only guard. It matters because the
+    picker is drawn once and tapped later: a conversation that ends while the
+    message sits in scrollback is exactly the tap this protects, and the
+    renderer is the last place that can still refuse to draw it.
     """
     return [
         s for s in (sessions or [])
-        if str(s.get("status") or "").lower() not in _UNDRAWABLE_STATUSES
+        if str(s.get("status") or "").lower() in _REACHABLE_STATUSES
     ]
 
 
