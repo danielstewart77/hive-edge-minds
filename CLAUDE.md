@@ -230,6 +230,41 @@ lacking a file does not take the whole route down for every mind behind it.
 The GPU probe runs with a hard timeout off the event loop, since a wedged
 `nvidia-smi` must not stall every session the mind is serving.
 
+### A mind resolves a named function off its own disk
+
+A design session's console page may not propose a test against a function
+nobody has looked at, and the console cannot look: it holds no checkout of
+anything, and a mind on another machine has no bind mount to offer. So the
+mind resolves and reports, the same shape as `/skills`, `/files`, `/models`
+and `/host` — a container in the stack, a bare-metal mind here and a mind
+across the LAN are one code path. `code_symbols.py` does the parsing;
+`mind_server.py` exposes it as admin-guarded `GET /symbols`
+(`repo`, `path`, `name`) and `GET /symbols/roots`.
+
+What comes back is the real body, its path, its line span and a fingerprint
+of those bytes. The fingerprint is what keeps the snapshot honest later: a
+file edited after publication reads as drifted rather than leaving a page
+showing old source under a live label.
+
+Resolution is by parse, never by search. A regex for `def name` matches the
+word in a docstring, in a comment and in a string, and cannot tell a method
+on one class from a method on another. A bare name means module scope —
+letting it also match a method would make every `get`, `run` and `handle`
+ambiguous in any file holding a class — and `Owner.member` addresses the
+method. A name defined twice is reported ambiguous rather than resolved to
+whichever came first, because a confident wrong line span is worse than an
+honest refusal.
+
+The checkouts it will read are declared in `DESIGN_REPO_ROOTS`, not
+discovered: a repository path arriving on an HTTP request is a path
+traversal with extra steps, and this route returns file contents.
+Containment is judged on the resolved path, so a symlink pointing out of
+the declared set is refused rather than followed.
+
+A name that is simply absent comes back as an unresolved answer with a 200.
+The console reads a 404 on a route as "this mind predates the API" and
+sends the operator off to redeploy; a typo must not produce that sentence.
+
 ### Browser terminal (tmux-backed)
 
 `mind_server.py` exposes `WS /sessions/{id}/attach-pty`, bridging raw bytes
@@ -467,15 +502,36 @@ A tailer opens at end-of-file when it first sees a conversation (so
 attaching to a session with hours of history doesn't read the past aloud),
 but re-opens from the top when the conversation id under an
 already-followed session changes — that's a rotation, and everything in
-the new conversation is new. Only `text` content blocks are read; `thinking`
-is skipped because the harness writes it empty to disk regardless, and
-`tool_use`/`tool_result` are skipped because reading a diff aloud isn't
-speech. The browser strips fenced code blocks from what it sends to the
-voice server (`terminal-routing.js`'s `speakable`) while leaving them on
-screen, and silences an unterminated fence entirely rather than speaking a
-half-written command. hive-comms gates its own chat-path publishing on
-`owner_type` so a Telegram-driven turn isn't spoken twice — once by
-`send_message`, once by the tailer reading the same transcript.
+the new conversation is new. The speaker's diet stays prose-only: `text`
+blocks are read aloud, `thinking` is skipped because the harness writes it
+empty to disk regardless, and `tool_use`/`tool_result` are skipped because
+reading a diff aloud isn't speech — and only blocks with no `agent` (the
+mind's own, not a delegate's) are spoken, so a sub-mind's report is never
+read aloud in the mind's voice. The browser strips fenced code blocks from
+what it sends to the voice server (`terminal-routing.js`'s `speakable`)
+while leaving them on screen, and silences an unterminated fence entirely
+rather than speaking a half-written command. hive-comms gates its own
+chat-path publishing on `owner_type` so a Telegram-driven turn isn't spoken
+twice — once by `send_message`, once by the tailer reading the same
+transcript.
+
+The same sweep also drives a second, wider feed: `activity_blocks` (also in
+`pty_voice.py`) reports every block a transcript entry carries — prose,
+thinking, a tool call's whole input, a tool result's whole body, and the
+user's own submission — each capped to `MAX_BLOCK_BYTES` (120,000, tail-first,
+marked `trimmed`) by `cap_block`. `_post_pty_activity` hands one sweep's
+worth to `POST /sessions/{id}/pty-activity`, deliberately separate from
+`pty-text`: that route is what the tile's speaker reads, so widening it
+would read tool calls aloud, while `pty-activity` reaches the dashboard's
+activity feed and nothing else. Speech is posted first and never behind the
+dashboard, since a hanging gateway must not delay a spoken sentence to serve
+a page nobody may have open. Sub-mind work does not live in the parent
+transcript: the harness gives each delegate its own
+`<sid>/subagents/agent-<id>.jsonl`, writing only the dispatching `tool_use`
+and the final `tool_result` into the parent, so `subagent_transcripts`
+follows those files alongside the parent one and `agent_label` names the
+delegate from its `agent-<id>.meta.json` (`agentType`, falling back to the
+id) rather than blending its work into the mind's own.
 
 ### Cross-surface session pickup
 

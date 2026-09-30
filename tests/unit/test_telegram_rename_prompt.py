@@ -43,19 +43,11 @@ def _patch_config():
 
 
 @pytest.fixture()
-def labels():
-    """A configured, readable, writable label store."""
-    with patch("bots.telegram_bot.labels_client") as lc:
-        lc.configured = MagicMock(return_value=True)
-        lc.fetch_labels = AsyncMock(return_value={"sess-1": {"color": "#5c913b"}})
-        lc.put_label = AsyncMock(return_value=True)
-        yield lc
-
-
-@pytest.fixture()
 def gateway():
+    """A gateway that finds the chat's conversation and accepts a rename."""
     gw = AsyncMock()
     gw.find_active_session = AsyncMock(return_value="sess-1")
+    gw.rename_session = AsyncMock(return_value=200)
     with patch("bots.telegram_bot.gateway", gw):
         yield gw
 
@@ -109,7 +101,7 @@ class TestReplyRecognition:
 
 @pytest.mark.asyncio
 class TestBareRenameAsks:
-    async def test_bare_rename_sends_a_force_reply_prompt(self, labels, gateway) -> None:
+    async def test_bare_rename_sends_a_force_reply_prompt(self, gateway) -> None:
         """Requirement 2: `/rename` with no name asks for one."""
         from bots.telegram_bot import cmd_rename
         from bots import rename_prompt
@@ -124,10 +116,10 @@ class TestBareRenameAsks:
         args, kwargs = update.message.reply_text.call_args
         assert args[0] == rename_prompt.PROMPT_TEXT
         assert kwargs.get("reply_markup") is not None
-        labels.put_label.assert_not_awaited()
+        gateway.rename_session.assert_not_awaited()
 
     async def test_bare_rename_with_no_conversation_refuses_without_asking(
-        self, labels, gateway
+        self, gateway
     ) -> None:
         """Requirement 7: don't ask for a name there is nothing to apply to."""
         from bots.telegram_bot import cmd_rename
@@ -143,9 +135,9 @@ class TestBareRenameAsks:
         args, kwargs = update.message.reply_text.call_args
         assert args[0] != rename_prompt.PROMPT_TEXT
         assert kwargs.get("reply_markup") is None
-        labels.put_label.assert_not_awaited()
+        gateway.rename_session.assert_not_awaited()
 
-    async def test_rename_with_a_name_writes_it_directly(self, labels, gateway) -> None:
+    async def test_rename_with_a_name_writes_it_directly(self, gateway) -> None:
         """Requirement 4: `/rename Dragoman` still renames in one go."""
         from bots.telegram_bot import cmd_rename
         from bots import rename_prompt
@@ -156,18 +148,20 @@ class TestBareRenameAsks:
 
         await cmd_rename(update, context)
 
-        labels.put_label.assert_awaited_once()
-        session_id, body = labels.put_label.call_args[0]
+        gateway.rename_session.assert_awaited_once()
+        session_id, body = gateway.rename_session.call_args[0]
         assert session_id == "sess-1"
         assert body["name"] == "Dragoman"
-        # The colour set at the tile survives a rename.
-        assert body["color"] == "#5c913b"
+        # The name alone. The write is partial, so the colour set at the tile
+        # survives by not being mentioned — sending it is how a rename used to
+        # blank it whenever the read that supplied it failed.
+        assert "color" not in body
         assert update.message.reply_text.call_args[0][0] != rename_prompt.PROMPT_TEXT
 
 
 @pytest.mark.asyncio
 class TestReplyRenamesTheConversation:
-    async def test_reply_to_prompt_writes_the_label(self, labels, gateway) -> None:
+    async def test_reply_to_prompt_writes_the_name(self, gateway) -> None:
         """Requirement 3: the reply renames the conversation this chat is in."""
         from bots.telegram_bot import handle_text
         from bots import rename_prompt
@@ -178,12 +172,12 @@ class TestReplyRenamesTheConversation:
         with patch("bots.telegram_bot._stream_to_message", AsyncMock()) as stream:
             await handle_text(update, context)
 
-        labels.put_label.assert_awaited_once()
-        assert labels.put_label.call_args[0][1]["name"] == "Dragoman"
+        gateway.rename_session.assert_awaited_once()
+        assert gateway.rename_session.call_args[0][1]["name"] == "Dragoman"
         # Requirement 3: the name is a name, not a question for the mind.
         stream.assert_not_awaited()
 
-    async def test_ordinary_message_reaches_the_harness(self, labels, gateway) -> None:
+    async def test_ordinary_message_reaches_the_harness(self, gateway) -> None:
         """Requirement 5: dismissing the prompt and typing works as it always did."""
         from bots.telegram_bot import handle_text
 
@@ -194,7 +188,7 @@ class TestReplyRenamesTheConversation:
             await handle_text(update, context)
 
         stream.assert_awaited()
-        labels.put_label.assert_not_awaited()
+        gateway.rename_session.assert_not_awaited()
 
 
 class TestOnlyTheBotsOwnPromptCounts:
@@ -237,7 +231,7 @@ class TestOnlyTheBotsOwnPromptCounts:
 @pytest.mark.asyncio
 class TestTheReplyIsFoundOnEverySurface:
     async def test_a_group_reply_carrying_no_mention_still_renames(
-        self, labels, gateway
+        self, gateway
     ) -> None:
         """Requirement 3: ForceReply aims the composer, so no mention is typed.
 
@@ -255,10 +249,10 @@ class TestTheReplyIsFoundOnEverySurface:
 
         await handle_text(update, context)
 
-        labels.put_label.assert_awaited_once()
-        assert labels.put_label.call_args[0][1]["name"] == "Dragoman"
+        gateway.rename_session.assert_awaited_once()
+        assert gateway.rename_session.call_args[0][1]["name"] == "Dragoman"
 
-    async def test_a_spoken_reply_renames(self, labels, gateway) -> None:
+    async def test_a_spoken_reply_renames(self, gateway) -> None:
         """Requirement 3: the prompt opens a reply box on a voice-first surface.
 
         Telegram is the primary surface here and runs with voice on, so the
@@ -282,15 +276,15 @@ class TestTheReplyIsFoundOnEverySurface:
             )
             await handle_voice(update, context)
 
-        labels.put_label.assert_awaited_once()
-        assert labels.put_label.call_args[0][1]["name"] == "Dragoman"
+        gateway.rename_session.assert_awaited_once()
+        assert gateway.rename_session.call_args[0][1]["name"] == "Dragoman"
         stream.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 class TestRenameRefusesLoudly:
     async def test_an_unreachable_gateway_refuses_instead_of_vanishing(
-        self, labels, gateway
+        self, gateway
     ) -> None:
         """Requirements 2 and 7: no path through /rename produces silence.
 
@@ -317,7 +311,7 @@ class TestRenameRefusesLoudly:
 @pytest.mark.asyncio
 class TestTheRenamePromptHasATarget:
     async def test_the_prompt_quotes_the_command_that_asked_for_it(
-        self, labels, gateway
+        self, gateway
     ) -> None:
         """Requirement 2: `selective` needs something to select.
 

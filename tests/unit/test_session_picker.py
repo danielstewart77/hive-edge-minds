@@ -41,7 +41,7 @@ def test_one_switch_button_per_conversation_in_gateway_order():
         {"id": "33333333-cccc", "summary": "Sloan's laptop"},
     ]
 
-    rows = picker.build_session_rows(sessions, {})
+    rows = picker.build_session_rows(sessions)
 
     switch_payloads = [
         row[0].callback_data for row in rows
@@ -52,17 +52,19 @@ def test_one_switch_button_per_conversation_in_gateway_order():
     ]
     # The operator's label beats the gateway's summary on the face of the
     # button; an unlabelled conversation keeps the summary.
-    labelled = picker.build_session_rows(
-        sessions, {"22222222-bbbb": {"name": "New roof", "color": "#3481cc"}}
-    )
-    assert "New roof" in labelled[1][0].text
-    assert "Roof quote" not in labelled[1][0].text
-    assert "Taxes" in labelled[0][0].text
+    named = picker.build_session_rows([
+        sessions[0],
+        {**sessions[1], "name": "New roof", "color": "#3481cc"},
+        sessions[2],
+    ])
+    assert "New roof" in named[1][0].text
+    assert "Roof quote" not in named[1][0].text
+    assert "Taxes" in named[0][0].text
 
 
 def test_an_empty_list_still_offers_a_new_session():
     """Breaks if the new-session button is only drawn alongside existing rows."""
-    rows = picker.build_session_rows([], {})
+    rows = picker.build_session_rows([])
     assert [b.callback_data for row in rows for b in row] == [picker.CB_NEW]
 
 
@@ -148,21 +150,17 @@ async def test_a_tapped_conversation_switches_to_that_id(tapped):
 # ---------------------------------------------------------------------------
 # Requirement 3 — a bare rename leaves an existing label alone.
 # ---------------------------------------------------------------------------
-def test_a_bare_rename_sends_nothing_rather_than_erasing_the_label():
-    """The terminal deletes the row when name and colour are both blank.
+def test_a_bare_rename_sends_nothing_rather_than_erasing_the_name():
+    """An empty name clears, and `/rename` with no text is easy to send.
 
     Breaks the moment an empty name is passed through as a body instead of
-    being refused here.
+    being refused here. The body carries the name alone — the write is partial,
+    so the colour picked at the tile survives without being read back first.
     """
-    existing = {"name": "New roof", "color": "#3481cc"}
+    assert picker.rename_body("") is None
+    assert picker.rename_body("   ") is None
 
-    assert picker.rename_body("", existing) is None
-    assert picker.rename_body("   ", existing) is None
-
-    assert picker.rename_body("Roof, round two", existing) == {
-        "name": "Roof, round two",
-        "color": "#3481cc",
-    }
+    assert picker.rename_body("Roof, round two") == {"name": "Roof, round two"}
 
 
 # ---------------------------------------------------------------------------
@@ -172,37 +170,44 @@ def test_a_bare_rename_sends_nothing_rather_than_erasing_the_label():
 @pytest.mark.asyncio
 async def test_switching_reports_the_name_the_button_showed(monkeypatch):
     """A row reading "dragoman" whose tap answered "Resumed New session" reads
-    as having resumed something else. Breaks if the reply goes back to the
-    gateway's summary, or if the label stops beating it."""
+    as having resumed something else.
+
+    The name now rides on the row the gateway returns, so the reply reads it
+    from the same place the button did. Breaks if the reply goes back to the
+    summary while a name is present.
+    """
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
     monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(
-        return_value={"id": "77777777-eeee", "summary": "New session"})))
-    monkeypatch.setattr(bot.labels_client, "fetch_labels",
-                        AsyncMock(return_value={"77777777-eeee": {"name": "dragoman"}}))
+        return_value={"id": "77777777-eeee", "summary": "New session",
+                      "name": "dragoman"})))
 
     named = await bot._handle_server_command("/switch 77777777-eeee", 4242, 99)
 
     assert named == 'Resumed "dragoman"'
 
-    # No label: the gateway's summary is all there is, and it is used.
-    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
+    monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(
+        return_value={"id": "77777777-eeee", "summary": "New session"})))
     unnamed = await bot._handle_server_command("/switch 77777777-eeee", 4242, 99)
 
     assert unnamed == 'Resumed "New session"'
 
 
-def test_the_button_and_the_reply_read_the_same_name(monkeypatch):
-    """One function names a conversation, so the two cannot drift. Breaks if
-    either side starts resolving the caption for itself."""
-    session = {"id": "77777777-eeee", "summary": "New session", "status": "running"}
-    labels = {"77777777-eeee": {"name": "dragoman"}}
+def test_the_button_and_the_reply_read_the_same_name():
+    """One function names a conversation, so the two cannot drift.
 
-    assert picker.caption_for(session, labels) == "dragoman"
-    assert "dragoman" in picker.button_text(session, labels)
-    # An unreadable store is not an empty one at the caller, but here a
-    # missing label simply leaves the gateway's own summary standing.
-    assert picker.caption_for(session, None) == "New session"
-    assert picker.caption_for({"id": "x"}, {}) == "Untitled"
+    Both read the name off the session row; there is no separate dict either
+    could be handed. Breaks if either side starts resolving the caption for
+    itself, and breaks if the name stops being read off the row — which is the
+    failure that used to hide behind a `labels` parameter nobody populated.
+    """
+    named = {"id": "77777777-eeee", "summary": "New session",
+             "status": "running", "name": "dragoman"}
+    bare = {"id": "77777777-eeee", "summary": "New session", "status": "running"}
+
+    assert picker.caption_for(named) == "dragoman"
+    assert "dragoman" in picker.button_text(named)
+    assert picker.caption_for(bare) == "New session"
+    assert picker.caption_for({"id": "x"}) == "Untitled"
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +269,6 @@ async def test_the_sessions_command_neither_draws_nor_counts_an_ended_one(monkey
     update, ctx = _chat_update(recorder)
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
     monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
-    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
 
     await bot.cmd_sessions(update, ctx)
 
@@ -288,7 +292,6 @@ async def test_the_sessions_command_neither_draws_nor_counts_a_suspended_one(mon
     update, ctx = _chat_update(recorder)
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
     monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
-    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
 
     await bot.cmd_sessions(update, ctx)
 
@@ -383,7 +386,7 @@ def test_a_conversation_held_elsewhere_says_so_on_its_button(session, expected):
     Breaks if the marker is dropped, or if it starts appearing on the
     operator's own conversations.
     """
-    text = picker.button_text(session, {})
+    text = picker.button_text(session)
     if expected:
         assert expected in text
     else:
@@ -462,7 +465,6 @@ async def test_the_sessions_command_sends_a_keyboard_not_a_list(monkeypatch):
     update, ctx = _chat_update(recorder)
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
     monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
-    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
 
     await bot.cmd_sessions(update, ctx)
 
@@ -485,7 +487,6 @@ async def test_a_long_session_list_is_capped_and_says_so(monkeypatch):
     update, ctx = _chat_update(recorder)
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
     monkeypatch.setattr(bot, "gateway", MagicMock(server_command=AsyncMock(return_value=sessions)))
-    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
 
     await bot.cmd_sessions(update, ctx)
 
@@ -502,7 +503,7 @@ def test_the_new_button_carries_a_payload_with_no_target_in_it():
     """The original assertion decoded a module constant, which proved nothing
     about the button. Breaks if `encode` ever emits a separator for it."""
     rows = picker.build_session_rows(
-        [{"id": "11111111-aaaa", "summary": "x", "status": "running"}], {}
+        [{"id": "11111111-aaaa", "summary": "x", "status": "running"}]
     )
     new_payload = rows[-1][0].callback_data
 
@@ -551,44 +552,46 @@ async def test_a_bare_rename_command_writes_nothing_at_all(monkeypatch):
     Breaks if `cmd_rename` ever PUTs on an empty name."""
     writes = []
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
-    monkeypatch.setattr(bot.labels_client, "configured", lambda: True)
-    monkeypatch.setattr(bot.labels_client, "fetch_labels",
-                        AsyncMock(return_value={"sess-1": {"name": "Roof", "color": "#3481cc"}}))
-    monkeypatch.setattr(bot.labels_client, "put_label",
-                        AsyncMock(side_effect=lambda sid, body: writes.append((sid, body)) or True))
-    monkeypatch.setattr(bot, "gateway",
-                        MagicMock(find_active_session=AsyncMock(return_value="sess-1")))
+    monkeypatch.setattr(bot, "gateway", MagicMock(
+        find_active_session=AsyncMock(return_value="sess-1"),
+        rename_session=AsyncMock(
+            side_effect=lambda sid, body: writes.append((sid, body)) or 200),
+    ))
 
     recorder = _Recorder()
     update, ctx = _chat_update(recorder, args=[])
     await bot.cmd_rename(update, ctx)
-    assert writes == [], "a bare /rename reached the label store"
+    assert writes == [], "a bare /rename reached the gateway"
 
     recorder = _Recorder()
     update, ctx = _chat_update(recorder, args=["New", "roof"])
     await bot.cmd_rename(update, ctx)
-    assert writes == [("sess-1", {"name": "New roof", "color": "#3481cc"})]
+    # The name alone. A body carrying a colour would be a whole-record write,
+    # which is how a rename used to blank the colour picked at the tile.
+    assert writes == [("sess-1", {"name": "New roof"})]
 
 
 @pytest.mark.asyncio
-async def test_a_rename_refuses_when_the_current_label_cannot_be_read(monkeypatch):
-    """An unreadable store used to look like an empty one, so the write went
-    out with a blank colour and erased the one set at the tile. Breaks if a
-    failed read is ever treated as "no labels"."""
-    writes = []
+async def test_each_refused_rename_says_which_refusal_it_was(monkeypatch):
+    """"It didn't work" sends the operator to restart something.
+
+    A 409 means the conversation rotated away and the only thing that helps is
+    tapping the live one; an unreachable gateway means try again. Breaks if the
+    handler folds the statuses together, which is what it did when the write
+    returned a bool.
+    """
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
-    monkeypatch.setattr(bot.labels_client, "configured", lambda: True)
-    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value=None))
-    monkeypatch.setattr(bot.labels_client, "put_label",
-                        AsyncMock(side_effect=lambda sid, body: writes.append((sid, body)) or True))
-    monkeypatch.setattr(bot, "gateway",
-                        MagicMock(find_active_session=AsyncMock(return_value="sess-1")))
 
-    recorder = _Recorder()
-    update, ctx = _chat_update(recorder, args=["New", "roof"])
-    await bot.cmd_rename(update, ctx)
+    async def rename_with(status):
+        monkeypatch.setattr(bot, "gateway", MagicMock(
+            find_active_session=AsyncMock(return_value="sess-1"),
+            rename_session=AsyncMock(return_value=status),
+        ))
+        return await bot._apply_rename("sess-1", "New roof")
 
-    assert writes == []
+    assert "rotated away" in await rename_with(409)
+    assert "reach the gateway" in await rename_with(0)
+    assert await rename_with(200) == 'Renamed to "New roof".'
 
 
 # --- The spinner, and the gate on it ---------------------------------------
@@ -631,13 +634,10 @@ async def test_rename_never_creates_the_conversation_it_is_naming(monkeypatch):
     created = []
     writes = []
     monkeypatch.setattr(bot, "_is_allowed_user", lambda uid: True)
-    monkeypatch.setattr(bot.labels_client, "configured", lambda: True)
-    monkeypatch.setattr(bot.labels_client, "fetch_labels", AsyncMock(return_value={}))
-    monkeypatch.setattr(bot.labels_client, "put_label",
-                        AsyncMock(side_effect=lambda sid, body: writes.append(sid) or True))
     monkeypatch.setattr(bot, "gateway", MagicMock(
         find_active_session=AsyncMock(return_value=None),
         ensure_session=AsyncMock(side_effect=lambda u, c: created.append(c) or "brand-new"),
+        rename_session=AsyncMock(side_effect=lambda sid, body: writes.append(sid) or 200),
     ))
 
     recorder = _Recorder()
@@ -645,7 +645,7 @@ async def test_rename_never_creates_the_conversation_it_is_naming(monkeypatch):
     await bot.cmd_rename(update, ctx)
 
     assert created == [], "/rename started a conversation"
-    assert writes == [], "/rename labelled a conversation it had just created"
+    assert writes == [], "/rename named a conversation it had just created"
 
 
 @pytest.mark.asyncio
@@ -685,7 +685,7 @@ def test_one_unsendable_row_does_not_take_the_whole_picker_with_it():
     ]
 
     payloads = [
-        b.callback_data for row in picker.build_session_rows(sessions, {}) for b in row
+        b.callback_data for row in picker.build_session_rows(sessions) for b in row
     ]
 
     assert "sw:11111111-aaaa" in payloads
@@ -693,3 +693,88 @@ def test_one_unsendable_row_does_not_take_the_whole_picker_with_it():
     assert all(
         len(p.encode("utf-8")) <= picker.CALLBACK_DATA_LIMIT for p in payloads
     )
+
+
+# --- The rename client itself, which every handler test replaces wholesale ---
+@pytest.mark.asyncio
+async def test_the_rename_client_puts_to_the_named_session_with_its_credential():
+    """R2 and R8, at the HTTP call rather than at the argument boundary.
+
+    Every handler test patches `rename_session` with a mock, so nothing else
+    proves this method addresses the right route or carries the right key. Breaks
+    if the path changes, and breaks if the rename credential stops being sent as
+    its own header — in which case comms falls back to the service bearer, which
+    it refuses, and three surfaces report a network fault.
+    """
+    from bots.gateway_client import GatewayClient
+
+    calls = []
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Http:
+        def put(self, url, **kwargs):
+            calls.append((url, kwargs.get("json"), kwargs.get("headers") or {}))
+            return _Resp()
+
+    client = GatewayClient(
+        _Http(), "http://gw.test", "telegram", mind_id="m",
+        bearer_token="service", rename_token="rename-only",
+    )
+
+    status = await client.rename_session("33333333-cccc", {"name": "Health"})
+
+    assert status == 200
+    url, body, headers = calls[0]
+    assert url == "http://gw.test/sessions/33333333-cccc/name"
+    assert body == {"name": "Health"}
+    assert headers["X-Rename-Token"] == "rename-only"
+    assert headers["Authorization"] == "Bearer service"
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_gateway_is_a_status_the_reply_can_read():
+    """R7: the client reports the failure rather than raising through the handler.
+
+    Breaks if the exception is allowed out — the rename command would die inside
+    Telegram's error handler, which logs a network blip at INFO and answers the
+    operator with nothing at all.
+    """
+    from bots.gateway_client import GatewayClient
+
+    class _Http:
+        def put(self, url, **kwargs):
+            raise OSError("no route to host")
+
+    client = GatewayClient(
+        _Http(), "http://gw.test", "telegram", mind_id="m", bearer_token="t"
+    )
+
+    assert await client.rename_session("sess-1", {"name": "Health"}) == 0
+
+
+# --- The colour mark, which moved onto the session row with the name ---------
+def test_a_conversations_colour_mark_comes_off_its_session_row():
+    """The dot is the operator's own mark and the only text-readable trace of a
+    colour anywhere.
+
+    It used to be read from a separate labels dict. Breaks if the key changes or
+    the lookup is dropped — and a conversation with no colour must stay bare,
+    since inventing a mark claims the operator set one.
+    """
+    # A mark whose nearest dot is not the one the running-status icon already
+    # uses, so the assertion is about the colour and not about the status.
+    marked = {"id": "11111111-aaaa", "summary": "Roof", "status": "running",
+              "color": "#8859a3"}
+    bare = {"id": "11111111-aaaa", "summary": "Roof", "status": "running"}
+
+    dot = picker.dot_for_color("#8859a3")
+    assert dot in picker.button_text(marked)
+    assert dot not in picker.button_text(bare)

@@ -113,40 +113,40 @@ def dot_for_color(color: object) -> str:
     )[0]
 
 
-def caption_for(session: dict, labels: dict | None) -> str:
+def caption_for(session: dict) -> str:
     """What a conversation is called whenever it is named to the operator.
 
-    The operator's own label wins over the gateway's generated summary — they
+    The operator's own name wins over the gateway's generated summary — they
     named it, and a name they chose is the only thing they can predict. One
     function because the button and the reply that follows tapping it have to
     agree: a picker row reading "dragoman" whose tap answers "Resumed New
     session" reads as having resumed something else entirely. The gateway
     writes a summary only on a chat turn, so every conversation the browser
     terminal holds is called "New session" forever, which is exactly the
-    population most likely to carry a label.
+    population most likely to carry a name.
+
+    The name is read off the session row, which is the only place it lives.
+    It used to arrive as a separate dict fetched from the browser terminal over
+    HTTP, and a caller that forgot to populate it drew a picker with no names at
+    all while every test still passed — so the parameter is gone rather than
+    kept for compatibility.
     """
-    label = (labels or {}).get(str(session.get("id") or "")) or {}
-    if not isinstance(label, dict):
-        label = {}
-    name = (label.get("name") or "").strip()
+    name = (str(session.get("name") or "")).strip()
     return name or (str(session.get("summary") or "")).strip() or "Untitled"
 
 
-def button_text(session: dict, labels: dict) -> str:
+def button_text(session: dict) -> str:
     """What one conversation's button says.
 
     Everything falls back rather than raising, because a malformed row must
     cost its own button's prose, not the whole picker.
     """
     session_id = str(session.get("id") or "")
-    label = labels.get(session_id) or {}
-    if not isinstance(label, dict):
-        label = {}
-    caption = caption_for(session, labels)
+    caption = caption_for(session)
     # A colour is the operator's own mark and only they can decode it, so it is
     # shown when they set one and never invented when they did not. The status
     # icon is always there, because it is the gateway's fact about the row.
-    dot = dot_for_color(label["color"]) if label.get("color") else ""
+    dot = dot_for_color(session.get("color")) if session.get("color") else ""
     status = _STATUS_ICONS.get(str(session.get("status") or ""), DEFAULT_STATUS_ICON)
     where = ""
     # A conversation another surface is holding has to read as elsewhere:
@@ -201,7 +201,7 @@ def visible_sessions(sessions: list[dict] | None) -> list[dict]:
 
 
 def build_session_rows(
-    sessions: list[dict], labels: dict | None = None, limit: int = MAX_PICKER_ROWS
+    sessions: list[dict], limit: int = MAX_PICKER_ROWS
 ) -> list[list[InlineKeyboardButton]]:
     """One button per conversation, in the order the gateway returned them.
 
@@ -213,7 +213,6 @@ def build_session_rows(
     always last, so an empty list is still a usable picker rather than a dead
     end.
     """
-    labels = labels or {}
     rows: list[list[InlineKeyboardButton]] = []
     for session in (sessions or [])[:limit]:
         session_id = str(session.get("id") or "")
@@ -223,7 +222,7 @@ def build_session_rows(
             continue
         rows.append([
             InlineKeyboardButton(
-                button_text(session, labels),
+                button_text(session),
                 callback_data=encode(CB_SWITCH, session_id),
             ),
         ])
@@ -232,28 +231,27 @@ def build_session_rows(
 
 
 def build_session_keyboard(
-    sessions: list[dict], labels: dict | None = None, limit: int = MAX_PICKER_ROWS
+    sessions: list[dict], limit: int = MAX_PICKER_ROWS
 ) -> InlineKeyboardMarkup:
     """The rows, wrapped for the send call. No decisions of its own."""
-    return InlineKeyboardMarkup(build_session_rows(sessions, labels, limit))
+    return InlineKeyboardMarkup(build_session_rows(sessions, limit))
 
 
-def rename_body(new_name: object, existing: dict | None) -> dict | None:
-    """The label PUT body for a rename, or ``None`` when nothing should be sent.
+def rename_body(new_name: object) -> dict | None:
+    """The PUT body for a rename, or ``None`` when nothing should be sent.
 
-    The terminal's label route deletes the row outright when name and colour
-    are both blank, so a bare `/rename` with no text — the easiest thing in the
-    world to type by accident — would silently erase a name set at the tile.
-    An empty name is therefore a refusal here rather than a write there.
+    An empty name clears, and a bare `/rename` with no text is the easiest
+    thing in the world to type by accident, so it is refused here rather than
+    reaching a write that would erase a name set at the tile.
 
-    A rename changes the name and nothing else: the colour the operator picked
-    survives, because they picked it in a different place for a different
-    reason and the rename never asked about it.
+    A rename sends the name and nothing else. The write is a partial one, so
+    the colour the operator picked survives without this having to read it
+    back first — which is what it used to do, and what left the colour blank
+    whenever that read failed.
     """
     if not isinstance(new_name, str):
         return None
     name = new_name.strip()[:40]
     if not name:
         return None
-    existing = existing if isinstance(existing, dict) else {}
-    return {"name": name, "color": (existing.get("color") or "")}
+    return {"name": name}

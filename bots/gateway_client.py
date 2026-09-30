@@ -35,6 +35,7 @@ class GatewayClient:
         *,
         mind_id: str,
         bearer_token: str | None = None,
+        rename_token: str | None = None,
     ):
         self.http = http
         self.server_url = server_url
@@ -42,6 +43,11 @@ class GatewayClient:
         self.surface_prompt = surface_prompt
         self.mind_id = mind_id
         self._bearer_token = bearer_token
+        # The one small credential that may change a conversation's name. Held
+        # separately from the service bearer on purpose: a copy of this one
+        # escaping into a log or a screenshot is worth exactly one renamed
+        # conversation, where the service token opens every route on the hive.
+        self._rename_token = rename_token
 
     @property
     def _auth_headers(self) -> dict[str, str]:
@@ -175,6 +181,44 @@ class GatewayClient:
                 session_id=session_id, mind_id=self.mind_id, status_code=status,
             )
             return result
+
+    async def rename_session(self, session_id: str, body: dict) -> int:
+        """Name a conversation on the row that holds its name. Returns the status.
+
+        The status rather than a bool, because the refusals mean different
+        things and the operator has to be told which one happened: 409 is a
+        conversation that has already rotated away — the button or the rename
+        prompt carried an id captured when it was drawn and neither expires —
+        and 503 is a gateway with no rename credential configured. Folding
+        those into "it did not work" sends the operator looking at the wrong
+        thing.
+
+        The body is a partial write, so a rename carries the name alone and the
+        colour picked at the tile survives without being read back first.
+        """
+        headers = {**self._auth_headers}
+        if self._rename_token:
+            headers["X-Rename-Token"] = self._rename_token
+        try:
+            async with self.http.put(
+                f"{self.server_url}/sessions/{session_id}/name",
+                json=body,
+                headers=headers,
+            ) as resp:
+                status = resp.status if isinstance(resp.status, int) else 200
+        except Exception as exc:  # noqa: BLE001 — an unreachable gateway is a refusal
+            log_event(
+                log, "gateway.session.rename.failed", level=logging.WARNING,
+                session_id=session_id, mind_id=self.mind_id, error=str(exc),
+            )
+            return 0
+        log_event(
+            log,
+            "gateway.session.rename.completed" if status < 400 else "gateway.session.rename.failed",
+            level=logging.INFO if status < 400 else logging.WARNING,
+            session_id=session_id, mind_id=self.mind_id, status_code=status,
+        )
+        return status
 
     async def query_stream(
         self, user_id: int, client_ref: int | str, prompt: str,

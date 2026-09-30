@@ -537,8 +537,7 @@ class TestARefusalIsNeverReportedAsSuccess:
         gw.server_command = AsyncMock(return_value={"detail": "Not authenticated"})
         update, context = _make_callback(data="sw:sess-1")
 
-        with patch("bots.telegram_bot.gateway", gw), \
-                patch("bots.telegram_bot.labels_client.fetch_labels", AsyncMock(return_value={})):
+        with patch("bots.telegram_bot.gateway", gw):
             await on_session_button(update, context)
 
         annotated = update.callback_query.edit_message_text.call_args[0][0]
