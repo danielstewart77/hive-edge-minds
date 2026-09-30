@@ -29,7 +29,7 @@ from telegram.ext import (
 from config import config
 from bots.bot_utils import claim_picker, get_lock, get_queue, time_ago
 from bots.gateway_client import GatewayClient
-from bots import labels_client, rename_prompt, session_picker
+from bots import rename_prompt, session_picker
 from bots.skills import get_skills
 from hive_logging import configure_logging, log_event
 
@@ -42,6 +42,11 @@ TELEGRAM_MSG_LIMIT = 4096
 # Gateway/sessions/broker → hive-comms (containerised, NS-owned).
 COMMS_URL = os.environ.get("COMMS_URL", "http://127.0.0.1:8426")
 COMMS_BEARER_TOKEN = os.environ.get("COMMS_BEARER_TOKEN", "")
+# The one credential that may change a conversation's name, held apart from the
+# service bearer. It is the same secret the browser terminal used to check when
+# it owned the name store, kept small on purpose: a copy escaping into a log or
+# a screenshot is worth exactly one renamed conversation.
+TERMINAL_LABELS_TOKEN = os.environ.get("TERMINAL_LABELS_TOKEN", "")
 VOICE_SERVER_URL = os.environ.get("VOICE_SERVER_URL", "http://localhost:8422")
 # When on (default), every conversational reply is voiced: text still streams,
 # a voice note follows. Set ALWAYS_VOICE=0 in .env for text-only except when
@@ -376,16 +381,16 @@ SPENT_PICKER_TEXT = (
 )
 
 
-async def _conversation_caption(result: dict) -> str:
+def _conversation_caption(result: dict) -> str:
     """Name a conversation the way the picker named it.
 
-    The gateway's reply carries only its own generated summary, so a reply
-    built from that alone contradicts the button that was just tapped. An
-    unreachable label store falls back to the summary rather than failing the
-    command — the label is how the reply reads, not whether it happened.
+    One function for the button and for the reply that follows tapping it, so a
+    row reading "dragoman" cannot answer "Resumed New session". The name rides
+    on the session row the gateway just returned — it used to be fetched from a
+    second store over HTTP, which meant the reply and the button could disagree
+    whenever that store was unreachable.
     """
-    labels = await labels_client.fetch_labels() or {}
-    return session_picker.caption_for(result, labels)
+    return session_picker.caption_for(result)
 
 
 async def _handle_server_command(content: str, user_id: int, chat_id: int) -> str:
@@ -438,14 +443,14 @@ async def _handle_server_command(content: str, user_id: int, chat_id: int) -> st
         return msg
     if cmd == "/autopilot":
         on = result.get("autopilot", False)
-        summary = await _conversation_caption(result)
+        summary = _conversation_caption(result)
         if on:
             return f"\U0001f916 Autopilot ON for \"{summary}\""
         return f"\U0001f512 Autopilot OFF for \"{summary}\""
     if cmd == "/switch":
-        return f"Resumed \"{await _conversation_caption(result)}\""
+        return f"Resumed \"{_conversation_caption(result)}\""
     if cmd == "/kill":
-        caption = await _conversation_caption(result)
+        caption = _conversation_caption(result)
         return f"Killed \"{caption}\" (status: {result.get('status')})"
     if cmd == "/prune":
         killed = result.get("killed") or []
@@ -524,10 +529,6 @@ async def _send_session_picker(bot, user_id: int, chat_id: int) -> None:
     # Filtered before anything is counted, so the "newest N of M" the operator
     # reads is about the list they can actually see.
     sessions = session_picker.visible_sessions(result if isinstance(result, list) else [])
-    # An unreadable label store draws the same picker as an empty one: the
-    # buttons fall back to the gateway's own summaries, which is what the
-    # numbered list showed before any of this existed.
-    labels = await labels_client.fetch_labels() or {}
     shown = min(len(sessions), session_picker.MAX_PICKER_ROWS)
     if not sessions:
         header = "No live conversations."
@@ -539,7 +540,7 @@ async def _send_session_picker(bot, user_id: int, chat_id: int) -> None:
     # A bare send here fails into `_on_error`, which logs a network error at
     # INFO and returns — so during an outage the picker never appears, says
     # nothing, and leaves nothing above INFO to find.
-    keyboard = session_picker.build_session_keyboard(sessions, labels)
+    keyboard = session_picker.build_session_keyboard(sessions)
     last: Exception | None = None
     for attempt in range(_DELIVER_ATTEMPTS):
         try:
@@ -784,9 +785,8 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entry useless to the one person it was added for: the operator on a phone
     who does not want to remember the syntax.
 
-    An empty name is still never written. The terminal's label route deletes
-    the row when name and colour are both blank, so a rename that cannot name
-    anything asks again instead of erasing what is there.
+    An empty name is still never written: an empty name clears, so a rename
+    that cannot name anything asks again instead of erasing what is there.
     """
     if not await _auth_check(update):
         return
@@ -829,11 +829,6 @@ async def _rename_target(user_id: int, chat_id: int) -> tuple[str, str]:
     checking there is anything to name is how the operator gets prompted, types
     a name, and is only then told it was all for nothing.
     """
-    if not labels_client.configured():
-        return "", (
-            "Renaming isn't wired up on this mind \u2014 TERMINAL_URL and "
-            "TERMINAL_LABELS_TOKEN aren't set."
-        )
     # `ensure_session` creates when it finds nothing, and creating here mints a
     # conversation id, binds this chat to it and spawns a harness — so a rename
     # typed against a suspended conversation started an empty one and named
@@ -858,20 +853,32 @@ async def _rename_target(user_id: int, chat_id: int) -> tuple[str, str]:
 
 
 async def _apply_rename(session_id: str, name: str) -> str:
-    """Write the label and say what happened, in one sentence either way."""
-    labels = await labels_client.fetch_labels()
-    if labels is None:
-        # Writing now would send an empty colour and wipe the one set at the
-        # tile. A rename that cannot read the current label is not a rename.
-        return "Couldn't read the current label \u2014 nothing changed."
-    body = session_picker.rename_body(name, labels.get(session_id))
+    """Write the name and say what happened, in one sentence either way.
+
+    No read first. The write is partial, so a rename carries the name alone and
+    the colour picked at the tile survives — which is what the read was for, and
+    what made a rename fail outright whenever that read did.
+
+    Each refusal says which one it was. "It didn't work" sends the operator to
+    restart something; "that conversation has moved on" tells them to send
+    /sessions and tap the live one, which is the only thing that helps.
+    """
+    body = session_picker.rename_body(name)
     if body is None:
         # A name that trimmed to nothing. Asking again beats a usage line for
         # the same reason the bare command asks in the first place.
         return rename_prompt.PROMPT_TEXT
-    if await labels_client.put_label(session_id, body):
+    status = await gateway.rename_session(session_id, body)
+    if status < 400 and status != 0:
         return f"Renamed to \"{body['name']}\"."
-    return "Couldn't reach the label store \u2014 name unchanged."
+    if status == 409:
+        return (
+            "That conversation has already rotated away \u2014 nothing renamed. "
+            "Send /sessions and tap the live one."
+        )
+    if status == 503:
+        return "Renaming isn't wired up on this hive \u2014 nothing changed."
+    return "Couldn't reach the gateway \u2014 name unchanged."
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1476,6 +1483,7 @@ async def _on_startup(app) -> None:
         surface_prompt=TELEGRAM_SURFACE_PROMPT,
         mind_id=mind_id,
         bearer_token=COMMS_BEARER_TOKEN or None,
+        rename_token=TERMINAL_LABELS_TOKEN or None,  # secret-guard: allow
     )
     log.info(
         "Hive Mind Telegram bot started (gateway=%s, voice=%s)",
