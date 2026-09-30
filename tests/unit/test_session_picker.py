@@ -693,3 +693,88 @@ def test_one_unsendable_row_does_not_take_the_whole_picker_with_it():
     assert all(
         len(p.encode("utf-8")) <= picker.CALLBACK_DATA_LIMIT for p in payloads
     )
+
+
+# --- The rename client itself, which every handler test replaces wholesale ---
+@pytest.mark.asyncio
+async def test_the_rename_client_puts_to_the_named_session_with_its_credential():
+    """R2 and R8, at the HTTP call rather than at the argument boundary.
+
+    Every handler test patches `rename_session` with a mock, so nothing else
+    proves this method addresses the right route or carries the right key. Breaks
+    if the path changes, and breaks if the rename credential stops being sent as
+    its own header — in which case comms falls back to the service bearer, which
+    it refuses, and three surfaces report a network fault.
+    """
+    from bots.gateway_client import GatewayClient
+
+    calls = []
+
+    class _Resp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Http:
+        def put(self, url, **kwargs):
+            calls.append((url, kwargs.get("json"), kwargs.get("headers") or {}))
+            return _Resp()
+
+    client = GatewayClient(
+        _Http(), "http://gw.test", "telegram", mind_id="m",
+        bearer_token="service", rename_token="rename-only",
+    )
+
+    status = await client.rename_session("33333333-cccc", {"name": "Health"})
+
+    assert status == 200
+    url, body, headers = calls[0]
+    assert url == "http://gw.test/sessions/33333333-cccc/name"
+    assert body == {"name": "Health"}
+    assert headers["X-Rename-Token"] == "rename-only"
+    assert headers["Authorization"] == "Bearer service"
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_gateway_is_a_status_the_reply_can_read():
+    """R7: the client reports the failure rather than raising through the handler.
+
+    Breaks if the exception is allowed out — the rename command would die inside
+    Telegram's error handler, which logs a network blip at INFO and answers the
+    operator with nothing at all.
+    """
+    from bots.gateway_client import GatewayClient
+
+    class _Http:
+        def put(self, url, **kwargs):
+            raise OSError("no route to host")
+
+    client = GatewayClient(
+        _Http(), "http://gw.test", "telegram", mind_id="m", bearer_token="t"
+    )
+
+    assert await client.rename_session("sess-1", {"name": "Health"}) == 0
+
+
+# --- The colour mark, which moved onto the session row with the name ---------
+def test_a_conversations_colour_mark_comes_off_its_session_row():
+    """The dot is the operator's own mark and the only text-readable trace of a
+    colour anywhere.
+
+    It used to be read from a separate labels dict. Breaks if the key changes or
+    the lookup is dropped — and a conversation with no colour must stay bare,
+    since inventing a mark claims the operator set one.
+    """
+    # A mark whose nearest dot is not the one the running-status icon already
+    # uses, so the assertion is about the colour and not about the status.
+    marked = {"id": "11111111-aaaa", "summary": "Roof", "status": "running",
+              "color": "#8859a3"}
+    bare = {"id": "11111111-aaaa", "summary": "Roof", "status": "running"}
+
+    dot = picker.dot_for_color("#8859a3")
+    assert dot in picker.button_text(marked)
+    assert dot not in picker.button_text(bare)

@@ -878,6 +878,15 @@ async def _apply_rename(session_id: str, name: str) -> str:
         )
     if status == 503:
         return "Renaming isn't wired up on this hive \u2014 nothing changed."
+    if status == 401:
+        # Named as a credential, not as a network fault. This mind may hold no
+        # rename token at all, which is the state a fresh mind is installed in,
+        # and "couldn't reach the gateway" sends the operator to restart a
+        # container that is answering perfectly.
+        return (
+            "The gateway refused my rename credential \u2014 nothing changed. "
+            "This mind needs TERMINAL_LABELS_TOKEN set to the hive's rename token."
+        )
     return "Couldn't reach the gateway \u2014 name unchanged."
 
 
